@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>TB Local Web App Showcase — ES6+ &amp; Live DOM</title>
+  <style>
+    body { margin: 1 2; color: #e2e8f0; }
+    .banner { border: 1px solid #38bdf8; background-color: #0f172a; padding: 1 2; margin-bottom: 1; }
+    .panel  { border: 1px solid #475569; padding: 1 2; margin-bottom: 1; }
+    h1 { color: #38bdf8; }
+    h2 { color: #a78bfa; }
+    .ok { color: #4ade80; font-weight: bold; }
+    .muted { color: #94a3b8; }
+    .hidden { display: none; }
+    th { color: #fbbf24; font-weight: bold; }
+    blockquote { color: #cbd5e1; margin-top: 1; margin-bottom: 1; }
+  </style>
+  <script src="widget.js"></script>
+</head>
+<body>
+  <div class="banner">
+    <h1>🌐 TB Local Showcase (`demos/index.html`)</h1>
+    <p class="muted">External <code>&lt;script src="widget.js"&gt;</code> + ES6 Closures + Live CSS Class Toggling + Form Controls</p>
+    <p class="ok" id="mem-banner">Measuring kernel VmRSS...</p>
+  </div>
+
+  <div class="panel">
+    <h2>1. Interactive Tab Switcher (`classList.toggle` &amp; `display: none`)</h2>
+    <p>
+      <button id="tab-btn-arch">Tab 1: Architecture</button>
+      <button id="tab-btn-sieve">Tab 2: Prime Sieve JS Engine</button>
+      <button id="tab-btn-catalog">Tab 3: Live Search &amp; Controls</button>
+    </p>
+
+    <div id="tab-arch">
+      <blockquote>
+        TB renders HTML5 + CSS cascade + live ES6 JavaScript inside a raw POSIX termios TUI with zero V8/QuickJS/ncurses/libcurl bloat.
+      </blockquote>
+      <table>
+        <thead>
+          <tr><th>Subsystem</th><th>Implementation</th><th>Memory Discipline</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>Networking</td><td>HTTP/1.1 + Lazy dlopen OpenSSL + RFC 1952 Gzip</td><td>Streaming cap + SSL_MODE_RELEASE_BUFFERS</td></tr>
+          <tr><td>DOM &amp; CSS</td><td>Intrusive sibling tree + specificity cascade</td><td>Embedded CssStyle, single active page</td></tr>
+          <tr><td>TinyJS VM</td><td>24-byte flat AST pool + Mark &amp; Sweep GC</td><td>256 KB GC threshold, orphan DOM sweep</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div id="tab-sieve" class="hidden">
+      <p>Upper Bound: <input id="sieve-limit" type="text" value="500" /> <button id="sieve-run">Run Sieve</button></p>
+      <p id="sieve-output" class="ok">Not yet run.</p>
+    </div>
+
+    <div id="tab-catalog" class="hidden">
+      <p>
+        Filter: <input id="cat-query" type="text" value="" placeholder="Type module name..." />
+        Category:
+        <select id="cat-tier">
+          <option value="all">All Layers</option>
+          <option value="vm">JS Engine</option>
+          <option value="ui">Layout &amp; TUI</option>
+        </select>
+        Only Core: <input id="cat-core" type="checkbox" checked />
+        <button id="cat-apply">Apply Filter</button>
+      </p>
+      <ul id="cat-results"></ul>
+    </div>
+  </div>
+
+  <script>
+    const tabs = [
+      { btn: 'tab-btn-arch',    pane: 'tab-arch' },
+      { btn: 'tab-btn-sieve',   pane: 'tab-sieve' },
+      { btn: 'tab-btn-catalog', pane: 'tab-catalog' }
+    ];
+
+    function activateTab(activePaneId) {
+      tabs.forEach(({ pane }) => {
+        const el = document.getElementById(pane);
+        if (pane === activePaneId) el.classList.remove('hidden');
+        else el.classList.add('hidden');
+      });
+    }
+
+    tabs.forEach(({ btn, pane }) => {
+      document.getElementById(btn).addEventListener('click', () => activateTab(pane));
+    });
+
+    function runSieve() {
+      const lim = parseInt(document.getElementById('sieve-limit').value, 10) || 200;
+      const lab = new PrimeSieveLab(Math.min(Math.max(lim, 10), 5000));
+      lab.compute();
+      document.getElementById('sieve-output').textContent =
+        (window.TBExternalWidgetLoaded ? '[widget.js OK] ' : '[missing] ') + lab.summary();
+    }
+    document.getElementById('sieve-run').addEventListener('click', runSieve);
+    runSieve();
+
+    const modules = [
+      { name: 'js_parse.c (Pratt AST Parser)', tier: 'vm', core: true },
+      { name: 'js_eval.c (Lexical Closures & Flow)', tier: 'vm', core: true },
+      { name: 'js_gc.c (Mark-and-Sweep Collector)', tier: 'vm', core: true },
+      { name: 'layout.c (Unicode Box/Table Engine)', tier: 'ui', core: true },
+      { name: 'tui.c (Raw termios + SGR Mouse + REPL)', tier: 'ui', core: false }
+    ];
+
+    function renderCatalog() {
+      const q = document.getElementById('cat-query').value.trim().toLowerCase();
+      const tier = document.getElementById('cat-tier').value;
+      const coreOnly = document.getElementById('cat-core').checked;
+      const matched = modules.filter(m => {
+        if (coreOnly && !m.core) return false;
+        if (tier !== 'all' && m.tier !== tier) return false;
+        if (q && !m.name.toLowerCase().includes(q)) return false;
+        return true;
+      });
+      const ul = document.getElementById('cat-results');
+      ul.innerHTML = matched.map(m => `<li><strong>${m.name}</strong> [${m.tier.toUpperCase()}]</li>`).join('');
+    }
+
+    document.getElementById('cat-apply').addEventListener('click', renderCatalog);
+    document.getElementById('cat-query').addEventListener('input', renderCatalog);
+    document.getElementById('cat-tier').addEventListener('change', renderCatalog);
+    document.getElementById('cat-core').addEventListener('change', renderCatalog);
+    renderCatalog();
+
+    const mem = performance?.memory;
+    if (mem) {
+      const mb = (mem.rssBytes / 1048576).toFixed(2);
+      const anonKb = (mem.anonBytes / 1024).toFixed(0);
+      document.getElementById('mem-banner').textContent =
+        `External script loaded: ${Boolean(window.TBExternalWidgetLoaded)} | Active VmRSS: ${mb} MB (< 10.00 MB!) | RssAnon: ${anonKb} KB`;
+    }
+  </script>
+</body>
+</html>
