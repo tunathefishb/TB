@@ -1,7 +1,5 @@
 #include "js.h"
-
-#include <math.h>
-#include <stdlib.h>
+#include "math_tb.h"
 
 typedef enum {
     FLOW_NONE = 0,
@@ -157,8 +155,8 @@ static JsVal apply_binop(JsVm *vm, AstOp op, JsVal lv, JsVal rv) {
         case OP_SUB: return js_num(js_to_num(vm, lv) - js_to_num(vm, rv));
         case OP_MUL: return js_num(js_to_num(vm, lv) * js_to_num(vm, rv));
         case OP_DIV: return js_num(js_to_num(vm, lv) / js_to_num(vm, rv));
-        case OP_MOD: return js_num(fmod(js_to_num(vm, lv), js_to_num(vm, rv)));
-        case OP_POW: return js_num(pow(js_to_num(vm, lv), js_to_num(vm, rv)));
+        case OP_MOD: return js_num(tb_fmod(js_to_num(vm, lv), js_to_num(vm, rv)));
+        case OP_POW: return js_num(tb_pow(js_to_num(vm, lv), js_to_num(vm, rv)));
         case OP_BIT_AND: return js_num((double)((int32_t)(int64_t)js_to_num(vm, lv) & (int32_t)(int64_t)js_to_num(vm, rv)));
         case OP_BIT_OR:  return js_num((double)((int32_t)(int64_t)js_to_num(vm, lv) | (int32_t)(int64_t)js_to_num(vm, rv)));
         case OP_BIT_XOR: return js_num((double)((int32_t)(int64_t)js_to_num(vm, lv) ^ (int32_t)(int64_t)js_to_num(vm, rv)));
@@ -181,7 +179,7 @@ static JsVal apply_binop(JsVm *vm, AstOp op, JsVal lv, JsVal rv) {
             }
             double ln = js_to_num(vm, lv);
             double rn = js_to_num(vm, rv);
-            if (isnan(ln) || isnan(rn)) return js_bool(false);
+            if (tb_isnan(ln) || tb_isnan(rn)) return js_bool(false);
             if (op == OP_LT) return js_bool(ln < rn);
             if (op == OP_LE) return js_bool(ln <= rn);
             if (op == OP_GT) return js_bool(ln > rn);
@@ -317,7 +315,9 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
         case AST_REGEX: {
             const char *pat = (n->a < ch->str_count) ? ch->strs[n->a] : "";
             const char *flg = (n->b < ch->str_count) ? ch->strs[n->b] : "";
-            return res_ok(js_obj_val(js_regex_new(vm, pat, flg)));
+            JsObj *rx = js_regex_new(vm, pat, flg);
+            if (vm->has_thrown) return absorb_vm_throw(vm);
+            return res_ok(js_obj_val(rx));
         }
         case AST_THIS:
             return res_ok(js_env_resolve_this(vm, env));
@@ -530,7 +530,7 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                 if (vm->has_thrown) return absorb_vm_throw(vm);
                 return res_ok(is_prefix ? newv : js_num(oldn));
             }
-            return res_ok(js_num(NAN));
+            return res_ok(js_num(TB_NAN));
         }
         case AST_BINARY: {
             int sp = vm->temp_sp;
@@ -671,7 +671,7 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             if (kr.flow != FLOW_NONE) { vm->temp_sp = sp; return kr; }
             JsVal out;
             if (kr.val.type == JS_NUMBER && kr.val.u.num >= 0 &&
-                kr.val.u.num <= 0x7FFFFFFF && floor(kr.val.u.num) == kr.val.u.num) {
+                kr.val.u.num <= 0x7FFFFFFF && tb_floor(kr.val.u.num) == kr.val.u.num) {
                 out = js_get_index(vm, or.val, (uint32_t)kr.val.u.num);
             } else {
                 JsStr *ks = js_to_str(vm, kr.val);

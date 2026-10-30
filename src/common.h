@@ -2,13 +2,7 @@
 #define TB_COMMON_H
 
 #include "mem.h"
-
-#include <stdarg.h>
-#include <stdbool.h>
-#include <stddef.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
+#include "sys.h"
 
 typedef struct {
     char  *data;
@@ -38,6 +32,10 @@ static inline void tb_buf_clear(TbBuf *b) {
 
 static inline bool tb_buf_reserve(TbBuf *b, size_t extra) {
     if (b->oom) return false;
+    if (extra >= (SIZE_MAX / 2) - 1 || b->len > (SIZE_MAX / 2) - 1 - extra) {
+        b->oom = true;
+        return false;
+    }
     size_t need = b->len + extra + 1;
     if (need <= b->cap) return true;
     size_t ncap = b->cap ? b->cap * 2 : 64;
@@ -120,6 +118,22 @@ static inline char tb_toupper(char c) {
 
 static inline bool tb_isspace(char c) {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+}
+
+static inline bool tb_isdigit(char c) {
+    return c >= '0' && c <= '9';
+}
+
+static inline bool tb_isalpha(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static inline bool tb_isalnum(char c) {
+    return tb_isalpha(c) || tb_isdigit(c);
+}
+
+static inline bool tb_isxdigit(char c) {
+    return tb_isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
 static inline int tb_strcasecmp(const char *a, const char *b) {

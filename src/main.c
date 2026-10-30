@@ -5,11 +5,6 @@
 #include "mem.h"
 #include "tui.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <unistd.h>
-
 static void print_help(const char *prog) {
     printf(
         "TB (TinyBrowser) — Sub-10 MB TUI Web Browser & ES6+ JavaScript Engine\n"

@@ -1,7 +1,4 @@
-#define _GNU_SOURCE
 #include "layout.h"
-
-#include <stdlib.h>
 
 void layout_init(LayoutDoc *ld) {
     memset(ld, 0, sizeof(*ld));

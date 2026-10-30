@@ -1,17 +1,6 @@
-#define _GNU_SOURCE
 #include "tui.h"
 #include "common.h"
 #include "mem.h"
-
-#include <errno.h>
-#include <poll.h>
-#include <signal.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/ioctl.h>
-#include <termios.h>
-#include <unistd.h>
 
 static struct termios        g_orig_tios;
 static bool                  g_tios_active = false;
@@ -585,7 +574,8 @@ int tb_tui_run(TbBrowser *b) {
                     if (finished == PROMPT_URL && prompt_buf[0]) {
                         tb_browser_navigate(b, prompt_buf, true);
                     } else if (finished == PROMPT_SEARCH) {
-                        snprintf(search_query, sizeof(search_query), "%s", prompt_buf);
+                        snprintf(search_query, sizeof(search_query), "%.*s",
+                                 (int)(sizeof(search_query) - 1), prompt_buf);
                         if (search_query[0]) search_jump(b, search_query, 1, doc_rows);
                     } else if (finished == PROMPT_REPL && prompt_buf[0]) {
                         tb_browser_eval_repl(b, prompt_buf);

@@ -1,8 +1,5 @@
 #include "js.h"
 
-#include <ctype.h>
-#include <stdlib.h>
-
 typedef enum {
     TOK_EOF = 0,
     TOK_NUM,

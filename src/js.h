@@ -3,6 +3,7 @@
 
 #include "common.h"
 #include "dom.h"
+#include "regex_tb.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -96,6 +97,8 @@ typedef struct {
     JsVal   *items;
     uint32_t len;
     uint32_t cap;
+    int32_t  match_index;
+    JsStr   *match_input;
 } JsArrObj;
 
 typedef struct {
@@ -122,10 +125,12 @@ typedef struct {
 } JsNativeFnObj;
 
 typedef struct {
-    JsObj  hdr;
-    JsObj *proto;
-    char  *pattern;
-    char  *flags;
+    JsObj    hdr;
+    JsObj   *proto;
+    char    *pattern;
+    char    *flags;
+    TbRegex *compiled;
+    size_t   last_index;
 } JsRegexObj;
 
 typedef struct {
@@ -398,8 +403,6 @@ void   js_log(JsVm *vm, JsLogLevel level, const char *fmt, ...)
 void   js_throw_str(JsVm *vm, const char *msg);
 
 void   js_stdlib_init(JsVm *vm);
-bool   js_regex_exec_posix(const char *pat, const char *flags, const char *subj,
-                           size_t offset, size_t *match_start, size_t *match_end);
 
 static inline bool js_temp_push(JsVm *vm, JsVal v) {
     if (vm->temp_sp >= JS_MAX_TEMP_ROOTS) return false;

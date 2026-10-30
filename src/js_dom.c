@@ -1,9 +1,5 @@
-#define _GNU_SOURCE
 #include "js.h"
 #include "net.h"
-
-#include <ctype.h>
-#include <stdlib.h>
 
 static void on_dom_node_destroy(void *userdata, DomNode *node) {
     (void)userdata;

@@ -1,11 +1,6 @@
-#define _GNU_SOURCE
 #include "js.h"
-
-#include <ctype.h>
-#include <math.h>
-#include <regex.h>
-#include <stdlib.h>
-#include <time.h>
+#include "math_tb.h"
+#include "regex_tb.h"
 
 static JsVal make_str_val(JsVm *vm, const char *s, size_t len) {
     JsStr *st = js_str_new(vm, s, len);
@@ -17,63 +12,101 @@ static JsVal make_cstr_val(JsVm *vm, const char *s) {
     return st ? js_obj_val((JsObj *)st) : js_undefined();
 }
 
-/* POSIX ERE translator for JS regex shorthands (\d, \s, \w, etc.) */
-static void translate_js_regex(const char *pat, TbBuf *out) {
-    bool in_cls = false;
-    for (size_t i = 0; pat[i]; i++) {
-        if (pat[i] == '[') in_cls = true;
-        else if (pat[i] == ']') in_cls = false;
-        if (pat[i] == '\\' && pat[i + 1]) {
-            char nxt = pat[++i];
-            switch (nxt) {
-                case 'd': tb_buf_append_cstr(out, in_cls ? "0-9" : "[0-9]"); break;
-                case 'D': tb_buf_append_cstr(out, "[^0-9]"); break;
-                case 's': tb_buf_append_cstr(out, in_cls ? " \t\r\n\f\v" : "[ \t\r\n\f\v]"); break;
-                case 'S': tb_buf_append_cstr(out, "[^ \t\r\n\f\v]"); break;
-                case 'w': tb_buf_append_cstr(out, in_cls ? "A-Za-z0-9_" : "[A-Za-z0-9_]"); break;
-                case 'W': tb_buf_append_cstr(out, "[^A-Za-z0-9_]"); break;
-                case 'n': tb_buf_append_char(out, '\n'); break;
-                case 'r': tb_buf_append_char(out, '\r'); break;
-                case 't': tb_buf_append_char(out, '\t'); break;
-                default:
-                    tb_buf_append_char(out, '\\');
-                    tb_buf_append_char(out, nxt);
-                    break;
-            }
+static JsVal build_match_array(JsVm *vm, JsStr *subj, const TbRegexMatch *m) {
+    JsObj *arr = js_arr_new(vm, m->group_count);
+    if (!arr) return js_null();
+    int saved_sp = vm->temp_sp;
+    js_temp_push(vm, js_obj_val(arr));
+    js_temp_push(vm, js_obj_val((JsObj *)subj));
+    JsArrObj *a = (JsArrObj *)arr;
+    a->match_index = (int32_t)m->starts[0];
+    a->match_input = subj;
+    for (uint32_t g = 0; g < m->group_count; g++) {
+        if (m->starts[g] != SIZE_MAX && m->ends[g] >= m->starts[g]) {
+            js_arr_push(vm, arr, make_str_val(vm, subj->data + m->starts[g],
+                                              m->ends[g] - m->starts[g]));
         } else {
-            tb_buf_append_char(out, pat[i]);
+            js_arr_push(vm, arr, js_undefined());
         }
     }
-    if (out->len == 0) tb_buf_append_cstr(out, "()");
+    vm->temp_sp = saved_sp;
+    return js_obj_val(arr);
 }
 
-bool js_regex_exec_posix(const char *pat, const char *flags, const char *subj,
-                         size_t offset, size_t *match_start, size_t *match_end) {
-    size_t slen = strlen(subj);
-    if (offset > slen) return false;
-    TbBuf ere;
-    tb_buf_init(&ere);
-    translate_js_regex(pat ? pat : "", &ere);
+static void append_regex_subst(TbBuf *out, const char *subj, size_t slen,
+                               const TbRegexMatch *m, const char *rep, size_t rlen) {
+    size_t ms = m->starts[0];
+    size_t me = m->ends[0];
+    for (size_t i = 0; i < rlen; i++) {
+        if (rep[i] == '$' && i + 1 < rlen) {
+            char nx = rep[i + 1];
+            if (nx == '$') {
+                tb_buf_append_char(out, '$');
+                i++;
+                continue;
+            }
+            if (nx == '&') {
+                tb_buf_append(out, subj + ms, me - ms);
+                i++;
+                continue;
+            }
+            if (nx == '`') {
+                tb_buf_append(out, subj, ms);
+                i++;
+                continue;
+            }
+            if (nx == '\'') {
+                if (me < slen) tb_buf_append(out, subj + me, slen - me);
+                i++;
+                continue;
+            }
+            if (nx >= '1' && nx <= '9') {
+                uint32_t g = (uint32_t)(nx - '0');
+                size_t adv = 1;
+                if (i + 2 < rlen && rep[i + 2] >= '0' && rep[i + 2] <= '9') {
+                    uint32_t g2 = g * 10U + (uint32_t)(rep[i + 2] - '0');
+                    if (g2 < m->group_count) {
+                        g = g2;
+                        adv = 2;
+                    }
+                }
+                if (g < m->group_count) {
+                    if (m->starts[g] != SIZE_MAX && m->ends[g] >= m->starts[g]) {
+                        tb_buf_append(out, subj + m->starts[g], m->ends[g] - m->starts[g]);
+                    }
+                    i += adv;
+                    continue;
+                }
+            }
+        }
+        tb_buf_append_char(out, rep[i]);
+    }
+}
 
-    int cflags = REG_EXTENDED;
-    if (flags && strchr(flags, 'i')) cflags |= REG_ICASE;
-    if (flags && strchr(flags, 'm')) cflags |= REG_NEWLINE;
+static bool invoke_replace_cb(JsVm *vm, JsVal cb, JsStr *subj, const TbRegexMatch *m, TbBuf *out) {
+    int saved_sp = vm->temp_sp;
+    js_temp_push(vm, cb);
+    js_temp_push(vm, js_obj_val((JsObj *)subj));
+    int arg_base = vm->temp_sp;
+    int argc = 0;
+    for (uint32_t g = 0; g < m->group_count; g++) {
+        JsVal gv = (m->starts[g] != SIZE_MAX && m->ends[g] >= m->starts[g])
+                       ? make_str_val(vm, subj->data + m->starts[g], m->ends[g] - m->starts[g])
+                       : js_undefined();
+        if (!js_temp_push(vm, gv)) break;
+        argc++;
+    }
+    if (js_temp_push(vm, js_num((double)m->starts[0]))) argc++;
+    if (js_temp_push(vm, js_obj_val((JsObj *)subj))) argc++;
 
-    regex_t re;
-    if (regcomp(&re, ere.data ? ere.data : "", cflags) != 0) {
-        tb_buf_free(&ere);
+    JsVal rv = js_call(vm, cb, js_undefined(), argc, &vm->temp_roots[arg_base]);
+    if (vm->has_thrown) {
+        vm->temp_sp = saved_sp;
         return false;
     }
-    tb_buf_free(&ere);
-
-    regmatch_t pm[1];
-    int eflags = (offset > 0) ? REG_NOTBOL : 0;
-    int rc     = regexec(&re, subj + offset, 1, pm, eflags);
-    regfree(&re);
-    if (rc != 0 || pm[0].rm_so < 0) return false;
-
-    *match_start = offset + (size_t)pm[0].rm_so;
-    *match_end   = offset + (size_t)pm[0].rm_eo;
+    JsStr *rs = js_to_str(vm, rv);
+    if (rs) tb_buf_append(out, rs->data, rs->len);
+    vm->temp_sp = saved_sp;
     return true;
 }
 
@@ -84,7 +117,7 @@ static JsVal fn_global_misc(JsVm *vm, JsVal this_val, int argc, const JsVal *arg
     switch (magic) {
         case 0: { /* parseInt */
             JsStr *s = js_to_str(vm, a0);
-            if (!s) return js_num(NAN);
+            if (!s) return js_num(TB_NAN);
             const char *p = s->data;
             while (*p && tb_isspace(*p)) p++;
             int radix = (argc > 1 && argv[1].type != JS_UNDEFINED) ? (int)js_to_num(vm, argv[1]) : 0;
@@ -92,30 +125,30 @@ static JsVal fn_global_misc(JsVm *vm, JsVal this_val, int argc, const JsVal *arg
                 if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) radix = 16;
                 else radix = 10;
             }
-            if (radix < 2 || radix > 36) return js_num(NAN);
+            if (radix < 2 || radix > 36) return js_num(TB_NAN);
             char *endp = NULL;
             long long v = strtoll(p, &endp, radix);
-            return (endp == p) ? js_num(NAN) : js_num((double)v);
+            return (endp == p) ? js_num(TB_NAN) : js_num((double)v);
         }
         case 1: { /* parseFloat */
             JsStr *s = js_to_str(vm, a0);
-            if (!s) return js_num(NAN);
+            if (!s) return js_num(TB_NAN);
             const char *p = s->data;
             while (*p && tb_isspace(*p)) p++;
             char *endp = NULL;
             double v   = strtod(p, &endp);
-            return (endp == p) ? js_num(NAN) : js_num(v);
+            return (endp == p) ? js_num(TB_NAN) : js_num(v);
         }
         case 2: /* isNaN */
-            return js_bool(isnan(js_to_num(vm, a0)));
+            return js_bool(tb_isnan(js_to_num(vm, a0)));
         case 3: { /* isFinite */
             double d = js_to_num(vm, a0);
-            return js_bool(!isnan(d) && !isinf(d));
+            return js_bool(!tb_isnan(d) && !tb_isinf(d));
         }
         case 4: /* Number.isNaN */
-            return js_bool(a0.type == JS_NUMBER && isnan(a0.u.num));
+            return js_bool(a0.type == JS_NUMBER && tb_isnan(a0.u.num));
         case 5: /* Number.isInteger */
-            return js_bool(a0.type == JS_NUMBER && isfinite(a0.u.num) && floor(a0.u.num) == a0.u.num);
+            return js_bool(a0.type == JS_NUMBER && tb_isfinite(a0.u.num) && tb_floor(a0.u.num) == a0.u.num);
         case 6: /* Number() */
             return js_num(argc > 0 ? js_to_num(vm, a0) : 0.0);
         case 7: /* String() */
@@ -152,7 +185,7 @@ static JsVal fn_global_misc(JsVm *vm, JsVal this_val, int argc, const JsVal *arg
             tb_buf_init(&b);
             for (uint32_t i = 0; i < s->len; i++) {
                 uint8_t c = (uint8_t)s->data[i];
-                if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '!' ||
+                if (tb_isalnum((char)c) || c == '-' || c == '_' || c == '.' || c == '!' ||
                     c == '~' || c == '*' || c == '\'' || c == '(' || c == ')') {
                     tb_buf_append_char(&b, (char)c);
                 } else {
@@ -170,7 +203,7 @@ static JsVal fn_global_misc(JsVm *vm, JsVal this_val, int argc, const JsVal *arg
             tb_buf_init(&b);
             for (uint32_t i = 0; i < s->len; i++) {
                 if (s->data[i] == '%' && i + 2 < s->len &&
-                    isxdigit((uint8_t)s->data[i + 1]) && isxdigit((uint8_t)s->data[i + 2])) {
+                    tb_isxdigit(s->data[i + 1]) && tb_isxdigit(s->data[i + 2])) {
                     char hx[3] = { s->data[i + 1], s->data[i + 2], '\0' };
                     tb_buf_append_char(&b, (char)strtol(hx, NULL, 16));
                     i += 2;
@@ -201,14 +234,14 @@ static JsVal fn_num_proto(JsVm *vm, JsVal this_val, int argc, const JsVal *argv,
         int digits = (argc > 0 && argv[0].type != JS_UNDEFINED) ? (int)js_to_num(vm, argv[0]) : 0;
         if (digits < 0) digits = 0;
         if (digits > 20) digits = 20;
-        if (isnan(n) || isinf(n)) return js_obj_val((JsObj *)js_to_str(vm, js_num(n)));
+        if (tb_isnan(n) || tb_isinf(n)) return js_obj_val((JsObj *)js_to_str(vm, js_num(n)));
         char buf[128];
         snprintf(buf, sizeof(buf), "%.*f", digits, n);
         return make_cstr_val(vm, buf);
     }
     /* toString(radix) */
     int radix = (argc > 0 && argv[0].type != JS_UNDEFINED) ? (int)js_to_num(vm, argv[0]) : 10;
-    if (radix == 10 || radix < 2 || radix > 36 || !isfinite(n)) {
+    if (radix == 10 || radix < 2 || radix > 36 || !tb_isfinite(n)) {
         return js_obj_val((JsObj *)js_to_str(vm, js_num(n)));
     }
     long long iv = (long long)n;
@@ -320,22 +353,56 @@ static JsVal fn_object(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, in
 /* RegExp methods */
 static JsVal fn_regexp(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     if (magic == 0) { /* RegExp(pat, flags) */
-        JsStr *p = argc > 0 && argv[0].type != JS_UNDEFINED ? js_to_str(vm, argv[0]) : js_str_cstr(vm, "");
-        JsStr *f = argc > 1 && argv[1].type != JS_UNDEFINED ? js_to_str(vm, argv[1]) : js_str_cstr(vm, "");
-        return js_obj_val(js_regex_new(vm, p ? p->data : "", f ? f->data : ""));
+        const char *pat_c = "";
+        const char *flg_c = "";
+        JsStr *p = NULL;
+        JsStr *f = NULL;
+        int saved_sp = vm->temp_sp;
+        if (argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj &&
+            argv[0].u.obj->obj_type == OBJ_REGEX) {
+            JsRegexObj *src_rx = (JsRegexObj *)argv[0].u.obj;
+            pat_c = src_rx->pattern ? src_rx->pattern : "";
+            flg_c = src_rx->flags ? src_rx->flags : "";
+        } else if (argc > 0 && argv[0].type != JS_UNDEFINED) {
+            p = js_to_str(vm, argv[0]);
+            if (p) {
+                js_temp_push(vm, js_obj_val((JsObj *)p));
+                pat_c = p->data;
+            }
+        }
+        if (argc > 1 && argv[1].type != JS_UNDEFINED) {
+            f = js_to_str(vm, argv[1]);
+            if (f) {
+                js_temp_push(vm, js_obj_val((JsObj *)f));
+                flg_c = f->data;
+            }
+        }
+        JsObj *rxo = js_regex_new(vm, pat_c, flg_c);
+        vm->temp_sp = saved_sp;
+        return rxo ? js_obj_val(rxo) : js_undefined();
     }
     if (this_val.type != JS_OBJECT || !this_val.u.obj || this_val.u.obj->obj_type != OBJ_REGEX)
         return magic == 1 ? js_bool(false) : js_null();
     JsRegexObj *rx = (JsRegexObj *)this_val.u.obj;
     JsStr *subj    = js_to_str(vm, argc > 0 ? argv[0] : js_undefined());
-    if (!subj) return magic == 1 ? js_bool(false) : js_null();
-    size_t ms = 0, me = 0;
-    bool hit = js_regex_exec_posix(rx->pattern, rx->flags, subj->data, 0, &ms, &me);
-    if (magic == 1) return js_bool(hit); /* test */
-    if (!hit) return js_null();          /* exec */
-    JsObj *arr = js_arr_new(vm, 1);
-    if (arr) js_arr_push(vm, arr, make_str_val(vm, subj->data + ms, me - ms));
-    return js_obj_val(arr);
+    if (!subj || !rx->compiled) return magic == 1 ? js_bool(false) : js_null();
+
+    uint32_t rf      = tb_regex_flags(rx->compiled);
+    bool use_last    = (rf & (TB_RX_GLOBAL | TB_RX_STICKY)) != 0;
+    size_t start_pos = use_last ? rx->last_index : 0;
+    if (start_pos > subj->len) {
+        if (use_last) rx->last_index = 0;
+        return magic == 1 ? js_bool(false) : js_null();
+    }
+    TbRegexMatch m;
+    bool hit = tb_regex_exec(rx->compiled, subj->data, subj->len, start_pos, &m);
+    if (!hit) {
+        if (use_last) rx->last_index = 0;
+        return magic == 1 ? js_bool(false) : js_null();
+    }
+    if (use_last) rx->last_index = m.ends[0];
+    if (magic == 1) return js_bool(true); /* test */
+    return build_match_array(vm, subj, &m); /* exec */
 }
 
 /* String & String.prototype */
@@ -368,7 +435,7 @@ static JsVal fn_str_proto(JsVm *vm, JsVal this_val, int argc, const JsVal *argv,
         }
         case 2: { /* charCodeAt */
             int idx = argc > 0 ? (int)js_to_num(vm, argv[0]) : 0;
-            if (idx < 0 || idx >= slen) return js_num(NAN);
+            if (idx < 0 || idx >= slen) return js_num(TB_NAN);
             return js_num((double)(uint8_t)s->data[idx]);
         }
         case 3: { /* slice */
@@ -475,105 +542,287 @@ static JsVal fn_str_proto(JsVm *vm, JsVal this_val, int argc, const JsVal *argv,
         case 16: { /* split */
             JsObj *arr = js_arr_new(vm, 8);
             if (!arr) return js_undefined();
+            uint32_t limit = 0xFFFFFFFFU;
+            if (argc > 1 && argv[1].type != JS_UNDEFINED) {
+                double lim_d = js_to_num(vm, argv[1]);
+                limit = (lim_d >= 0.0 && !tb_isnan(lim_d)) ? (uint32_t)lim_d : 0U;
+            }
+            if (limit == 0) return js_obj_val(arr);
             if (argc == 0 || argv[0].type == JS_UNDEFINED) {
                 js_arr_push(vm, arr, js_obj_val((JsObj *)s));
                 return js_obj_val(arr);
             }
+            int saved_sp = vm->temp_sp;
+            js_temp_push(vm, js_obj_val((JsObj *)s));
+            js_temp_push(vm, js_obj_val(arr));
             if (argv[0].type == JS_OBJECT && argv[0].u.obj && argv[0].u.obj->obj_type == OBJ_REGEX) {
                 JsRegexObj *rx = (JsRegexObj *)argv[0].u.obj;
-                size_t pos = 0, ms = 0, me = 0;
-                while (pos <= s->len && js_regex_exec_posix(rx->pattern, rx->flags, s->data, pos, &ms, &me)) {
-                    if (me == pos) { pos++; continue; }
-                    js_arr_push(vm, arr, make_str_val(vm, s->data + pos, ms - pos));
-                    pos = me;
+                if (!rx->compiled) {
+                    js_arr_push(vm, arr, js_obj_val((JsObj *)s));
+                    vm->temp_sp = saved_sp;
+                    return js_obj_val(arr);
                 }
-                js_arr_push(vm, arr, make_str_val(vm, s->data + pos, s->len - pos));
+                if (s->len == 0) {
+                    TbRegexMatch em;
+                    if (!tb_regex_exec(rx->compiled, "", 0, 0, &em)) {
+                        js_arr_push(vm, arr, make_cstr_val(vm, ""));
+                    }
+                    vm->temp_sp = saved_sp;
+                    return js_obj_val(arr);
+                }
+                size_t last_end = 0;
+                size_t scan_pos = 0;
+                TbRegexMatch m;
+                while (scan_pos <= s->len &&
+                       tb_regex_exec(rx->compiled, s->data, s->len, scan_pos, &m)) {
+                    if (m.starts[0] == s->len && m.ends[0] == s->len) break;
+                    if (m.ends[0] == last_end) {
+                        scan_pos++;
+                        continue;
+                    }
+                    js_arr_push(vm, arr, make_str_val(vm, s->data + last_end, m.starts[0] - last_end));
+                    if (((JsArrObj *)arr)->len >= limit) {
+                        vm->temp_sp = saved_sp;
+                        return js_obj_val(arr);
+                    }
+                    for (uint32_t g = 1; g < m.group_count; g++) {
+                        JsVal gv = (m.starts[g] != SIZE_MAX && m.ends[g] >= m.starts[g])
+                                       ? make_str_val(vm, s->data + m.starts[g], m.ends[g] - m.starts[g])
+                                       : js_undefined();
+                        js_arr_push(vm, arr, gv);
+                        if (((JsArrObj *)arr)->len >= limit) {
+                            vm->temp_sp = saved_sp;
+                            return js_obj_val(arr);
+                        }
+                    }
+                    last_end = m.ends[0];
+                    scan_pos = (m.ends[0] == m.starts[0]) ? m.ends[0] + 1 : m.ends[0];
+                }
+                if (((JsArrObj *)arr)->len < limit) {
+                    js_arr_push(vm, arr, make_str_val(vm, s->data + last_end, s->len - last_end));
+                }
+                vm->temp_sp = saved_sp;
                 return js_obj_val(arr);
             }
             JsStr *sep = js_to_str(vm, argv[0]);
+            if (sep) js_temp_push(vm, js_obj_val((JsObj *)sep));
             if (!sep || sep->len == 0) {
-                for (uint32_t i = 0; i < s->len; i++) {
+                for (uint32_t i = 0; i < s->len && ((JsArrObj *)arr)->len < limit; i++) {
                     js_arr_push(vm, arr, make_str_val(vm, s->data + i, 1));
                 }
+                vm->temp_sp = saved_sp;
                 return js_obj_val(arr);
             }
             const char *p = s->data;
             const char *hit;
             while ((hit = strstr(p, sep->data)) != NULL) {
                 js_arr_push(vm, arr, make_str_val(vm, p, (size_t)(hit - p)));
+                if (((JsArrObj *)arr)->len >= limit) {
+                    vm->temp_sp = saved_sp;
+                    return js_obj_val(arr);
+                }
                 p = hit + sep->len;
             }
-            js_arr_push(vm, arr, make_cstr_val(vm, p));
+            if (((JsArrObj *)arr)->len < limit) {
+                js_arr_push(vm, arr, make_cstr_val(vm, p));
+            }
+            vm->temp_sp = saved_sp;
             return js_obj_val(arr);
         }
         case 17:   /* replace */
         case 18: { /* replaceAll */
             if (argc < 2) return js_obj_val((JsObj *)s);
-            JsStr *rep = js_to_str(vm, argv[1]);
-            if (!rep) return js_obj_val((JsObj *)s);
+            int saved_sp = vm->temp_sp;
+            js_temp_push(vm, js_obj_val((JsObj *)s));
+
+            bool is_fn = (argv[1].type == JS_OBJECT && argv[1].u.obj &&
+                          (argv[1].u.obj->obj_type == OBJ_FUNC ||
+                           argv[1].u.obj->obj_type == OBJ_NATIVE_FN));
+            JsStr *rep = NULL;
+            if (!is_fn) {
+                rep = js_to_str(vm, argv[1]);
+                if (!rep) {
+                    vm->temp_sp = saved_sp;
+                    return js_obj_val((JsObj *)s);
+                }
+                js_temp_push(vm, js_obj_val((JsObj *)rep));
+            }
+
             bool all = (magic == 18);
             TbBuf b;
             tb_buf_init(&b);
 
             if (argv[0].type == JS_OBJECT && argv[0].u.obj && argv[0].u.obj->obj_type == OBJ_REGEX) {
                 JsRegexObj *rx = (JsRegexObj *)argv[0].u.obj;
-                if (rx->flags && strchr(rx->flags, 'g')) all = true;
-                size_t pos = 0, ms = 0, me = 0;
-                while (pos <= s->len && js_regex_exec_posix(rx->pattern, rx->flags, s->data, pos, &ms, &me)) {
-                    tb_buf_append(&b, s->data + pos, ms - pos);
-                    tb_buf_append(&b, rep->data, rep->len);
-                    if (me == pos) {
-                        if (pos < s->len) tb_buf_append_char(&b, s->data[pos]);
-                        pos++;
-                    } else {
-                        pos = me;
-                    }
-                    if (!all) break;
-                }
-                if (pos < s->len) tb_buf_append(&b, s->data + pos, s->len - pos);
-            } else {
-                JsStr *pat = js_to_str(vm, argv[0]);
-                if (!pat || pat->len == 0) {
+                if (!rx->compiled) {
                     tb_buf_free(&b);
+                    vm->temp_sp = saved_sp;
                     return js_obj_val((JsObj *)s);
                 }
-                const char *p = s->data;
-                const char *hit;
-                while ((hit = strstr(p, pat->data)) != NULL) {
-                    tb_buf_append(&b, p, (size_t)(hit - p));
-                    tb_buf_append(&b, rep->data, rep->len);
-                    p = hit + pat->len;
-                    if (!all) break;
+                uint32_t rf = tb_regex_flags(rx->compiled);
+                if (rf & TB_RX_GLOBAL) {
+                    all = true;
+                    rx->last_index = 0;
                 }
-                tb_buf_append_cstr(&b, p);
+                size_t last_end = 0;
+                size_t scan_pos = 0;
+                TbRegexMatch m;
+                while (scan_pos <= s->len &&
+                       tb_regex_exec(rx->compiled, s->data, s->len, scan_pos, &m)) {
+                    if (m.starts[0] > last_end) {
+                        tb_buf_append(&b, s->data + last_end, m.starts[0] - last_end);
+                    }
+                    if (is_fn) {
+                        if (!invoke_replace_cb(vm, argv[1], s, &m, &b)) {
+                            tb_buf_free(&b);
+                            vm->temp_sp = saved_sp;
+                            return js_undefined();
+                        }
+                    } else {
+                        append_regex_subst(&b, s->data, s->len, &m, rep->data, rep->len);
+                    }
+                    last_end = m.ends[0];
+                    if (!all) break;
+                    if (m.ends[0] == m.starts[0]) {
+                        if (m.ends[0] < s->len) {
+                            tb_buf_append_char(&b, s->data[m.ends[0]]);
+                            last_end = m.ends[0] + 1;
+                        }
+                        scan_pos = m.ends[0] + 1;
+                    } else {
+                        scan_pos = m.ends[0];
+                    }
+                }
+                if (last_end < s->len) tb_buf_append(&b, s->data + last_end, s->len - last_end);
+            } else {
+                JsStr *pat = js_to_str(vm, argv[0]);
+                if (!pat) {
+                    tb_buf_free(&b);
+                    vm->temp_sp = saved_sp;
+                    return js_obj_val((JsObj *)s);
+                }
+                js_temp_push(vm, js_obj_val((JsObj *)pat));
+                if (pat->len == 0) {
+                    for (size_t i = 0; i <= s->len; i++) {
+                        TbRegexMatch m;
+                        memset(&m, 0, sizeof(m));
+                        m.group_count = 1;
+                        m.starts[0]   = i;
+                        m.ends[0]     = i;
+                        if (is_fn) {
+                            if (!invoke_replace_cb(vm, argv[1], s, &m, &b)) {
+                                tb_buf_free(&b);
+                                vm->temp_sp = saved_sp;
+                                return js_undefined();
+                            }
+                        } else {
+                            append_regex_subst(&b, s->data, s->len, &m, rep->data, rep->len);
+                        }
+                        if (!all) {
+                            tb_buf_append(&b, s->data, s->len);
+                            break;
+                        }
+                        if (i < s->len) tb_buf_append_char(&b, s->data[i]);
+                    }
+                } else {
+                    size_t pos = 0;
+                    const char *hit;
+                    while ((hit = strstr(s->data + pos, pat->data)) != NULL) {
+                        size_t ms = (size_t)(hit - s->data);
+                        size_t me = ms + pat->len;
+                        if (ms > pos) tb_buf_append(&b, s->data + pos, ms - pos);
+                        TbRegexMatch m;
+                        memset(&m, 0, sizeof(m));
+                        m.group_count = 1;
+                        m.starts[0]   = ms;
+                        m.ends[0]     = me;
+                        if (is_fn) {
+                            if (!invoke_replace_cb(vm, argv[1], s, &m, &b)) {
+                                tb_buf_free(&b);
+                                vm->temp_sp = saved_sp;
+                                return js_undefined();
+                            }
+                        } else {
+                            append_regex_subst(&b, s->data, s->len, &m, rep->data, rep->len);
+                        }
+                        pos = me;
+                        if (!all) break;
+                    }
+                    if (pos < s->len) tb_buf_append(&b, s->data + pos, s->len - pos);
+                }
             }
             JsVal r = make_str_val(vm, b.data ? b.data : "", b.len);
             tb_buf_free(&b);
+            vm->temp_sp = saved_sp;
             return r;
         }
         case 19: { /* match */
-            if (argc == 0) return js_null();
+            int saved_sp = vm->temp_sp;
+            js_temp_push(vm, js_obj_val((JsObj *)s));
+            if (argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj &&
+                argv[0].u.obj->obj_type == OBJ_REGEX) {
+                JsRegexObj *rx = (JsRegexObj *)argv[0].u.obj;
+                if (!rx->compiled) {
+                    vm->temp_sp = saved_sp;
+                    return js_null();
+                }
+                uint32_t rf = tb_regex_flags(rx->compiled);
+                if (!(rf & TB_RX_GLOBAL)) {
+                    size_t start_pos = (rf & TB_RX_STICKY) ? rx->last_index : 0;
+                    if (start_pos > s->len) {
+                        if (rf & TB_RX_STICKY) rx->last_index = 0;
+                        vm->temp_sp = saved_sp;
+                        return js_null();
+                    }
+                    TbRegexMatch m;
+                    bool hit = tb_regex_exec(rx->compiled, s->data, s->len, start_pos, &m);
+                    if (!hit) {
+                        if (rf & TB_RX_STICKY) rx->last_index = 0;
+                        vm->temp_sp = saved_sp;
+                        return js_null();
+                    }
+                    if (rf & TB_RX_STICKY) rx->last_index = m.ends[0];
+                    JsVal res = build_match_array(vm, s, &m);
+                    vm->temp_sp = saved_sp;
+                    return res;
+                }
+                rx->last_index = 0;
+                JsObj *arr = js_arr_new(vm, 4);
+                if (arr) js_temp_push(vm, js_obj_val(arr));
+                size_t pos = 0;
+                bool any = false;
+                TbRegexMatch m;
+                while (pos <= s->len &&
+                       tb_regex_exec(rx->compiled, s->data, s->len, pos, &m)) {
+                    any = true;
+                    js_arr_push(vm, arr, make_str_val(vm, s->data + m.starts[0],
+                                                      m.ends[0] - m.starts[0]));
+                    pos = (m.ends[0] > m.starts[0]) ? m.ends[0] : m.ends[0] + 1;
+                }
+                vm->temp_sp = saved_sp;
+                return any ? js_obj_val(arr) : js_null();
+            }
             const char *pat = "";
-            const char *flg = "";
-            JsStr *tmp_s = NULL;
-            if (argv[0].type == JS_OBJECT && argv[0].u.obj && argv[0].u.obj->obj_type == OBJ_REGEX) {
-                pat = ((JsRegexObj *)argv[0].u.obj)->pattern;
-                flg = ((JsRegexObj *)argv[0].u.obj)->flags;
-            } else {
-                tmp_s = js_to_str(vm, argv[0]);
-                if (tmp_s) pat = tmp_s->data;
+            if (argc > 0 && argv[0].type != JS_UNDEFINED) {
+                JsStr *ps = js_to_str(vm, argv[0]);
+                if (ps) {
+                    js_temp_push(vm, js_obj_val((JsObj *)ps));
+                    pat = ps->data;
+                }
             }
-            bool global = flg && strchr(flg, 'g');
-            JsObj *arr = js_arr_new(vm, 4);
-            size_t pos = 0, ms = 0, me = 0;
-            bool any = false;
-            while (pos <= s->len && js_regex_exec_posix(pat, flg, s->data, pos, &ms, &me)) {
-                any = true;
-                js_arr_push(vm, arr, make_str_val(vm, s->data + ms, me - ms));
-                if (!global) break;
-                pos = (me > pos) ? me : pos + 1;
+            char err_buf[128] = "";
+            TbRegex *tmp_rx = tb_regex_compile(pat, "", err_buf, sizeof(err_buf));
+            if (!tmp_rx) {
+                vm->temp_sp = saved_sp;
+                if (err_buf[0]) js_throw_str(vm, err_buf);
+                return js_undefined();
             }
-            return any ? js_obj_val(arr) : js_null();
+            TbRegexMatch m;
+            bool hit = tb_regex_exec(tmp_rx, s->data, s->len, 0, &m);
+            tb_regex_free(tmp_rx);
+            JsVal res = hit ? build_match_array(vm, s, &m) : js_null();
+            vm->temp_sp = saved_sp;
+            return res;
         }
         case 20: { /* lastIndexOf */
             JsStr *ndl = js_to_str(vm, argc > 0 ? argv[0] : js_undefined());
@@ -582,6 +831,37 @@ static JsVal fn_str_proto(JsVm *vm, JsVal this_val, int argc, const JsVal *argv,
                 if (memcmp(s->data + i, ndl->data, ndl->len) == 0) return js_num((double)i);
             }
             return js_num(-1);
+        }
+        case 21: { /* search */
+            if (argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj &&
+                argv[0].u.obj->obj_type == OBJ_REGEX) {
+                JsRegexObj *rx = (JsRegexObj *)argv[0].u.obj;
+                if (!rx->compiled) return js_num(-1);
+                TbRegexMatch m;
+                bool hit = tb_regex_exec(rx->compiled, s->data, s->len, 0, &m);
+                return js_num(hit ? (double)m.starts[0] : -1.0);
+            }
+            int saved_sp = vm->temp_sp;
+            js_temp_push(vm, js_obj_val((JsObj *)s));
+            const char *pat = "";
+            if (argc > 0 && argv[0].type != JS_UNDEFINED) {
+                JsStr *ps = js_to_str(vm, argv[0]);
+                if (ps) {
+                    js_temp_push(vm, js_obj_val((JsObj *)ps));
+                    pat = ps->data;
+                }
+            }
+            char err_buf[128] = "";
+            TbRegex *tmp_rx = tb_regex_compile(pat, "", err_buf, sizeof(err_buf));
+            vm->temp_sp = saved_sp;
+            if (!tmp_rx) {
+                if (err_buf[0]) js_throw_str(vm, err_buf);
+                return js_undefined();
+            }
+            TbRegexMatch m;
+            bool hit = tb_regex_exec(tmp_rx, s->data, s->len, 0, &m);
+            tb_regex_free(tmp_rx);
+            return js_num(hit ? (double)m.starts[0] : -1.0);
         }
         default:
             return js_undefined();
@@ -734,7 +1014,7 @@ static JsVal fn_arr_proto(JsVm *vm, JsVal this_val, int argc, const JsVal *argv,
             for (uint32_t i = 0; i < a->len; i++) {
                 bool eq = js_strict_eq(a->items[i], needle) ||
                           (magic == 9 && a->items[i].type == JS_NUMBER && needle.type == JS_NUMBER &&
-                           isnan(a->items[i].u.num) && isnan(needle.u.num));
+                           tb_isnan(a->items[i].u.num) && tb_isnan(needle.u.num));
                 if (eq) return magic == 8 ? js_num((double)i) : js_bool(true);
             }
             return magic == 8 ? js_num(-1) : js_bool(false);
@@ -844,46 +1124,48 @@ static JsVal fn_math(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int 
     (void)this_val;
     if (magic == 20) return js_num((double)rand() / ((double)RAND_MAX + 1.0));
     if (magic == 21 || magic == 22) { /* min(21), max(22) */
-        double best = (magic == 21) ? INFINITY : -INFINITY;
+        double best = (magic == 21) ? TB_INFINITY : -TB_INFINITY;
         for (int i = 0; i < argc; i++) {
             double v = js_to_num(vm, argv[i]);
-            if (isnan(v)) return js_num(NAN);
+            if (tb_isnan(v)) return js_num(TB_NAN);
             if ((magic == 21 && v < best) || (magic == 22 && v > best)) best = v;
         }
         return js_num(best);
     }
-    double x = argc > 0 ? js_to_num(vm, argv[0]) : NAN;
-    double y = argc > 1 ? js_to_num(vm, argv[1]) : NAN;
+    double x = argc > 0 ? js_to_num(vm, argv[0]) : TB_NAN;
+    double y = argc > 1 ? js_to_num(vm, argv[1]) : TB_NAN;
     switch (magic) {
-        case 0:  return js_num(fabs(x));
-        case 1:  return js_num(floor(x));
-        case 2:  return js_num(ceil(x));
-        case 3:  return js_num(floor(x + 0.5));
-        case 4:  return js_num(trunc(x));
-        case 5:  return js_num(sqrt(x));
-        case 6:  return js_num(sin(x));
-        case 7:  return js_num(cos(x));
-        case 8:  return js_num(tan(x));
-        case 9:  return js_num(log(x));
-        case 10: return js_num(log10(x));
-        case 11: return js_num(exp(x));
-        case 12: return js_num(pow(x, y));
-        case 13: return js_num(atan2(x, y));
-        case 14: return js_num(isnan(x) ? NAN : (x > 0 ? 1.0 : (x < 0 ? -1.0 : 0.0)));
-        default: return js_num(NAN);
+        case 0:  return js_num(tb_fabs(x));
+        case 1:  return js_num(tb_floor(x));
+        case 2:  return js_num(tb_ceil(x));
+        case 3:  return js_num(tb_round(x));
+        case 4:  return js_num(tb_trunc(x));
+        case 5:  return js_num(tb_sqrt(x));
+        case 6:  return js_num(tb_sin(x));
+        case 7:  return js_num(tb_cos(x));
+        case 8:  return js_num(tb_tan(x));
+        case 9:  return js_num(tb_log(x));
+        case 10: return js_num(tb_log10(x));
+        case 11: return js_num(tb_exp(x));
+        case 12: return js_num(tb_pow(x, y));
+        case 13: return js_num(tb_atan2(x, y));
+        case 14: return js_num(tb_isnan(x) ? TB_NAN : (x > 0 ? 1.0 : (x < 0 ? -1.0 : 0.0)));
+        default: return js_num(TB_NAN);
     }
 }
 
 static JsVal fn_date(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
-    (void)argc; (void)argv;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     double epoch_ms = (double)ts.tv_sec * 1000.0 + (double)(ts.tv_nsec / 1000000LL);
     if (magic == 0) return js_num(epoch_ms); /* Date.now() */
     if (magic == 1) { /* Date constructor */
+        double init_ms = (argc > 0 && argv[0].type != JS_UNDEFINED)
+                             ? js_to_num(vm, argv[0])
+                             : epoch_ms;
         JsObj *d = js_map_new(vm, vm->object_proto);
         if (d) {
-            js_set_prop(vm, js_obj_val(d), "_ms", js_num(epoch_ms));
+            js_set_prop(vm, js_obj_val(d), "_ms", js_num(init_ms));
             js_define_native(vm, d, "getTime", fn_date, 2);
             js_define_native(vm, d, "toISOString", fn_date, 3);
         }
@@ -891,11 +1173,12 @@ static JsVal fn_date(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int 
     }
     double ms = js_to_num(vm, js_get_prop(vm, this_val, "_ms"));
     if (magic == 2) return js_num(ms);
-    time_t sec = (time_t)(ms / 1000.0);
-    struct tm gtm;
-    gmtime_r(&sec, &gtm);
+    if (!tb_isfinite(ms)) {
+        js_throw_str(vm, "RangeError: Invalid time value");
+        return js_undefined();
+    }
     char iso[64];
-    strftime(iso, sizeof(iso), "%Y-%m-%dT%H:%M:%SZ", &gtm);
+    tb_utc_to_iso8601(ms, iso, sizeof(iso));
     return make_cstr_val(vm, iso);
 }
 
@@ -1052,7 +1335,7 @@ static bool json_stringify_rec(JsVm *vm, JsVal v, TbBuf *out, int depth) {
         case JS_NULL:      tb_buf_append_cstr(out, "null"); return true;
         case JS_BOOL:      tb_buf_append_cstr(out, v.u.boolean ? "true" : "false"); return true;
         case JS_NUMBER:
-            if (!isfinite(v.u.num)) tb_buf_append_cstr(out, "null");
+            if (!tb_isfinite(v.u.num)) tb_buf_append_cstr(out, "null");
             else tb_buf_printf(out, "%.15g", v.u.num);
             return true;
         case JS_OBJECT: {
@@ -1152,8 +1435,8 @@ static JsVal fn_console(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, i
 void js_stdlib_init(JsVm *vm) {
     JsObj *g = vm->global_obj;
     js_set_prop(vm, js_obj_val(g), "globalThis", js_obj_val(g));
-    js_set_prop(vm, js_obj_val(g), "NaN", js_num(NAN));
-    js_set_prop(vm, js_obj_val(g), "Infinity", js_num(INFINITY));
+    js_set_prop(vm, js_obj_val(g), "NaN", js_num(TB_NAN));
+    js_set_prop(vm, js_obj_val(g), "Infinity", js_num(TB_INFINITY));
 
     /* Global functions */
     js_define_native(vm, g, "parseInt", fn_global_misc, 0);
@@ -1226,6 +1509,7 @@ void js_stdlib_init(JsVm *vm) {
     js_define_native(vm, vm->string_proto, "replaceAll", fn_str_proto, 18);
     js_define_native(vm, vm->string_proto, "match", fn_str_proto, 19);
     js_define_native(vm, vm->string_proto, "lastIndexOf", fn_str_proto, 20);
+    js_define_native(vm, vm->string_proto, "search", fn_str_proto, 21);
 
     /* RegExp */
     js_define_native(vm, g, "RegExp", fn_regexp, 0);

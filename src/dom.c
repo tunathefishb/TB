@@ -1,8 +1,6 @@
 #include "dom.h"
 #include "common.h"
 
-#include <stdlib.h>
-
 static const char *TAG_NAMES[TAG_COUNT] = {
     [TAG_UNKNOWN] = "unknown",
     [TAG_HTML] = "html", [TAG_HEAD] = "head", [TAG_TITLE] = "title",

@@ -1,8 +1,4 @@
-#define _GNU_SOURCE
 #include "browser.h"
-
-#include <ctype.h>
-#include <stdlib.h>
 
 static void clear_console_logs(TbBrowser *b) {
     for (int i = 0; i < b->console_count; i++) {

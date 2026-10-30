@@ -1,9 +1,6 @@
-#define _GNU_SOURCE
 #include "css.h"
 #include "common.h"
 #include "dom.h"
-
-#include <stdlib.h>
 
 void css_stylesheet_init(CssStylesheet *ss) {
     memset(ss, 0, sizeof(*ss));

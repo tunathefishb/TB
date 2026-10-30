@@ -1,9 +1,5 @@
-#define _GNU_SOURCE
 #include "js.h"
-
-#include <math.h>
-#include <stdlib.h>
-#include <time.h>
+#include "math_tb.h"
 
 int64_t js_now_ms(void) {
     struct timespec ts;
@@ -92,7 +88,9 @@ JsObj *js_map_new(JsVm *vm, JsObj *proto) {
 JsObj *js_arr_new(JsVm *vm, uint32_t cap) {
     JsArrObj *a = (JsArrObj *)js_gc_alloc(vm, sizeof(JsArrObj), OBJ_ARRAY);
     if (!a) return NULL;
-    a->proto = vm->array_proto;
+    a->proto       = vm->array_proto;
+    a->match_index = -1;
+    a->match_input = NULL;
     if (cap > 0) {
         JsVal *it = (JsVal *)tb_calloc(cap, sizeof(JsVal));
         if (it) {
@@ -126,13 +124,26 @@ JsObj *js_native_fn_new(JsVm *vm, const char *name, JsNativeFn fn, int magic) {
 }
 
 JsObj *js_regex_new(JsVm *vm, const char *pattern, const char *flags) {
+    char err_buf[128] = "";
+    TbRegex *comp = tb_regex_compile(pattern ? pattern : "", flags ? flags : "",
+                                     err_buf, sizeof(err_buf));
+    if (!comp && err_buf[0] != '\0') {
+        js_throw_str(vm, err_buf);
+        return NULL;
+    }
     JsRegexObj *rx = (JsRegexObj *)js_gc_alloc(vm, sizeof(JsRegexObj), OBJ_REGEX);
-    if (!rx) return NULL;
-    rx->proto   = vm->regex_proto;
-    rx->pattern = tb_strdup(pattern ? pattern : "");
-    rx->flags   = tb_strdup(flags ? flags : "");
+    if (!rx) {
+        tb_regex_free(comp);
+        return NULL;
+    }
+    rx->proto      = vm->regex_proto;
+    rx->pattern    = tb_strdup(pattern ? pattern : "");
+    rx->flags      = tb_strdup(flags ? flags : "");
+    rx->compiled   = comp;
+    rx->last_index = 0;
     vm->gc_bytes += (rx->pattern ? strlen(rx->pattern) + 1 : 0) +
-                    (rx->flags ? strlen(rx->flags) + 1 : 0);
+                    (rx->flags ? strlen(rx->flags) + 1 : 0) +
+                    tb_regex_mem_size(comp);
     return (JsObj *)rx;
 }
 
@@ -304,6 +315,10 @@ JsVal js_get_prop_str(JsVm *vm, JsVal target, JsStr *key) {
         } else if (o->obj_type == OBJ_ARRAY) {
             JsArrObj *a = (JsArrObj *)o;
             if (strcmp(key->data, "length") == 0) return js_num((double)a->len);
+            if (a->match_index >= 0 && strcmp(key->data, "index") == 0)
+                return js_num((double)a->match_index);
+            if (a->match_input && strcmp(key->data, "input") == 0)
+                return js_obj_val((JsObj *)a->match_input);
             uint32_t idx = 0;
             if (parse_array_index(key->data, key->len, &idx)) {
                 return (idx < a->len) ? a->items[idx] : js_undefined();
@@ -340,6 +355,15 @@ JsVal js_get_prop_str(JsVm *vm, JsVal target, JsStr *key) {
                 return js_obj_val((JsObj *)js_str_cstr(vm, rx->pattern));
             if (strcmp(key->data, "flags") == 0)
                 return js_obj_val((JsObj *)js_str_cstr(vm, rx->flags));
+            if (strcmp(key->data, "lastIndex") == 0)
+                return js_num((double)rx->last_index);
+            uint32_t rf = tb_regex_flags(rx->compiled);
+            if (strcmp(key->data, "global") == 0)     return js_bool((rf & TB_RX_GLOBAL) != 0);
+            if (strcmp(key->data, "ignoreCase") == 0) return js_bool((rf & TB_RX_ICASE) != 0);
+            if (strcmp(key->data, "multiline") == 0)  return js_bool((rf & TB_RX_MULTILINE) != 0);
+            if (strcmp(key->data, "dotAll") == 0)     return js_bool((rf & TB_RX_DOTALL) != 0);
+            if (strcmp(key->data, "sticky") == 0)     return js_bool((rf & TB_RX_STICKY) != 0);
+            if (strcmp(key->data, "unicode") == 0)    return js_bool((rf & TB_RX_UNICODE) != 0);
             proto_walk = rx->proto;
         } else if (o->obj_type == OBJ_OBJECT) {
             JsMapObj *m = (JsMapObj *)o;
@@ -390,6 +414,15 @@ bool js_set_prop_str(JsVm *vm, JsVal target, JsStr *key, JsVal val) {
         uint32_t idx = 0;
         if (parse_array_index(key->data, key->len, &idx)) {
             return js_set_index(vm, target, idx, val);
+        }
+        return false;
+    }
+    if (o->obj_type == OBJ_REGEX) {
+        JsRegexObj *rx = (JsRegexObj *)o;
+        if (strcmp(key->data, "lastIndex") == 0) {
+            double nl = js_to_num(vm, val);
+            rx->last_index = (nl > 0.0 && !tb_isnan(nl)) ? (size_t)nl : 0;
+            return true;
         }
         return false;
     }
@@ -551,7 +584,7 @@ bool js_to_bool(JsVal v) {
         case JS_UNDEFINED:
         case JS_NULL:   return false;
         case JS_BOOL:   return v.u.boolean;
-        case JS_NUMBER: return v.u.num != 0.0 && !isnan(v.u.num);
+        case JS_NUMBER: return v.u.num != 0.0 && !tb_isnan(v.u.num);
         case JS_OBJECT:
             if (!v.u.obj) return false;
             if (v.u.obj->obj_type == OBJ_STRING) return ((JsStr *)v.u.obj)->len > 0;
@@ -563,7 +596,7 @@ bool js_to_bool(JsVal v) {
 double js_to_num(JsVm *vm, JsVal v) {
     (void)vm;
     switch (v.type) {
-        case JS_UNDEFINED: return NAN;
+        case JS_UNDEFINED: return TB_NAN;
         case JS_NULL:      return 0.0;
         case JS_BOOL:      return v.u.boolean ? 1.0 : 0.0;
         case JS_NUMBER:    return v.u.num;
@@ -576,17 +609,17 @@ double js_to_num(JsVm *vm, JsVal v) {
                 char *endp = NULL;
                 double d   = strtod(s, &endp);
                 while (endp && *endp && tb_isspace(*endp)) endp++;
-                return (endp && *endp == '\0') ? d : NAN;
+                return (endp && *endp == '\0') ? d : TB_NAN;
             }
             if (v.u.obj->obj_type == OBJ_ARRAY) {
                 JsArrObj *a = (JsArrObj *)v.u.obj;
                 if (a->len == 0) return 0.0;
                 if (a->len == 1) return js_to_num(vm, a->items[0]);
             }
-            return NAN;
+            return TB_NAN;
         }
     }
-    return NAN;
+    return TB_NAN;
 }
 
 JsStr *js_to_str(JsVm *vm, JsVal v) {
@@ -595,8 +628,8 @@ JsStr *js_to_str(JsVm *vm, JsVal v) {
         case JS_NULL:      return js_str_cstr(vm, "null");
         case JS_BOOL:      return js_str_cstr(vm, v.u.boolean ? "true" : "false");
         case JS_NUMBER: {
-            if (isnan(v.u.num)) return js_str_cstr(vm, "NaN");
-            if (isinf(v.u.num)) return js_str_cstr(vm, v.u.num < 0 ? "-Infinity" : "Infinity");
+            if (tb_isnan(v.u.num)) return js_str_cstr(vm, "NaN");
+            if (tb_isinf(v.u.num)) return js_str_cstr(vm, v.u.num < 0 ? "-Infinity" : "Infinity");
             if (v.u.num == 0.0) return js_str_cstr(vm, "0");
             char buf[64];
             snprintf(buf, sizeof(buf), "%.15g", v.u.num);
@@ -773,6 +806,7 @@ static void gc_mark_obj(JsVm *vm, JsObj *o) {
         case OBJ_ARRAY: {
             JsArrObj *a = (JsArrObj *)o;
             gc_mark_obj(vm, a->proto);
+            if (a->match_input) gc_mark_obj(vm, (JsObj *)a->match_input);
             for (uint32_t i = 0; i < a->len; i++) gc_mark_val(vm, a->items[i]);
             break;
         }
@@ -830,7 +864,9 @@ static void gc_free_obj(JsVm *vm, JsObj *o, bool vm_teardown) {
         case OBJ_REGEX: {
             JsRegexObj *rx = (JsRegexObj *)o;
             extra += (rx->pattern ? strlen(rx->pattern) + 1 : 0) +
-                     (rx->flags ? strlen(rx->flags) + 1 : 0);
+                     (rx->flags ? strlen(rx->flags) + 1 : 0) +
+                     tb_regex_mem_size(rx->compiled);
+            tb_regex_free(rx->compiled);
             tb_free(rx->pattern);
             tb_free(rx->flags);
             break;
