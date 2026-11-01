@@ -231,6 +231,11 @@ typedef enum {
 
 #define OPT_CHAIN_FLAG       0x01
 
+#define JS_PARAM_REST        (1U << 0)
+#define JS_PARAM_DESTRUCT    (1U << 1)
+#define JS_UPDATE_PREFIX     1U
+#define JS_FOR_IN_OF_NO_DECL 0xFFU
+
 typedef struct {
     uint8_t  kind;
     uint8_t  op;
@@ -403,6 +408,13 @@ void   js_log(JsVm *vm, JsLogLevel level, const char *fmt, ...)
 void   js_throw_str(JsVm *vm, const char *msg);
 
 void   js_stdlib_init(JsVm *vm);
+
+typedef enum {
+    JSON_PARSE = 0,
+    JSON_STRINGIFY = 1
+} JsJsonMagic;
+
+JsVal  js_fn_json(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic);
 
 static inline bool js_temp_push(JsVm *vm, JsVal v) {
     if (vm->temp_sp >= JS_MAX_TEMP_ROOTS) return false;

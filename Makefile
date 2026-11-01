@@ -7,7 +7,9 @@ LDFLAGS      ?=
 
 BUILD_DIR    := build
 
-MODE_CFLAGS  :=
+INC_DIRS     := -Isrc/core -Isrc/net -Isrc/tls -Isrc/js -Isrc/engine -Isrc/ui
+
+MODE_CFLAGS  := $(INC_DIRS)
 MODE_LDFLAGS :=
 
 ifeq ($(FREESTANDING),1)
@@ -26,7 +28,11 @@ MODE_LDFLAGS += -ldl
 TLS_SRCS     :=
 else ifeq ($(TLS),builtin)
 MODE_CFLAGS  += -DTB_TLS_OPENSSL=0
-TLS_SRCS     := src/tls_crypto.c src/tls_x509.c src/tls.c
+TLS_SRCS     := \
+	src/tls/tls_sym.c \
+	src/tls/tls_asym.c \
+	src/tls/tls_x509.c \
+	src/tls/tls_conn.c
 else
 $(error Unknown TLS=$(TLS); expected 'builtin' or 'openssl')
 endif
@@ -35,28 +41,36 @@ ALL_CFLAGS   := $(CFLAGS) $(MODE_CFLAGS)
 ALL_LDFLAGS  := $(LDFLAGS) $(MODE_LDFLAGS)
 
 CORE_SRCS := \
-	src/sys.c \
-	src/math_tb.c \
-	src/regex_tb.c \
-	src/mem.c \
-	src/inflate.c \
-	src/net.c \
-	src/dom.c \
-	src/css.c \
-	src/js_parse.c \
-	src/js_gc.c \
-	src/js_stdlib.c \
-	src/js_eval.c \
-	src/js_dom.c \
-	src/layout.c \
-	src/browser.c \
-	src/tui.c \
+	src/core/sys_syscall.c \
+	src/core/sys_stdio.c \
+	src/core/sys_stdlib.c \
+	src/core/math_tb.c \
+	src/core/regex_tb.c \
+	src/core/mem.c \
+	src/core/inflate.c \
+	src/net/url.c \
+	src/net/about.c \
+	src/net/dns.c \
+	src/net/http.c \
+	src/engine/dom.c \
+	src/engine/css.c \
+	src/engine/layout.c \
+	src/js/js_parse.c \
+	src/js/js_gc.c \
+	src/js/js_stdlib.c \
+	src/js/js_json.c \
+	src/js/js_eval.c \
+	src/js/js_dom.c \
+	src/ui/browser.c \
+	src/ui/tui.c \
 	$(TLS_SRCS)
 
-CORE_OBJS    := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(CORE_SRCS))
+vpath %.c src/core src/net src/tls src/js src/engine src/ui
+
+CORE_OBJS    := $(addprefix $(BUILD_DIR)/,$(notdir $(CORE_SRCS:.c=.o)))
 MAIN_OBJ     := $(BUILD_DIR)/main.o
 TEST_OBJ     := $(BUILD_DIR)/test_suite.o
-HEADERS      := $(wildcard src/*.h)
+HEADERS      := $(wildcard src/*/*.h)
 
 CONFIG_STR   := FREESTANDING=$(FREESTANDING) TLS=$(TLS)
 CONFIG_STAMP := $(BUILD_DIR)/.config
@@ -73,11 +87,11 @@ $(CONFIG_STAMP): FORCE | $(BUILD_DIR)
 tb: $(CORE_OBJS) $(MAIN_OBJ) $(CONFIG_STAMP)
 	$(CC) $(ALL_CFLAGS) -o $@ $(CORE_OBJS) $(MAIN_OBJ) $(ALL_LDFLAGS)
 
-$(BUILD_DIR)/%.o: src/%.c $(HEADERS) $(CONFIG_STAMP) | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: %.c $(HEADERS) $(CONFIG_STAMP) | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
 $(TEST_OBJ): tests/test_suite.c $(HEADERS) $(CONFIG_STAMP) | $(BUILD_DIR)
-	$(CC) $(ALL_CFLAGS) -Isrc -c -o $@ $<
+	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/test_suite: $(CORE_OBJS) $(TEST_OBJ) $(CONFIG_STAMP)
 	$(CC) $(ALL_CFLAGS) -o $@ $(CORE_OBJS) $(TEST_OBJ) $(ALL_LDFLAGS)

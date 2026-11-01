@@ -481,7 +481,7 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             }
         }
         case AST_UPDATE: {
-            bool is_prefix = (n->flags != 0);
+            bool is_prefix = (n->flags == JS_UPDATE_PREFIX);
             double delta   = (n->op == OP_INC) ? 1.0 : -1.0;
             const AstNode *t = &ch->nodes[n->a];
             if (t->kind == AST_IDENT) {
@@ -928,7 +928,7 @@ static EvalRes eval_stmt(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             for (uint32_t i = 0; i < ia->len; i++) {
                 int env_mark = vm->env_sp;
                 JsEnv *ienv  = env;
-                if (n->flags != 0xFF && n->flags != DECL_VAR) {
+                if (n->flags != JS_FOR_IN_OF_NO_DECL && n->flags != DECL_VAR) {
                     ienv = js_env_new(vm, env, false, false, js_undefined());
                     if (!ienv || !push_env(vm, ienv)) {
                         vm->temp_sp = sp;
@@ -936,8 +936,8 @@ static EvalRes eval_stmt(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                     }
                 }
                 EvalRes bindr = bind_pattern(vm, ch, ienv, n->a, ia->items[i],
-                                             n->flags == 0xFF ? DECL_VAR : n->flags,
-                                             n->flags == 0xFF);
+                                             n->flags == JS_FOR_IN_OF_NO_DECL ? DECL_VAR : n->flags,
+                                             n->flags == JS_FOR_IN_OF_NO_DECL);
                 if (bindr.flow != FLOW_NONE) {
                     vm->env_sp  = env_mark;
                     vm->temp_sp = sp;
@@ -1094,7 +1094,7 @@ JsVal js_call(JsVm *vm, JsVal callee, JsVal this_val, int argc, const JsVal *arg
     int ai = 0;
     for (uint32_t p = fnode->b; p != 0; p = ch->nodes[p].next, ai++) {
         const AstNode *pn = &ch->nodes[p];
-        if (pn->flags & 1) { /* ...rest */
+        if (pn->flags & JS_PARAM_REST) {
             JsStr *pnm = chunk_js_str(vm, ch, pn->a);
             JsObj *rest = js_arr_new(vm, (uint32_t)(argc > ai ? argc - ai : 0));
             for (int r = ai; r < argc; r++) js_arr_push(vm, rest, argv[r]);
@@ -1115,7 +1115,7 @@ JsVal js_call(JsVm *vm, JsVal callee, JsVal this_val, int argc, const JsVal *arg
             }
             pv = dr.val;
         }
-        if (pn->flags & 2) {
+        if (pn->flags & JS_PARAM_DESTRUCT) {
             EvalRes br = bind_pattern(vm, ch, fenv, pn->c, pv, DECL_VAR, false);
             if (br.flow == FLOW_THROW) {
                 vm->has_thrown = true;

@@ -211,11 +211,8 @@ static bool rxc_insert_space(RxCompiler *c, uint32_t at_pc, uint32_t count) {
     return true;
 }
 
-static int hex_digit(char ch) {
-    if (ch >= '0' && ch <= '9') return ch - '0';
-    if (ch >= 'a' && ch <= 'f') return 10 + (ch - 'a');
-    if (ch >= 'A' && ch <= 'F') return 10 + (ch - 'A');
-    return -1;
+static inline int hex_digit(char ch) {
+    return tb_hex_val(ch);
 }
 
 static uint32_t rxc_next_cp(RxCompiler *c) {

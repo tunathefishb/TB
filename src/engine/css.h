@@ -31,6 +31,18 @@ typedef enum {
     CSS_DISP_NONE
 } CssDisplay;
 
+typedef enum {
+    CSS_ALIGN_LEFT   = 0,
+    CSS_ALIGN_CENTER = 1,
+    CSS_ALIGN_RIGHT  = 2
+} CssTextAlign;
+
+typedef enum {
+    CSS_TRANSFORM_NONE  = 0,
+    CSS_TRANSFORM_UPPER = 1,
+    CSS_TRANSFORM_LOWER = 2
+} CssTextTransform;
+
 typedef struct {
     CssDisplay display;
     CssColor   fg;
@@ -44,8 +56,8 @@ typedef struct {
     uint8_t    pre : 1;
     uint8_t    fg_set : 1;
     uint8_t    bg_set : 1;
-    uint8_t    text_align;     /* 0=left, 1=center, 2=right */
-    uint8_t    text_transform; /* 0=none, 1=uppercase, 2=lowercase */
+    uint8_t    text_align;     /* CssTextAlign */
+    uint8_t    text_transform; /* CssTextTransform */
     int8_t     margin_top, margin_bottom, margin_left, margin_right;
     int8_t     padding_top, padding_bottom, padding_left, padding_right;
     int16_t    width_cols;     /* 0=auto, >0=cols, <0=-percent */

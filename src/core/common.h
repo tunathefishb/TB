@@ -4,6 +4,216 @@
 #include "mem.h"
 #include "sys.h"
 
+/* ── Hex & Endian Primitives ── */
+
+static inline int tb_hex_val(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static inline uint16_t tb_load16_be(const uint8_t *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+static inline void tb_store16_be(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v >> 8);
+    p[1] = (uint8_t)(v & 0xFFU);
+}
+
+static inline uint32_t tb_load24_be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 16) | ((uint32_t)p[1] << 8) | (uint32_t)p[2];
+}
+
+static inline void tb_store24_be(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)((v >> 16) & 0xFFU);
+    p[1] = (uint8_t)((v >> 8) & 0xFFU);
+    p[2] = (uint8_t)(v & 0xFFU);
+}
+
+static inline uint32_t tb_load32_be(const uint8_t *p) {
+    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+           ((uint32_t)p[2] << 8) | (uint32_t)p[3];
+}
+
+static inline void tb_store32_be(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v >> 24);
+    p[1] = (uint8_t)(v >> 16);
+    p[2] = (uint8_t)(v >> 8);
+    p[3] = (uint8_t)v;
+}
+
+static inline uint64_t tb_load64_be(const uint8_t *p) {
+    return ((uint64_t)p[0] << 56) | ((uint64_t)p[1] << 48) |
+           ((uint64_t)p[2] << 40) | ((uint64_t)p[3] << 32) |
+           ((uint64_t)p[4] << 24) | ((uint64_t)p[5] << 16) |
+           ((uint64_t)p[6] << 8) | (uint64_t)p[7];
+}
+
+static inline void tb_store64_be(uint8_t *p, uint64_t v) {
+    p[0] = (uint8_t)(v >> 56);
+    p[1] = (uint8_t)(v >> 48);
+    p[2] = (uint8_t)(v >> 40);
+    p[3] = (uint8_t)(v >> 32);
+    p[4] = (uint8_t)(v >> 24);
+    p[5] = (uint8_t)(v >> 16);
+    p[6] = (uint8_t)(v >> 8);
+    p[7] = (uint8_t)v;
+}
+
+static inline uint32_t tb_load32_le(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static inline void tb_store32_le(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+static inline uint64_t tb_load64_le(const uint8_t *p) {
+    return (uint64_t)p[0] | ((uint64_t)p[1] << 8) |
+           ((uint64_t)p[2] << 16) | ((uint64_t)p[3] << 24) |
+           ((uint64_t)p[4] << 32) | ((uint64_t)p[5] << 40) |
+           ((uint64_t)p[6] << 48) | ((uint64_t)p[7] << 56);
+}
+
+static inline void tb_store64_le(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) {
+        p[i] = (uint8_t)((v >> (i * 8)) & 0xFFU);
+    }
+}
+
+/* ── IPv4 & IPv6 Literal Byte Parsers ── */
+
+static inline bool tb_parse_ipv4_bytes(const char *s, uint8_t out[4]) {
+    if (!s || !*s) return false;
+    int part = 0;
+    const char *p = s;
+    while (*p) {
+        if (part >= 4 || *p < '0' || *p > '9') return false;
+        uint32_t val = 0;
+        int digits = 0;
+        while (*p >= '0' && *p <= '9') {
+            if (digits == 1 && val == 0) return false; /* Reject leading zero octal */
+            val = val * 10U + (uint32_t)(*p - '0');
+            if (val > 255U) return false;
+            digits++;
+            p++;
+        }
+        out[part++] = (uint8_t)val;
+        if (*p == '.') {
+            p++;
+            if (*p == '\0') return false;
+        } else if (*p != '\0') {
+            return false;
+        }
+    }
+    return part == 4;
+}
+
+static inline bool tb_parse_ipv6_bytes(const char *s, uint8_t out[16]) {
+    if (!s || !*s) return false;
+    char buf[96];
+    size_t slen = strlen(s);
+    if (slen >= sizeof(buf)) return false;
+    if (s[0] == '[') {
+        if (slen < 3 || s[slen - 1] != ']') return false;
+        memcpy(buf, s + 1, slen - 2);
+        buf[slen - 2] = '\0';
+    } else {
+        memcpy(buf, s, slen + 1);
+    }
+
+    char *pct = strchr(buf, '%');
+    if (pct) *pct = '\0';
+    if (!strchr(buf, ':')) return false;
+
+    uint16_t head[8] = {0};
+    uint16_t tail[8] = {0};
+    int nhead = 0, ntail = 0;
+    bool saw_dc = false;
+
+    const char *p = buf;
+    if (p[0] == ':') {
+        if (p[1] != ':') return false;
+        saw_dc = true;
+        p += 2;
+    }
+
+    while (*p) {
+        if (!saw_dc && strchr(p, '.') != NULL && !strchr(p, ':')) {
+            uint8_t v4[4];
+            if (!tb_parse_ipv4_bytes(p, v4) || nhead > 6) return false;
+            head[nhead++] = (uint16_t)(((uint16_t)v4[0] << 8) | v4[1]);
+            head[nhead++] = (uint16_t)(((uint16_t)v4[2] << 8) | v4[3]);
+            break;
+        }
+        if (saw_dc && strchr(p, '.') != NULL && !strchr(p, ':')) {
+            uint8_t v4[4];
+            if (!tb_parse_ipv4_bytes(p, v4) || nhead + ntail > 6) return false;
+            tail[ntail++] = (uint16_t)(((uint16_t)v4[0] << 8) | v4[1]);
+            tail[ntail++] = (uint16_t)(((uint16_t)v4[2] << 8) | v4[3]);
+            break;
+        }
+
+        uint32_t gval = 0;
+        int hdigits = 0;
+        while (*p && *p != ':') {
+            int hv = tb_hex_val(*p);
+            if (hv < 0 || hdigits >= 4) return false;
+            gval = (gval << 4) | (uint32_t)hv;
+            hdigits++;
+            p++;
+        }
+        if (hdigits == 0) return false;
+
+        if (!saw_dc) {
+            if (nhead >= 8) return false;
+            head[nhead++] = (uint16_t)gval;
+        } else {
+            if (ntail >= 8) return false;
+            tail[ntail++] = (uint16_t)gval;
+        }
+
+        if (*p == ':') {
+            if (p[1] == ':') {
+                if (saw_dc) return false; /* Only one :: allowed */
+                saw_dc = true;
+                p += 2;
+            } else {
+                p++;
+                if (*p == '\0') return false;
+            }
+        }
+    }
+
+    if (saw_dc) {
+        if (nhead + ntail > 7) return false;
+    } else {
+        if (nhead != 8) return false;
+    }
+
+    uint16_t groups[8] = {0};
+    for (int i = 0; i < nhead; i++) groups[i] = head[i];
+    for (int i = 0; i < ntail; i++) groups[8 - ntail + i] = tail[i];
+    for (int i = 0; i < 8; i++) {
+        out[i * 2]     = (uint8_t)(groups[i] >> 8);
+        out[i * 2 + 1] = (uint8_t)(groups[i] & 0xFFU);
+    }
+    return true;
+}
+
+static inline bool tb_host_is_ip_literal(const char *host) {
+    uint8_t buf[16];
+    return tb_parse_ipv4_bytes(host, buf) || tb_parse_ipv6_bytes(host, buf);
+}
+
+/* ── Dynamic Byte/String Buffer (TbBuf) ── */
+
 typedef struct {
     char  *data;
     size_t len;
@@ -108,6 +318,8 @@ static inline char *tb_buf_detach(TbBuf *b, size_t *out_len) {
     return res;
 }
 
+/* ── Character & Case-Insensitive String Helpers ── */
+
 static inline char tb_tolower(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c;
 }
@@ -133,7 +345,7 @@ static inline bool tb_isalnum(char c) {
 }
 
 static inline bool tb_isxdigit(char c) {
-    return tb_isdigit(c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    return tb_hex_val(c) >= 0;
 }
 
 static inline int tb_strcasecmp(const char *a, const char *b) {
@@ -160,6 +372,8 @@ static inline int tb_strncasecmp(const char *a, const char *b, size_t n) {
     }
     return 0;
 }
+
+/* ── UTF-8 Codec & Display Width ── */
 
 /* UTF-8 decode: returns bytes consumed (>=1), writes codepoint to *cp */
 static inline size_t tb_utf8_decode(const char *s, size_t len, uint32_t *cp) {

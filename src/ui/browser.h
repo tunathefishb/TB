@@ -66,8 +66,17 @@ void tb_browser_relayout_if_needed(TbBrowser *b, bool force);
 int  tb_browser_tick(TbBrowser *b);
 
 /* Interactive widget & REPL actions */
+typedef enum {
+    TB_EDIT_NONE      = 0,
+    TB_EDIT_LEFT      = 1,
+    TB_EDIT_RIGHT     = 2,
+    TB_EDIT_BACKSPACE = 8,
+    TB_EDIT_ENTER     = 13,
+    TB_EDIT_DELETE    = 127
+} TbEditKey;
+
 void tb_browser_activate_hit(TbBrowser *b, int hit_idx);
-void tb_browser_edit_key(TbBrowser *b, uint32_t cp, int special_key /* 8=bs, 127=del, 1=left, 2=right */);
+void tb_browser_edit_key(TbBrowser *b, uint32_t cp, int special_key /* TbEditKey */);
 void tb_browser_stop_editing(TbBrowser *b);
 bool tb_browser_eval_repl(TbBrowser *b, const char *js_code);
 void tb_browser_force_gc(TbBrowser *b);

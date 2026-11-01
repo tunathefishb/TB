@@ -143,13 +143,6 @@ static uint32_t emit_node(Parser *p, AstKind kind, AstOp op, uint16_t flags,
     return idx;
 }
 
-static int hex_digit(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-    return -1;
-}
-
 static bool is_ident_start(char c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
            c == '_' || c == '$' || (uint8_t)c >= 0x80;
@@ -212,8 +205,8 @@ static void decode_js_escape(Lexer *lx, TbBuf *b) {
             break;
         case 'x': {
             if (lx->pos + 2 <= lx->len) {
-                int h1 = hex_digit(lx->src[lx->pos]);
-                int h2 = hex_digit(lx->src[lx->pos + 1]);
+                int h1 = tb_hex_val(lx->src[lx->pos]);
+                int h2 = tb_hex_val(lx->src[lx->pos + 1]);
                 if (h1 >= 0 && h2 >= 0) {
                     tb_buf_append_char(b, (char)((h1 << 4) | h2));
                     lx->pos += 2;
@@ -229,7 +222,7 @@ static void decode_js_escape(Lexer *lx, TbBuf *b) {
             if (lx->pos < lx->len && lx->src[lx->pos] == '{') {
                 lx->pos++;
                 while (lx->pos < lx->len && lx->src[lx->pos] != '}') {
-                    int h = hex_digit(lx->src[lx->pos]);
+                    int h = tb_hex_val(lx->src[lx->pos]);
                     if (h < 0) break;
                     cp = (cp << 4) | (uint32_t)h;
                     lx->pos++;
@@ -237,10 +230,10 @@ static void decode_js_escape(Lexer *lx, TbBuf *b) {
                 }
                 if (lx->pos < lx->len && lx->src[lx->pos] == '}') lx->pos++;
             } else if (lx->pos + 4 <= lx->len) {
-                int h0 = hex_digit(lx->src[lx->pos]);
-                int h1 = hex_digit(lx->src[lx->pos + 1]);
-                int h2 = hex_digit(lx->src[lx->pos + 2]);
-                int h3 = hex_digit(lx->src[lx->pos + 3]);
+                int h0 = tb_hex_val(lx->src[lx->pos]);
+                int h1 = tb_hex_val(lx->src[lx->pos + 1]);
+                int h2 = tb_hex_val(lx->src[lx->pos + 2]);
+                int h3 = tb_hex_val(lx->src[lx->pos + 3]);
                 if (h0 >= 0 && h1 >= 0 && h2 >= 0 && h3 >= 0) {
                     cp = (uint32_t)((h0 << 12) | (h1 << 8) | (h2 << 4) | h3);
                     lx->pos += 4;
@@ -322,8 +315,8 @@ static void next_token(Parser *p) {
         double val   = 0.0;
         if (c == '0' && (c1 == 'x' || c1 == 'X')) {
             lx->pos += 2;
-            while (lx->pos < lx->len && (hex_digit(lx->src[lx->pos]) >= 0 || lx->src[lx->pos] == '_')) {
-                if (lx->src[lx->pos] != '_') val = val * 16.0 + hex_digit(lx->src[lx->pos]);
+            while (lx->pos < lx->len && (tb_hex_val(lx->src[lx->pos]) >= 0 || lx->src[lx->pos] == '_')) {
+                if (lx->src[lx->pos] != '_') val = val * 16.0 + tb_hex_val(lx->src[lx->pos]);
                 lx->pos++;
             }
         } else if (c == '0' && (c1 == 'b' || c1 == 'B')) {
@@ -558,14 +551,14 @@ static uint32_t parse_param_list(Parser *p) {
     uint32_t head = 0, tail = 0;
     while (!p->has_err && p->cur.kind != TOK_RPAREN && p->cur.kind != TOK_EOF) {
         uint16_t flags = 0;
-        if (match_tok(p, TOK_SPREAD)) flags |= 1;
+        if (match_tok(p, TOK_SPREAD)) flags |= JS_PARAM_REST;
         uint32_t name_id = 0;
         uint32_t pat_idx = 0;
         if (p->cur.kind == TOK_IDENT) {
             name_id = p->cur.str_id;
             next_token(p);
-        } else if (!(flags & 1) && (p->cur.kind == TOK_LBRACE || p->cur.kind == TOK_LBRACK)) {
-            flags |= 2;
+        } else if (!(flags & JS_PARAM_REST) && (p->cur.kind == TOK_LBRACE || p->cur.kind == TOK_LBRACK)) {
+            flags |= JS_PARAM_DESTRUCT;
             pat_idx = parse_binding_target(p);
         } else {
             set_parse_err(p, "Expected parameter name");
@@ -938,7 +931,7 @@ static uint32_t parse_unary(Parser *p) {
         AstOp op = (p->cur.kind == TOK_INC) ? OP_INC : OP_DEC;
         next_token(p);
         uint32_t operand = parse_unary(p);
-        return emit_node(p, AST_UPDATE, op, 1 /* prefix */, operand, 0, 0);
+        return emit_node(p, AST_UPDATE, op, JS_UPDATE_PREFIX, operand, 0, 0);
     }
     if (p->cur.kind == TOK_PLUS || p->cur.kind == TOK_MINUS ||
         p->cur.kind == TOK_BANG || p->cur.kind == TOK_TILDE ||
@@ -1201,7 +1194,7 @@ static uint32_t parse_stmt(Parser *p) {
             next_token(p);
             expect_tok(p, TOK_LPAREN, "Expected '(' after 'for'");
             uint32_t init = 0;
-            uint16_t decl_flag = 0xFF;
+            uint16_t decl_flag = JS_FOR_IN_OF_NO_DECL;
             if (p->cur.kind == TOK_VAR || p->cur.kind == TOK_LET || p->cur.kind == TOK_CONST) {
                 decl_flag = (p->cur.kind == TOK_VAR) ? DECL_VAR
                           : (p->cur.kind == TOK_LET) ? DECL_LET : DECL_CONST;
@@ -1216,7 +1209,7 @@ static uint32_t parse_stmt(Parser *p) {
                 AstKind fk = (p->cur.kind == TOK_IN) ? AST_FOR_IN : AST_FOR_OF;
                 next_token(p);
                 uint32_t target_ident = init;
-                if (decl_flag != 0xFF && init) {
+                if (decl_flag != JS_FOR_IN_OF_NO_DECL && init) {
                     uint32_t decl = p->chunk->nodes[init].a;
                     uint32_t pat  = decl ? p->chunk->nodes[decl].a : 0;
                     target_ident  = pat;

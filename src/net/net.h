@@ -52,4 +52,8 @@ bool tb_fetch(const char *url, const char *method, const char *post_body,
 void tb_response_free(TbResponse *resp);
 void tb_net_cleanup(void);
 
+/* Internal network helpers shared across net/ modules */
+bool tb_net_load_local_scheme(const TbUrl *u, TbResponse *resp);
+int  tb_net_connect_ip(const TbIpAddr *ip, int port, int timeout_ms);
+
 #endif /* TB_NET_H */

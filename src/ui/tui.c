@@ -296,32 +296,7 @@ static void search_jump(TbBrowser *b, const char *query, int dir, int doc_rows) 
     snprintf(b->status_msg, sizeof(b->status_msg), "Pattern not found: \"%s\"", query);
 }
 
-static void tui_render(TbBrowser *b, int cols, int rows, bool console_open,
-                       TuiPromptMode prompt_mode, const char *prompt_buf,
-                       const char *search_query, TbBuf *frame) {
-    tb_buf_clear(frame);
-    /* Synchronized update start + hide cursor during draw */
-    tb_buf_append_cstr(frame, "\x1b[?2026h\x1b[?25l");
-
-    int drawer_h = console_open ? 8 : 0;
-    if (rows - 2 - drawer_h < 4) drawer_h = 0;
-    int doc_rows = rows - 2 - drawer_h;
-
-    if (b->viewport_w != cols || b->viewport_h != doc_rows) {
-        b->viewport_w = cols;
-        b->viewport_h = doc_rows;
-        tb_browser_relayout_if_needed(b, true);
-    } else {
-        tb_browser_relayout_if_needed(b, false);
-    }
-
-    int max_scroll = b->layout.line_count - doc_rows;
-    if (max_scroll < 0) max_scroll = 0;
-    if (b->scroll_y > max_scroll) b->scroll_y = max_scroll;
-    if (b->scroll_y < 0) b->scroll_y = 0;
-    if (b->vm) b->vm->scroll_y = b->scroll_y;
-
-    /* ── 1. Top Chrome + Live Kernel VmRSS Gauge (Row 1) ── */
+static void tui_render_top_bar(TbBrowser *b, int cols, TbBuf *frame) {
     TbMemStats ms;
     tb_mem_stats(&ms);
     double rss_mb = (double)ms.vm_rss_kb / 1024.0;
@@ -389,8 +364,10 @@ static void tui_render(TbBrowser *b, int cols, int rows, bool console_open,
     } else {
         tb_buf_append_cstr(frame, "\x1b[0m\x1b[K");
     }
+}
 
-    /* ── 2. Main Document Viewport ── */
+static void tui_render_viewport(TbBrowser *b, int cols, int doc_rows,
+                                const char *search_query, TbBuf *frame) {
     const char *hl_search = (search_query && search_query[0]) ? search_query : NULL;
     for (int r = 0; r < doc_rows; r++) {
         int doc_y = b->scroll_y + r;
@@ -400,42 +377,46 @@ static void tui_render(TbBrowser *b, int cols, int rows, bool console_open,
         }
         tb_buf_append_cstr(frame, "\x1b[0m\x1b[K");
     }
+}
 
-    /* ── 3. Optional Split-Pane JS Console & Live REPL Drawer ── */
-    if (drawer_h > 0) {
-        int top_row = 2 + doc_rows;
-        tb_buf_printf(frame, "\x1b[%d;1H\x1b[0;1;48;2;30;41;59;38;2;56;189;248m", top_row);
-        char hdr[256];
-        snprintf(hdr, sizeof(hdr),
-                 " ── JS Console & Live REPL (: eval, c hide, G force-GC) ── JS Objects: %u | DOM Nodes: %u ",
-                 b->vm ? b->vm->gc_obj_count : 0U,
-                 b->doc ? b->doc->node_count : 0U);
-        int hc = buf_append_trunc(frame, hdr, cols);
-        while (hc < cols) { tb_buf_append_char(frame, ' '); hc++; }
-        tb_buf_append_cstr(frame, "\x1b[0m\x1b[K");
+static void tui_render_console_drawer(TbBrowser *b, int cols, int doc_rows,
+                                      int drawer_h, TbBuf *frame) {
+    if (drawer_h <= 0) return;
+    int top_row = 2 + doc_rows;
+    tb_buf_printf(frame, "\x1b[%d;1H\x1b[0;1;48;2;30;41;59;38;2;56;189;248m", top_row);
+    char hdr[256];
+    snprintf(hdr, sizeof(hdr),
+             " ── JS Console & Live REPL (: eval, c hide, G force-GC) ── JS Objects: %u | DOM Nodes: %u ",
+             b->vm ? b->vm->gc_obj_count : 0U,
+             b->doc ? b->doc->node_count : 0U);
+    int hc = buf_append_trunc(frame, hdr, cols);
+    while (hc < cols) { tb_buf_append_char(frame, ' '); hc++; }
+    tb_buf_append_cstr(frame, "\x1b[0m\x1b[K");
 
-        int log_slots = drawer_h - 1;
-        int start_idx = b->console_count - log_slots;
-        if (start_idx < 0) start_idx = 0;
-        for (int i = 0; i < log_slots; i++) {
-            int row = top_row + 1 + i;
-            int li  = start_idx + i;
-            tb_buf_printf(frame, "\x1b[%d;1H\x1b[0;48;2;12;17;29m", row);
-            if (li < b->console_count && b->console_logs[li].text) {
-                JsLogLevel lv = b->console_logs[li].level;
-                if (lv == JS_LOG_ERROR)      tb_buf_append_cstr(frame, " \x1b[1;38;2;248;113;113m✖ ");
-                else if (lv == JS_LOG_WARN)  tb_buf_append_cstr(frame, " \x1b[1;38;2;251;191;36m▲ ");
-                else                         tb_buf_append_cstr(frame, " \x1b[38;2;148;163;184m› \x1b[38;2;226;232;240m");
-                int lc = 3 + buf_append_trunc(frame, b->console_logs[li].text, cols - 4);
-                while (lc < cols) { tb_buf_append_char(frame, ' '); lc++; }
-            } else {
-                for (int c = 0; c < cols; c++) tb_buf_append_char(frame, ' ');
-            }
-            tb_buf_append_cstr(frame, "\x1b[0m\x1b[K");
+    int log_slots = drawer_h - 1;
+    int start_idx = b->console_count - log_slots;
+    if (start_idx < 0) start_idx = 0;
+    for (int i = 0; i < log_slots; i++) {
+        int row = top_row + 1 + i;
+        int li  = start_idx + i;
+        tb_buf_printf(frame, "\x1b[%d;1H\x1b[0;48;2;12;17;29m", row);
+        if (li < b->console_count && b->console_logs[li].text) {
+            JsLogLevel lv = b->console_logs[li].level;
+            if (lv == JS_LOG_ERROR)      tb_buf_append_cstr(frame, " \x1b[1;38;2;248;113;113m✖ ");
+            else if (lv == JS_LOG_WARN)  tb_buf_append_cstr(frame, " \x1b[1;38;2;251;191;36m▲ ");
+            else                         tb_buf_append_cstr(frame, " \x1b[38;2;148;163;184m› \x1b[38;2;226;232;240m");
+            int lc = 3 + buf_append_trunc(frame, b->console_logs[li].text, cols - 4);
+            while (lc < cols) { tb_buf_append_char(frame, ' '); lc++; }
+        } else {
+            for (int c = 0; c < cols; c++) tb_buf_append_char(frame, ' ');
         }
+        tb_buf_append_cstr(frame, "\x1b[0m\x1b[K");
     }
+}
 
-    /* ── 4. Bottom Status / Omnibar / Search / REPL Prompt Bar ── */
+static void tui_render_bottom_bar(TbBrowser *b, int cols, int rows, int max_scroll,
+                                  TuiPromptMode prompt_mode, const char *prompt_buf,
+                                  TbBuf *frame) {
     tb_buf_printf(frame, "\x1b[%d;1H", rows);
     if (prompt_mode != PROMPT_NONE) {
         const char *prefix = " URL > ";
@@ -504,6 +485,37 @@ static void tui_render(TbBrowser *b, int cols, int rows, bool console_open,
         }
         tb_buf_append_cstr(frame, "\x1b[0m");
     }
+}
+
+static void tui_render(TbBrowser *b, int cols, int rows, bool console_open,
+                       TuiPromptMode prompt_mode, const char *prompt_buf,
+                       const char *search_query, TbBuf *frame) {
+    tb_buf_clear(frame);
+    /* Synchronized update start + hide cursor during draw */
+    tb_buf_append_cstr(frame, "\x1b[?2026h\x1b[?25l");
+
+    int drawer_h = console_open ? 8 : 0;
+    if (rows - 2 - drawer_h < 4) drawer_h = 0;
+    int doc_rows = rows - 2 - drawer_h;
+
+    if (b->viewport_w != cols || b->viewport_h != doc_rows) {
+        b->viewport_w = cols;
+        b->viewport_h = doc_rows;
+        tb_browser_relayout_if_needed(b, true);
+    } else {
+        tb_browser_relayout_if_needed(b, false);
+    }
+
+    int max_scroll = b->layout.line_count - doc_rows;
+    if (max_scroll < 0) max_scroll = 0;
+    if (b->scroll_y > max_scroll) b->scroll_y = max_scroll;
+    if (b->scroll_y < 0) b->scroll_y = 0;
+    if (b->vm) b->vm->scroll_y = b->scroll_y;
+
+    tui_render_top_bar(b, cols, frame);
+    tui_render_viewport(b, cols, doc_rows, search_query, frame);
+    tui_render_console_drawer(b, cols, doc_rows, drawer_h, frame);
+    tui_render_bottom_bar(b, cols, rows, max_scroll, prompt_mode, prompt_buf, frame);
 
     tb_buf_append_cstr(frame, "\x1b[?2026l");
     write_all(STDOUT_FILENO, frame->data, frame->len);
@@ -643,20 +655,20 @@ int tb_tui_run(TbBrowser *b) {
                 } else if (ev.kind == KEY_ENTER) {
                     DomNode *ed = b->editing_node;
                     if (ed->tag == TAG_TEXTAREA) {
-                        tb_browser_edit_key(b, '\n', 0);
+                        tb_browser_edit_key(b, '\n', TB_EDIT_NONE);
                     } else {
-                        tb_browser_edit_key(b, 0, 13);
+                        tb_browser_edit_key(b, 0, TB_EDIT_ENTER);
                     }
                 } else if (ev.kind == KEY_BACKSPACE) {
-                    tb_browser_edit_key(b, 0, 8);
+                    tb_browser_edit_key(b, 0, TB_EDIT_BACKSPACE);
                 } else if (ev.kind == KEY_DELETE) {
-                    tb_browser_edit_key(b, 0, 127);
+                    tb_browser_edit_key(b, 0, TB_EDIT_DELETE);
                 } else if (ev.kind == KEY_LEFT) {
-                    tb_browser_edit_key(b, 0, 1);
+                    tb_browser_edit_key(b, 0, TB_EDIT_LEFT);
                 } else if (ev.kind == KEY_RIGHT) {
-                    tb_browser_edit_key(b, 0, 2);
+                    tb_browser_edit_key(b, 0, TB_EDIT_RIGHT);
                 } else if (ev.kind == KEY_CHAR) {
-                    tb_browser_edit_key(b, ev.cp, 0);
+                    tb_browser_edit_key(b, ev.cp, TB_EDIT_NONE);
                 }
                 continue;
             }

@@ -5,6 +5,37 @@
  * Strict Bounds-Checked ASN.1 DER Reader
  * ============================================================================ */
 
+enum {
+    ASN1_TAG_BOOLEAN        = 0x01U,
+    ASN1_TAG_INTEGER        = 0x02U,
+    ASN1_TAG_BIT_STRING     = 0x03U,
+    ASN1_TAG_OCTET_STRING   = 0x04U,
+    ASN1_TAG_NULL           = 0x05U,
+    ASN1_TAG_OID            = 0x06U,
+    ASN1_TAG_UTF8_STRING    = 0x0CU,
+    ASN1_TAG_NUMERIC_STRING = 0x12U,
+    ASN1_TAG_PRINTABLE_STR  = 0x13U,
+    ASN1_TAG_TELETEX_STR    = 0x14U,
+    ASN1_TAG_IA5_STRING     = 0x16U,
+    ASN1_TAG_UTC_TIME       = 0x17U,
+    ASN1_TAG_GEN_TIME       = 0x18U,
+    ASN1_TAG_UNIVERSAL_STR  = 0x1CU,
+    ASN1_TAG_BMP_STRING     = 0x1EU,
+    ASN1_TAG_SEQUENCE       = 0x30U,
+    ASN1_TAG_SET            = 0x31U,
+    ASN1_CTX_IMPLICIT_0     = 0x80U,
+    ASN1_CTX_IMPLICIT_1     = 0x81U,
+    ASN1_CTX_IMPLICIT_2     = 0x82U,
+    ASN1_CTX_IMPLICIT_7     = 0x87U,
+    ASN1_CTX_CONSTRUCTED_0  = 0xA0U,
+    ASN1_CTX_CONSTRUCTED_2  = 0xA2U,
+    ASN1_CTX_CONSTRUCTED_3  = 0xA3U,
+    SAN_DNS_NAME            = 0x82U,
+    SAN_IP_ADDRESS          = 0x87U,
+    X509_KU_DIGITAL_SIG     = 0x8000U,
+    X509_KU_KEY_CERT_SIGN   = 0x0400U
+};
+
 typedef struct {
     const uint8_t *p;
     size_t         len;
@@ -517,111 +548,14 @@ bool tb_x509_wildcard_match(const char *pattern, size_t pat_len,
     return mem_case_eq(host_dot + 1, suffix, suffix_len);
 }
 
-static bool parse_ipv4_bytes(const char *s, uint8_t out[4]) {
-    int parts = 0;
-    const char *p = s;
-    while (*p) {
-        if (parts >= 4 || !tb_isdigit(*p)) return false;
-        int val = 0, digits = 0;
-        if (*p == '0' && tb_isdigit(p[1])) return false;
-        while (tb_isdigit(*p)) {
-            val = val * 10 + (*p - '0');
-            if (val > 255) return false;
-            p++;
-            digits++;
-        }
-        if (digits == 0) return false;
-        out[parts++] = (uint8_t)val;
-        if (*p == '.') {
-            p++;
-            if (!*p) return false;
-        } else if (*p != '\0') {
-            return false;
-        }
-    }
-    return parts == 4;
-}
-
-static bool parse_ipv6_bytes(const char *s, uint8_t out[16]) {
-    if (s[0] == '[') {
-        size_t sl = strlen(s);
-        if (sl < 4 || s[sl - 1] != ']') return false;
-        char tmp[64];
-        if (sl - 2 >= sizeof(tmp)) return false;
-        memcpy(tmp, s + 1, sl - 2);
-        tmp[sl - 2] = '\0';
-        return parse_ipv6_bytes(tmp, out);
-    }
-    uint16_t groups[8] = {0};
-    int ng = 0, gap = -1;
-    const char *p = s;
-    if (*p == ':') {
-        if (p[1] != ':') return false;
-        gap = 0;
-        p += 2;
-        if (!*p) {
-            memset(out, 0, 16);
-            return true;
-        }
-    }
-    while (*p) {
-        if (ng >= 8) return false;
-        /* Check trailing IPv4 dotted quad (e.g. ::ffff:127.0.0.1) */
-        const char *dot_chk = p;
-        while (*dot_chk && *dot_chk != ':' && *dot_chk != '.') dot_chk++;
-        if (*dot_chk == '.') {
-            if (ng > 6) return false;
-            uint8_t v4[4];
-            if (!parse_ipv4_bytes(p, v4)) return false;
-            groups[ng++] = (uint16_t)(((uint16_t)v4[0] << 8) | v4[1]);
-            groups[ng++] = (uint16_t)(((uint16_t)v4[2] << 8) | v4[3]);
-            break;
-        }
-        uint32_t v = 0;
-        int hd = 0;
-        while (tb_isxdigit(*p)) {
-            int d = tb_isdigit(*p) ? (*p - '0') : (10 + tb_tolower(*p) - 'a');
-            v = (v << 4) | (uint32_t)d;
-            p++;
-            if (++hd > 4) return false;
-        }
-        if (hd == 0) return false;
-        groups[ng++] = (uint16_t)v;
-        if (!*p) break;
-        if (*p != ':') return false;
-        p++;
-        if (*p == ':') {
-            if (gap >= 0) return false;
-            gap = ng;
-            p++;
-            if (!*p) break;
-        } else if (!*p) {
-            return false;
-        }
-    }
-    if (gap >= 0) {
-        int zeros = 8 - ng;
-        if (zeros < 1) return false;
-        for (int i = ng - 1; i >= gap; i--) groups[i + zeros] = groups[i];
-        for (int i = 0; i < zeros; i++) groups[gap + i] = 0;
-        ng = 8;
-    }
-    if (ng != 8) return false;
-    for (int i = 0; i < 8; i++) {
-        out[i * 2 + 0] = (uint8_t)(groups[i] >> 8);
-        out[i * 2 + 1] = (uint8_t)groups[i];
-    }
-    return true;
-}
-
 bool tb_x509_match_hostname(const TbX509Cert *cert, const char *host) {
     if (!cert || !host || !host[0]) return false;
 
     uint8_t ip_bin[16];
     size_t  ip_len = 0;
-    if (parse_ipv4_bytes(host, ip_bin)) {
+    if (tb_parse_ipv4_bytes(host, ip_bin)) {
         ip_len = 4;
-    } else if (strchr(host, ':') != NULL && parse_ipv6_bytes(host, ip_bin)) {
+    } else if (strchr(host, ':') != NULL && tb_parse_ipv6_bytes(host, ip_bin)) {
         ip_len = 16;
     }
 
@@ -632,18 +566,18 @@ bool tb_x509_match_hostname(const TbX509Cert *cert, const char *host) {
         DerCur san_oct, san_seq;
         uint8_t tag;
         der_init(&san_oct, cert->san_der, cert->san_len);
-        if (!der_next(&san_oct, &tag, &san_seq, NULL, NULL) || tag != 0x30U) return false;
+        if (!der_next(&san_oct, &tag, &san_seq, NULL, NULL) || tag != ASN1_TAG_SEQUENCE) return false;
         while (!der_eof(&san_seq)) {
             uint8_t gtag;
             DerCur  gval;
             if (!der_next(&san_seq, &gtag, &gval, NULL, NULL)) return false;
-            if (gtag == 0x82U) { /* dNSName [2] IMPLICIT IA5String */
+            if (gtag == SAN_DNS_NAME) {
                 saw_dns_san = true;
                 if (ip_len == 0 &&
                     tb_x509_wildcard_match((const char *)gval.p, gval.len, host, host_len)) {
                     return true;
                 }
-            } else if (gtag == 0x87U) { /* iPAddress [7] IMPLICIT OCTET STRING */
+            } else if (gtag == SAN_IP_ADDRESS) {
                 if (ip_len > 0 && gval.len == ip_len && memcmp(gval.p, ip_bin, ip_len) == 0) {
                     return true;
                 }

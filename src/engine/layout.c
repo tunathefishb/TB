@@ -106,9 +106,9 @@ static void append_span_raw(LayoutDoc *ld, int line_idx, int col, const char *te
     char *copy     = tb_arena_strndup(&ld->arena, text, byte_len);
     if (!sp || !copy) return;
 
-    if (pen.text_transform == 1) {
+    if (pen.text_transform == CSS_TRANSFORM_UPPER) {
         for (size_t i = 0; i < byte_len; i++) copy[i] = tb_toupper(copy[i]);
-    } else if (pen.text_transform == 2) {
+    } else if (pen.text_transform == CSS_TRANSFORM_LOWER) {
         for (size_t i = 0; i < byte_len; i++) copy[i] = tb_tolower(copy[i]);
     }
 
@@ -181,11 +181,11 @@ static void stamp_line_decors(LayoutCtx *ctx, int line_idx) {
 }
 
 static void align_finished_line(LayoutCtx *ctx, int line_idx) {
-    if (ctx->text_align == 0 || line_idx < 0 || line_idx >= ctx->ld->line_count) return;
+    if (ctx->text_align == CSS_ALIGN_LEFT || line_idx < 0 || line_idx >= ctx->ld->line_count) return;
     int avail = ctx->right_limit - ctx->left_margin;
     int used  = ctx->cur_col - ctx->left_margin;
     if (used <= 0 || used >= avail) return;
-    int shift = (ctx->text_align == 1) ? (avail - used) / 2 : (avail - used);
+    int shift = (ctx->text_align == CSS_ALIGN_CENTER) ? (avail - used) / 2 : (avail - used);
     if (shift <= 0) return;
 
     LayoutLine *ln = &ctx->ld->lines[line_idx];

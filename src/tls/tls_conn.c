@@ -31,6 +31,21 @@
 #define TLS_HS_KEY_UPDATE           24U
 #define TLS_HS_MESSAGE_HASH         254U
 
+/* Record layer content types */
+#define TLS_CT_CHANGE_CIPHER_SPEC   0x14U
+#define TLS_CT_ALERT                0x15U
+#define TLS_CT_HANDSHAKE            0x16U
+#define TLS_CT_APPLICATION_DATA     0x17U
+
+/* TLS extension types */
+#define TLS_EXT_SERVER_NAME          0x0000U
+#define TLS_EXT_SUPPORTED_GROUPS     0x000aU
+#define TLS_EXT_SIGNATURE_ALGORITHMS 0x000dU
+#define TLS_EXT_ALPN                 0x0010U
+#define TLS_EXT_SUPPORTED_VERSIONS   0x002bU
+#define TLS_EXT_COOKIE               0x002cU
+#define TLS_EXT_KEY_SHARE            0x0033U
+
 /* RFC 8446 §4.1.3 magic ServerHello.random for HelloRetryRequest */
 static const uint8_t TLS_HRR_RANDOM[32] = {
     0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11,
@@ -330,33 +345,19 @@ static bool tls_decrypt_record_inplace(TbTlsConn *c, const uint8_t hdr[5], size_
  * ClientHello Construction & ServerHello Parsing
  * ============================================================================ */
 
-static bool host_is_ip_literal(const char *host) {
-    if (!host || !*host) return true;
-    /* Any colon or bracket indicates an IPv6 literal */
-    if (strchr(host, ':') || host[0] == '[') return true;
-
-    /* Check if pure IPv4 dotted decimal */
-    int dots = 0;
-    bool all_num_dot = true;
-    for (const char *p = host; *p; p++) {
-        if (*p == '.') dots++;
-        else if (!tb_isdigit(*p)) { all_num_dot = false; break; }
-    }
-    if (all_num_dot && dots == 3) return true;
-    return false;
-}
-
 static void buf_put_u8(TbBuf *b, uint8_t v) {
     tb_buf_append(b, (const char *)&v, 1);
 }
 
 static void buf_put_u16(TbBuf *b, uint16_t v) {
-    uint8_t tmp[2] = { (uint8_t)(v >> 8), (uint8_t)v };
+    uint8_t tmp[2];
+    tb_store16_be(tmp, v);
     tb_buf_append(b, (const char *)tmp, 2);
 }
 
 static void buf_put_u24(TbBuf *b, uint32_t v) {
-    uint8_t tmp[3] = { (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v };
+    uint8_t tmp[3];
+    tb_store24_be(tmp, v);
     tb_buf_append(b, (const char *)tmp, 3);
 }
 
@@ -372,10 +373,10 @@ static bool tls_build_client_hello(TbBuf *hs_msg, const char *host,
     tb_buf_init(&ext);
 
     /* 1. server_name (0x0000) — omitted for IPv4/IPv6 literals per RFC 6066 §3 */
-    if (host && *host && !host_is_ip_literal(host)) {
+    if (host && *host && !tb_host_is_ip_literal(host)) {
         size_t hlen = strlen(host);
         if (hlen <= 253) {
-            buf_put_u16(&ext, 0x0000);
+            buf_put_u16(&ext, TLS_EXT_SERVER_NAME);
             buf_put_u16(&ext, (uint16_t)(hlen + 5));
             buf_put_u16(&ext, (uint16_t)(hlen + 3));
             buf_put_u8(&ext, 0x00); /* host_name */
@@ -385,20 +386,20 @@ static bool tls_build_client_hello(TbBuf *hs_msg, const char *host,
     }
 
     /* 2. application_layer_protocol_negotiation (0x0010) -> "http/1.1" (RFC 7301) */
-    buf_put_u16(&ext, 0x0010);
+    buf_put_u16(&ext, TLS_EXT_ALPN);
     buf_put_u16(&ext, 11);
     buf_put_u16(&ext, 9);
     buf_put_u8(&ext, 8);
     tb_buf_append(&ext, "http/1.1", 8);
 
     /* 3. supported_versions (0x002b) -> TLS 1.3 (0x0304) */
-    buf_put_u16(&ext, 0x002b);
+    buf_put_u16(&ext, TLS_EXT_SUPPORTED_VERSIONS);
     buf_put_u16(&ext, 3);
     buf_put_u8(&ext, 2);
     buf_put_u16(&ext, 0x0304);
 
     /* 4. supported_groups (0x000a) -> x25519 (0x001d), secp256r1 (0x0017), secp384r1 (0x0018) */
-    buf_put_u16(&ext, 0x000a);
+    buf_put_u16(&ext, TLS_EXT_SUPPORTED_GROUPS);
     buf_put_u16(&ext, 8);
     buf_put_u16(&ext, 6);
     buf_put_u16(&ext, TLS_GROUP_X25519);
@@ -420,7 +421,7 @@ static bool tls_build_client_hello(TbBuf *hs_msg, const char *host,
         0x0601  /* rsa_pkcs1_sha512 */
     };
     uint16_t sig_bytes = (uint16_t)(sizeof(sig_algs));
-    buf_put_u16(&ext, 0x000d);
+    buf_put_u16(&ext, TLS_EXT_SIGNATURE_ALGORITHMS);
     buf_put_u16(&ext, (uint16_t)(2 + sig_bytes));
     buf_put_u16(&ext, sig_bytes);
     for (size_t i = 0; i < sizeof(sig_algs) / sizeof(sig_algs[0]); i++) {
@@ -429,7 +430,7 @@ static bool tls_build_client_hello(TbBuf *hs_msg, const char *host,
 
     /* 6. cookie (0x002c) — echoed if server sent HelloRetryRequest with cookie */
     if (cookie && cookie_len > 0) {
-        buf_put_u16(&ext, 0x002c);
+        buf_put_u16(&ext, TLS_EXT_COOKIE);
         buf_put_u16(&ext, (uint16_t)(2 + cookie_len));
         buf_put_u16(&ext, (uint16_t)cookie_len);
         tb_buf_append(&ext, (const char *)cookie, cookie_len);
@@ -453,7 +454,7 @@ static bool tls_build_client_hello(TbBuf *hs_msg, const char *host,
         buf_put_u16(&ks, 97);
         tb_buf_append(&ks, (const char *)p384_pub, 97);
     }
-    buf_put_u16(&ext, 0x0033);
+    buf_put_u16(&ext, TLS_EXT_KEY_SHARE);
     buf_put_u16(&ext, (uint16_t)(2 + ks.len));
     buf_put_u16(&ext, (uint16_t)ks.len);
     if (ks.len > 0) tb_buf_append(&ext, ks.data, ks.len);
@@ -578,29 +579,29 @@ static bool tls_parse_server_hello(const uint8_t *body, size_t len,
         if (p + elen > len) return false;
         const uint8_t *ed = body + p;
 
-        if (etype == 0x002b) { /* supported_versions */
-            if (elen != 2 || (((uint16_t)ed[0] << 8) | ed[1]) != 0x0304) {
+        if (etype == TLS_EXT_SUPPORTED_VERSIONS) {
+            if (elen != 2 || tb_load16_be(ed) != 0x0304) {
                 tls_err(err, err_cap, "TLS server did not negotiate TLS 1.3");
                 return false;
             }
             got_ver = true;
-        } else if (etype == 0x0033) { /* key_share */
+        } else if (etype == TLS_EXT_KEY_SHARE) {
             if (out->is_hrr) {
                 if (elen != 2) return false;
-                out->selected_group = ((uint16_t)ed[0] << 8) | ed[1];
+                out->selected_group = tb_load16_be(ed);
                 got_ks = true;
             } else {
                 if (elen < 4) return false;
-                out->selected_group = ((uint16_t)ed[0] << 8) | ed[1];
-                size_t klen         = ((size_t)ed[2] << 8) | ed[3];
+                out->selected_group = tb_load16_be(ed);
+                size_t klen         = tb_load16_be(ed + 2);
                 if (4 + klen != elen) return false;
                 out->peer_key     = ed + 4;
                 out->peer_key_len = klen;
                 got_ks = true;
             }
-        } else if (etype == 0x002c) { /* cookie */
+        } else if (etype == TLS_EXT_COOKIE) {
             if (elen < 2) return false;
-            size_t clen = ((size_t)ed[0] << 8) | ed[1];
+            size_t clen = tb_load16_be(ed);
             if (2 + clen != elen) return false;
             out->cookie     = ed + 2;
             out->cookie_len = clen;
@@ -625,9 +626,7 @@ static bool tls_read_plaintext_server_hello(TbTlsConn *c, TbBuf *sh_buf, int tim
     tb_buf_init(sh_buf);
     for (;;) {
         if (sh_buf->len >= 4) {
-            size_t mlen = ((size_t)(uint8_t)sh_buf->data[1] << 16) |
-                          ((size_t)(uint8_t)sh_buf->data[2] << 8)  |
-                          (size_t)(uint8_t)sh_buf->data[3];
+            size_t mlen = tb_load24_be((const uint8_t *)sh_buf->data + 1);
             if ((uint8_t)sh_buf->data[0] != TLS_HS_SERVER_HELLO) {
                 tls_err(err, err_cap, "TLS expected ServerHello, got msg %u",
                         (unsigned)(uint8_t)sh_buf->data[0]);
@@ -650,17 +649,17 @@ static bool tls_read_plaintext_server_hello(TbTlsConn *c, TbBuf *sh_buf, int tim
             tb_buf_free(sh_buf);
             return false;
         }
-        if (hdr[0] == 0x14) {
+        if (hdr[0] == TLS_CT_CHANGE_CIPHER_SPEC) {
             /* Middlebox ChangeCipherSpec */
             continue;
         }
-        if (hdr[0] == 0x15) {
+        if (hdr[0] == TLS_CT_ALERT) {
             uint8_t desc = (rlen >= 2) ? c->rec_buf[1] : 0;
             tls_err(err, err_cap, "TLS alert %u from server during ServerHello", (unsigned)desc);
             tb_buf_free(sh_buf);
             return false;
         }
-        if (hdr[0] != 0x16 || sh_buf->len + (size_t)rlen > TLS_MAX_HS_BUF) {
+        if (hdr[0] != TLS_CT_HANDSHAKE || sh_buf->len + (size_t)rlen > TLS_MAX_HS_BUF) {
             tls_err(err, err_cap, "TLS unexpected outer record 0x%02x before ServerHello", hdr[0]);
             tb_buf_free(sh_buf);
             return false;
@@ -683,7 +682,7 @@ static bool tls_next_encrypted_hs(TbTlsConn *c, TbBuf *hs_buf, size_t *hs_off,
         size_t avail = hs_buf->len - *hs_off;
         if (avail >= 4) {
             const uint8_t *p = (const uint8_t *)hs_buf->data + *hs_off;
-            size_t mlen = ((size_t)p[1] << 16) | ((size_t)p[2] << 8) | (size_t)p[3];
+            size_t mlen = tb_load24_be(p + 1);
             if (4 + mlen > TLS_MAX_HS_BUF) {
                 tls_err(err, err_cap, "TLS handshake message exceeds 256 KB limit");
                 return false;
@@ -713,16 +712,16 @@ static bool tls_next_encrypted_hs(TbTlsConn *c, TbBuf *hs_buf, size_t *hs_off,
             tls_err(err, err_cap, "TLS connection closed during encrypted handshake");
             return false;
         }
-        if (hdr[0] == 0x14) {
+        if (hdr[0] == TLS_CT_CHANGE_CIPHER_SPEC) {
             /* Ignore middlebox plaintext ChangeCipherSpec */
             continue;
         }
-        if (hdr[0] == 0x15) {
+        if (hdr[0] == TLS_CT_ALERT) {
             uint8_t desc = (rlen >= 2) ? c->rec_buf[1] : 0;
             tls_err(err, err_cap, "TLS plaintext alert %u during handshake", (unsigned)desc);
             return false;
         }
-        if (hdr[0] != 0x17) {
+        if (hdr[0] != TLS_CT_APPLICATION_DATA) {
             tls_err(err, err_cap, "TLS unexpected record type 0x%02x during encrypted handshake", hdr[0]);
             return false;
         }
@@ -733,12 +732,12 @@ static bool tls_next_encrypted_hs(TbTlsConn *c, TbBuf *hs_buf, size_t *hs_off,
             tls_err(err, err_cap, "TLS handshake AEAD decryption failed");
             return false;
         }
-        if (inner_type == 0x15) {
+        if (inner_type == TLS_CT_ALERT) {
             uint8_t desc = (pt_len >= 2) ? c->rec_buf[1] : 0;
             tls_err(err, err_cap, "TLS encrypted alert %u during handshake", (unsigned)desc);
             return false;
         }
-        if (inner_type != 0x16) {
+        if (inner_type != TLS_CT_HANDSHAKE) {
             tls_err(err, err_cap, "TLS unexpected inner content type 0x%02x during handshake", inner_type);
             return false;
         }
@@ -751,6 +750,209 @@ static bool tls_next_encrypted_hs(TbTlsConn *c, TbBuf *hs_buf, size_t *hs_off,
             return false;
         }
     }
+}
+
+/* ============================================================================
+ * Encrypted Server Flight Verification Helpers
+ * ============================================================================ */
+
+static bool tls_verify_encrypted_extensions(const uint8_t *mbody, size_t mblen,
+                                            char *err_buf, size_t err_cap) {
+    if (mblen < 2) {
+        tls_err(err_buf, err_cap, "TLS malformed EncryptedExtensions");
+        return false;
+    }
+    size_t ee_len = tb_load16_be(mbody);
+    if (2 + ee_len != mblen) {
+        tls_err(err_buf, err_cap, "TLS malformed EncryptedExtensions");
+        return false;
+    }
+    size_t ep = 2;
+    while (ep < mblen) {
+        if (ep + 4 > mblen) {
+            tls_err(err_buf, err_cap, "TLS truncated EncryptedExtensions entry");
+            return false;
+        }
+        uint16_t etype = tb_load16_be(mbody + ep);
+        size_t   elen  = tb_load16_be(mbody + ep + 2);
+        ep += 4;
+        if (ep + elen > mblen) {
+            tls_err(err_buf, err_cap, "TLS EncryptedExtensions entry overflow");
+            return false;
+        }
+        if (etype == TLS_EXT_ALPN) {
+            const uint8_t *ed = mbody + ep;
+            if (elen != 11 || tb_load16_be(ed) != 9 ||
+                ed[2] != 8 || memcmp(ed + 3, "http/1.1", 8) != 0) {
+                tls_err(err_buf, err_cap, "TLS server negotiated unsupported ALPN protocol");
+                return false;
+            }
+        }
+        ep += elen;
+    }
+    return true;
+}
+
+static bool tls_process_certificate_msg(const uint8_t *mbody, size_t mblen,
+                                        const char *host, bool insecure,
+                                        TbX509Cert *leaf_cert_out, uint8_t **leaf_der_copy_out,
+                                        char *err_buf, size_t err_cap) {
+    if (mblen < 4) {
+        tls_err(err_buf, err_cap, "TLS malformed Certificate message");
+        return false;
+    }
+    size_t ctx_len = mbody[0];
+    if (ctx_len != 0 || 1 + ctx_len + 3 > mblen) {
+        tls_err(err_buf, err_cap, "TLS invalid server Certificate context");
+        return false;
+    }
+    size_t p = 1 + ctx_len;
+    size_t list_len = tb_load24_be(mbody + p);
+    p += 3;
+    if (p + list_len != mblen || list_len == 0) {
+        tls_err(err_buf, err_cap, "TLS empty or malformed server Certificate list");
+        return false;
+    }
+
+    const uint8_t *cert_ders[TLS_MAX_CERTS];
+    size_t         cert_lens[TLS_MAX_CERTS];
+    size_t         cert_count = 0;
+
+    while (p < mblen) {
+        if (p + 3 > mblen) {
+            tls_err(err_buf, err_cap, "TLS truncated CertificateEntry");
+            return false;
+        }
+        size_t clen = tb_load24_be(mbody + p);
+        p += 3;
+        if (clen == 0 || p + clen + 2 > mblen) {
+            tls_err(err_buf, err_cap, "TLS invalid CertificateEntry DER length");
+            return false;
+        }
+        const uint8_t *cder = mbody + p;
+        p += clen;
+
+        size_t ext_len = tb_load16_be(mbody + p);
+        p += 2;
+        if (p + ext_len > mblen) {
+            tls_err(err_buf, err_cap, "TLS invalid CertificateEntry extensions");
+            return false;
+        }
+        p += ext_len;
+
+        if (cert_count < TLS_MAX_CERTS) {
+            cert_ders[cert_count] = cder;
+            cert_lens[cert_count] = clen;
+            cert_count++;
+        }
+    }
+
+    if (cert_count == 0) {
+        tls_err(err_buf, err_cap, "TLS server sent zero certificates");
+        return false;
+    }
+
+    /* Copy leaf DER before hs_buf can be compacted by subsequent reads */
+    size_t leaf_der_len = cert_lens[0];
+    uint8_t *leaf_der_copy = (uint8_t *)tb_malloc(leaf_der_len);
+    if (!leaf_der_copy) {
+        tls_err(err_buf, err_cap, "Out of memory copying leaf certificate");
+        return false;
+    }
+    memcpy(leaf_der_copy, cert_ders[0], leaf_der_len);
+
+    if (!tb_x509_parse_der(leaf_der_copy, leaf_der_len, leaf_cert_out, err_buf, err_cap)) {
+        tb_free(leaf_der_copy);
+        return false;
+    }
+
+    if (!insecure) {
+        struct timespec ts_real = {0, 0};
+        clock_gettime(CLOCK_REALTIME, &ts_real);
+        int64_t now_unix = (int64_t)ts_real.tv_sec;
+        if (!tb_x509_verify_chain(cert_ders, cert_lens, cert_count, host, now_unix,
+                                  tb_tls_get_ca_file(), err_buf, err_cap)) {
+            tb_free(leaf_der_copy);
+            return false;
+        }
+    }
+
+    *leaf_der_copy_out = leaf_der_copy;
+    return true;
+}
+
+static bool tls_process_cert_verify_msg(const TbTlsConn *c, const TbX509Cert *leaf_cert,
+                                        const uint8_t th_cv[48],
+                                        const uint8_t *mbody, size_t mblen,
+                                        char *err_buf, size_t err_cap) {
+    if (mblen < 4) {
+        tls_err(err_buf, err_cap, "TLS malformed CertificateVerify");
+        return false;
+    }
+    uint16_t sig_scheme = tb_load16_be(mbody);
+    size_t   sig_len    = tb_load16_be(mbody + 2);
+    if (4 + sig_len != mblen) {
+        tls_err(err_buf, err_cap, "TLS malformed CertificateVerify signature length");
+        return false;
+    }
+    if (!tb_x509_verify_tls13_sig(leaf_cert, sig_scheme, th_cv, c->hash_len,
+                                  mbody + 4, sig_len)) {
+        tls_err(err_buf, err_cap, "TLS 1.3 CertificateVerify signature verification failed");
+        return false;
+    }
+    return true;
+}
+
+static bool tls_process_server_finished(const TbTlsConn *c, const uint8_t s_hs_traffic[48],
+                                        const uint8_t th_before_sfin[48],
+                                        const uint8_t *mbody, size_t mblen,
+                                        char *err_buf, size_t err_cap) {
+    if (mblen != c->hash_len) {
+        tls_err(err_buf, err_cap, "TLS expected server Finished (%zu B), got %zu B",
+                c->hash_len, mblen);
+        return false;
+    }
+    uint8_t s_fin_key[48];
+    uint8_t expected_sfin[48];
+    tb_tls13_hkdf_expand_label(c->hash_len, s_hs_traffic, "finished",
+                               NULL, 0, s_fin_key, c->hash_len);
+    tb_hmac(c->hash_len, s_fin_key, c->hash_len,
+            th_before_sfin, c->hash_len, expected_sfin);
+    int diff = tb_crypto_ct_memcmp(expected_sfin, mbody, c->hash_len);
+    tb_crypto_wipe(s_fin_key, sizeof(s_fin_key));
+    tb_crypto_wipe(expected_sfin, sizeof(expected_sfin));
+    if (diff != 0) {
+        tls_err(err_buf, err_cap, "TLS server Finished MAC mismatch");
+        return false;
+    }
+    return true;
+}
+
+static bool tls_send_client_finished(TbTlsConn *c, const TlsTranscript *th,
+                                     const uint8_t c_hs_traffic[48], int timeout_ms,
+                                     char *err_buf, size_t err_cap) {
+    uint8_t th_cfin[48];
+    uint8_t c_fin_key[48];
+    uint8_t c_fin_msg[4 + 48];
+
+    th_snapshot(th, c->hash_len, th_cfin);
+    tb_tls13_hkdf_expand_label(c->hash_len, c_hs_traffic, "finished",
+                               NULL, 0, c_fin_key, c->hash_len);
+    c_fin_msg[0] = (uint8_t)TLS_HS_FINISHED;
+    c_fin_msg[1] = 0;
+    c_fin_msg[2] = 0;
+    c_fin_msg[3] = (uint8_t)c->hash_len;
+    tb_hmac(c->hash_len, c_fin_key, c->hash_len, th_cfin, c->hash_len, c_fin_msg + 4);
+
+    bool ok = tls_encrypt_and_send(c, TLS_CT_HANDSHAKE, c_fin_msg, 4 + c->hash_len, timeout_ms);
+    tb_crypto_wipe(th_cfin, sizeof(th_cfin));
+    tb_crypto_wipe(c_fin_key, sizeof(c_fin_key));
+    tb_crypto_wipe(c_fin_msg, sizeof(c_fin_msg));
+    if (!ok) {
+        tls_err(err_buf, err_cap, "Failed sending TLS client Finished");
+        return false;
+    }
+    return true;
 }
 
 /* ============================================================================
@@ -812,7 +1014,7 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
             goto fail;
         }
         th_update(&th, (const uint8_t *)ch1.data, ch1.len);
-        bool sent = tls_send_plaintext_record(fd, 0x16, 0x0301,
+        bool sent = tls_send_plaintext_record(fd, TLS_CT_HANDSHAKE, 0x0301,
                                               (const uint8_t *)ch1.data, ch1.len, timeout_ms);
         tb_buf_free(&ch1);
         if (!sent) {
@@ -873,7 +1075,7 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
 
         /* Middlebox compatibility CCS before ClientHello2 (must NOT send a second CCS later!) */
         uint8_t ccs = 0x01;
-        if (!tls_send_plaintext_record(fd, 0x14, 0x0303, &ccs, 1, timeout_ms)) {
+        if (!tls_send_plaintext_record(fd, TLS_CT_CHANGE_CIPHER_SPEC, 0x0303, &ccs, 1, timeout_ms)) {
             tls_err(err_buf, err_cap, "Failed sending TLS middlebox CCS");
             goto fail;
         }
@@ -888,7 +1090,7 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
         tb_buf_free(&sh_buf);
 
         th_update(&th, (const uint8_t *)ch2.data, ch2.len);
-        bool sent = tls_send_plaintext_record(fd, 0x16, 0x0303,
+        bool sent = tls_send_plaintext_record(fd, TLS_CT_HANDSHAKE, 0x0303,
                                               (const uint8_t *)ch2.data, ch2.len, timeout_ms);
         tb_buf_free(&ch2);
         if (!sent) {
@@ -991,39 +1193,12 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
                                &mtype, &mfull, &mflen, &mbody, &mblen, err_buf, err_cap)) {
         goto fail_wipe;
     }
-    if (mtype != TLS_HS_ENCRYPTED_EXTENSIONS || mblen < 2) {
+    if (mtype != TLS_HS_ENCRYPTED_EXTENSIONS) {
         tls_err(err_buf, err_cap, "TLS expected EncryptedExtensions, got %u", (unsigned)mtype);
         goto fail_wipe;
     }
-    {
-        size_t ee_len = ((size_t)mbody[0] << 8) | mbody[1];
-        if (2 + ee_len != mblen) {
-            tls_err(err_buf, err_cap, "TLS malformed EncryptedExtensions");
-            goto fail_wipe;
-        }
-        size_t ep = 2;
-        while (ep < mblen) {
-            if (ep + 4 > mblen) {
-                tls_err(err_buf, err_cap, "TLS truncated EncryptedExtensions entry");
-                goto fail_wipe;
-            }
-            uint16_t etype = ((uint16_t)mbody[ep] << 8) | mbody[ep + 1];
-            size_t   elen  = ((size_t)mbody[ep + 2] << 8) | mbody[ep + 3];
-            ep += 4;
-            if (ep + elen > mblen) {
-                tls_err(err_buf, err_cap, "TLS EncryptedExtensions entry overflow");
-                goto fail_wipe;
-            }
-            if (etype == 0x0010U) { /* ALPN */
-                const uint8_t *ed = mbody + ep;
-                if (elen != 11 || (((size_t)ed[0] << 8) | ed[1]) != 9 ||
-                    ed[2] != 8 || memcmp(ed + 3, "http/1.1", 8) != 0) {
-                    tls_err(err_buf, err_cap, "TLS server negotiated unsupported ALPN protocol");
-                    goto fail_wipe;
-                }
-            }
-            ep += elen;
-        }
+    if (!tls_verify_encrypted_extensions(mbody, mblen, err_buf, err_cap)) {
+        goto fail_wipe;
     }
     th_update(&th, mfull, mflen);
 
@@ -1055,90 +1230,16 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
     }
 
     /* 3. Certificate */
-    if (mtype != TLS_HS_CERTIFICATE || mblen < 4) {
+    if (mtype != TLS_HS_CERTIFICATE) {
         tls_err(err_buf, err_cap, "TLS expected Certificate, got %u", (unsigned)mtype);
         goto fail_wipe;
     }
     TbX509Cert leaf_cert;
     memset(&leaf_cert, 0, sizeof(leaf_cert));
     uint8_t *leaf_der_copy = NULL;
-    size_t   leaf_der_len  = 0;
-    {
-        size_t ctx_len = mbody[0];
-        if (ctx_len != 0 || 1 + ctx_len + 3 > mblen) {
-            tls_err(err_buf, err_cap, "TLS invalid server Certificate context");
-            goto fail_wipe;
-        }
-        size_t p = 1 + ctx_len;
-        size_t list_len = ((size_t)mbody[p] << 16) | ((size_t)mbody[p + 1] << 8) | mbody[p + 2];
-        p += 3;
-        if (p + list_len != mblen || list_len == 0) {
-            tls_err(err_buf, err_cap, "TLS empty or malformed server Certificate list");
-            goto fail_wipe;
-        }
-
-        const uint8_t *cert_ders[TLS_MAX_CERTS];
-        size_t         cert_lens[TLS_MAX_CERTS];
-        size_t         cert_count = 0;
-
-        while (p < mblen) {
-            if (p + 3 > mblen) {
-                tls_err(err_buf, err_cap, "TLS truncated CertificateEntry");
-                goto fail_wipe;
-            }
-            size_t clen = ((size_t)mbody[p] << 16) | ((size_t)mbody[p + 1] << 8) | mbody[p + 2];
-            p += 3;
-            if (clen == 0 || p + clen + 2 > mblen) {
-                tls_err(err_buf, err_cap, "TLS invalid CertificateEntry DER length");
-                goto fail_wipe;
-            }
-            const uint8_t *cder = mbody + p;
-            p += clen;
-
-            size_t ext_len = ((size_t)mbody[p] << 8) | mbody[p + 1];
-            p += 2;
-            if (p + ext_len > mblen) {
-                tls_err(err_buf, err_cap, "TLS invalid CertificateEntry extensions");
-                goto fail_wipe;
-            }
-            p += ext_len;
-
-            if (cert_count < TLS_MAX_CERTS) {
-                cert_ders[cert_count] = cder;
-                cert_lens[cert_count] = clen;
-                cert_count++;
-            }
-        }
-
-        if (cert_count == 0) {
-            tls_err(err_buf, err_cap, "TLS server sent zero certificates");
-            goto fail_wipe;
-        }
-
-        /* Copy leaf DER before hs_buf can be compacted by subsequent reads */
-        leaf_der_len  = cert_lens[0];
-        leaf_der_copy = (uint8_t *)tb_malloc(leaf_der_len);
-        if (!leaf_der_copy) {
-            tls_err(err_buf, err_cap, "Out of memory copying leaf certificate");
-            goto fail_wipe;
-        }
-        memcpy(leaf_der_copy, cert_ders[0], leaf_der_len);
-
-        if (!tb_x509_parse_der(leaf_der_copy, leaf_der_len, &leaf_cert, err_buf, err_cap)) {
-            tb_free(leaf_der_copy);
-            goto fail_wipe;
-        }
-
-        if (!insecure) {
-            struct timespec ts_real = {0, 0};
-            clock_gettime(CLOCK_REALTIME, &ts_real);
-            int64_t now_unix = (int64_t)ts_real.tv_sec;
-            if (!tb_x509_verify_chain(cert_ders, cert_lens, cert_count, host, now_unix,
-                                      tb_tls_get_ca_file(), err_buf, err_cap)) {
-                tb_free(leaf_der_copy);
-                goto fail_wipe;
-            }
-        }
+    if (!tls_process_certificate_msg(mbody, mblen, host, insecure,
+                                     &leaf_cert, &leaf_der_copy, err_buf, err_cap)) {
+        goto fail_wipe;
     }
     th_update(&th, mfull, mflen);
 
@@ -1151,25 +1252,14 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
         tb_free(leaf_der_copy);
         goto fail_wipe;
     }
-    if (mtype != TLS_HS_CERTIFICATE_VERIFY || mblen < 4) {
+    if (mtype != TLS_HS_CERTIFICATE_VERIFY) {
         tb_free(leaf_der_copy);
         tls_err(err_buf, err_cap, "TLS expected CertificateVerify, got %u", (unsigned)mtype);
         goto fail_wipe;
     }
-    {
-        uint16_t sig_scheme = ((uint16_t)mbody[0] << 8) | mbody[1];
-        size_t   sig_len    = ((size_t)mbody[2] << 8) | mbody[3];
-        if (4 + sig_len != mblen) {
-            tb_free(leaf_der_copy);
-            tls_err(err_buf, err_cap, "TLS malformed CertificateVerify signature length");
-            goto fail_wipe;
-        }
-        if (!tb_x509_verify_tls13_sig(&leaf_cert, sig_scheme, th_cv, c->hash_len,
-                                      mbody + 4, sig_len)) {
-            tb_free(leaf_der_copy);
-            tls_err(err_buf, err_cap, "TLS 1.3 CertificateVerify signature verification failed");
-            goto fail_wipe;
-        }
+    if (!tls_process_cert_verify_msg(c, &leaf_cert, th_cv, mbody, mblen, err_buf, err_cap)) {
+        tb_free(leaf_der_copy);
+        goto fail_wipe;
     }
     tb_free(leaf_der_copy);
     leaf_der_copy = NULL;
@@ -1183,9 +1273,8 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
                                &mtype, &mfull, &mflen, &mbody, &mblen, err_buf, err_cap)) {
         goto fail_wipe;
     }
-    if (mtype != TLS_HS_FINISHED || mblen != c->hash_len) {
-        tls_err(err_buf, err_cap, "TLS expected server Finished (%zu B), got type %u (%zu B)",
-                c->hash_len, (unsigned)mtype, mblen);
+    if (mtype != TLS_HS_FINISHED) {
+        tls_err(err_buf, err_cap, "TLS expected server Finished, got type %u", (unsigned)mtype);
         goto fail_wipe;
     }
     /* RFC 8446 §5.1: Key change after Finished MUST align with record boundary */
@@ -1193,20 +1282,8 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
         tls_err(err_buf, err_cap, "TLS server Finished did not align with record boundary");
         goto fail_wipe;
     }
-    {
-        uint8_t s_fin_key[48];
-        uint8_t expected_sfin[48];
-        tb_tls13_hkdf_expand_label(c->hash_len, s_hs_traffic, "finished",
-                                   NULL, 0, s_fin_key, c->hash_len);
-        tb_hmac(c->hash_len, s_fin_key, c->hash_len,
-                th_before_sfin, c->hash_len, expected_sfin);
-        int diff = tb_crypto_ct_memcmp(expected_sfin, mbody, c->hash_len);
-        tb_crypto_wipe(s_fin_key, sizeof(s_fin_key));
-        tb_crypto_wipe(expected_sfin, sizeof(expected_sfin));
-        if (diff != 0) {
-            tls_err(err_buf, err_cap, "TLS server Finished MAC mismatch");
-            goto fail_wipe;
-        }
+    if (!tls_process_server_finished(c, s_hs_traffic, th_before_sfin, mbody, mblen, err_buf, err_cap)) {
+        goto fail_wipe;
     }
     th_update(&th, mfull, mflen);
     tb_buf_free(&hs_buf);
@@ -1230,7 +1307,7 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
     /* Send client ChangeCipherSpec (middlebox compat, if HRR didn't already send it) + Finished */
     if (!did_hrr) {
         uint8_t ccs = 0x01;
-        if (!tls_send_plaintext_record(fd, 0x14, 0x0303, &ccs, 1, timeout_ms)) {
+        if (!tls_send_plaintext_record(fd, TLS_CT_CHANGE_CIPHER_SPEC, 0x0303, &ccs, 1, timeout_ms)) {
             tls_err(err_buf, err_cap, "Failed sending TLS client CCS");
             goto fail_wipe_ap;
         }
@@ -1247,7 +1324,7 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
         buf_put_u24(&ccert, 0); /* empty certificate_list */
 
         th_update(&th, (const uint8_t *)ccert.data, ccert.len);
-        bool ok = tls_encrypt_and_send(c, 0x16, (const uint8_t *)ccert.data, ccert.len, timeout_ms);
+        bool ok = tls_encrypt_and_send(c, TLS_CT_HANDSHAKE, (const uint8_t *)ccert.data, ccert.len, timeout_ms);
         tb_buf_free(&ccert);
         tb_buf_free(&cert_req_ctx);
         if (!ok) {
@@ -1257,28 +1334,8 @@ TbTlsConn *tb_tls_connect(int fd, const char *host, bool insecure,
     }
 
     /* Compute & send client Finished under c_hs_traffic */
-    {
-        uint8_t th_cfin[48];
-        uint8_t c_fin_key[48];
-        uint8_t c_fin_msg[4 + 48];
-
-        th_snapshot(&th, c->hash_len, th_cfin);
-        tb_tls13_hkdf_expand_label(c->hash_len, c_hs_traffic, "finished",
-                                   NULL, 0, c_fin_key, c->hash_len);
-        c_fin_msg[0] = (uint8_t)TLS_HS_FINISHED;
-        c_fin_msg[1] = 0;
-        c_fin_msg[2] = 0;
-        c_fin_msg[3] = (uint8_t)c->hash_len;
-        tb_hmac(c->hash_len, c_fin_key, c->hash_len, th_cfin, c->hash_len, c_fin_msg + 4);
-
-        bool ok = tls_encrypt_and_send(c, 0x16, c_fin_msg, 4 + c->hash_len, timeout_ms);
-        tb_crypto_wipe(th_cfin, sizeof(th_cfin));
-        tb_crypto_wipe(c_fin_key, sizeof(c_fin_key));
-        tb_crypto_wipe(c_fin_msg, sizeof(c_fin_msg));
-        if (!ok) {
-            tls_err(err_buf, err_cap, "Failed sending TLS client Finished");
-            goto fail_wipe_ap;
-        }
+    if (!tls_send_client_finished(c, &th, c_hs_traffic, timeout_ms, err_buf, err_cap)) {
+        goto fail_wipe_ap;
     }
 
     /* Switch active read/write traffic keys to Application Traffic Secrets */
@@ -1361,7 +1418,7 @@ static bool tls_handle_post_handshake(TbTlsConn *c, const uint8_t *data, size_t 
 
             if (p[4] == 1) { /* update_requested */
                 uint8_t ku_reply[5] = { (uint8_t)TLS_HS_KEY_UPDATE, 0, 0, 1, 0 };
-                if (!tls_encrypt_and_send(c, 0x16, ku_reply, 5, timeout_ms)) {
+                if (!tls_encrypt_and_send(c, TLS_CT_HANDSHAKE, ku_reply, 5, timeout_ms)) {
                     tb_crypto_wipe(next_sec, sizeof(next_sec));
                     return false;
                 }
@@ -1413,10 +1470,10 @@ ssize_t tb_tls_read(TbTlsConn *c, void *buf, size_t len, int timeout_ms) {
             c->fatal = true;
             return -1;
         }
-        if (hdr[0] == 0x14) {
+        if (hdr[0] == TLS_CT_CHANGE_CIPHER_SPEC) {
             continue;
         }
-        if (hdr[0] != 0x17) {
+        if (hdr[0] != TLS_CT_APPLICATION_DATA) {
             c->fatal = true;
             return -1;
         }
@@ -1428,19 +1485,19 @@ ssize_t tb_tls_read(TbTlsConn *c, void *buf, size_t len, int timeout_ms) {
             return -1;
         }
 
-        if (inner_type == 0x17) {
+        if (inner_type == TLS_CT_APPLICATION_DATA) {
             if (pt_len == 0) continue; /* RFC 8446 permits empty app-data keepalive records */
             size_t take = (len < pt_len) ? len : pt_len;
             memcpy(buf, c->rec_buf, take);
             c->app_off = take;
             c->app_len = pt_len - take;
             return (ssize_t)take;
-        } else if (inner_type == 0x16) {
+        } else if (inner_type == TLS_CT_HANDSHAKE) {
             if (!tls_handle_post_handshake(c, c->rec_buf, pt_len, timeout_ms)) {
                 c->fatal = true;
                 return -1;
             }
-        } else if (inner_type == 0x15) {
+        } else if (inner_type == TLS_CT_ALERT) {
             if (pt_len >= 2 && c->rec_buf[1] == 0) { /* close_notify */
                 c->eof = true;
                 return 0;
@@ -1465,7 +1522,7 @@ bool tb_tls_write(TbTlsConn *c, const void *buf, size_t len, int timeout_ms) {
     while (sent < len) {
         size_t chunk = len - sent;
         if (chunk > TLS_MAX_PLAINTEXT) chunk = TLS_MAX_PLAINTEXT;
-        if (!tls_encrypt_and_send(c, 0x17, p + sent, chunk, timeout_ms)) {
+        if (!tls_encrypt_and_send(c, TLS_CT_APPLICATION_DATA, p + sent, chunk, timeout_ms)) {
             c->fatal = true;
             return false;
         }
@@ -1479,7 +1536,7 @@ void tb_tls_close(TbTlsConn *c) {
     if (!c->fatal && !c->eof && c->app_ready && c->fd >= 0) {
         /* Best-effort close_notify alert (non-blocking / short timeout) */
         uint8_t alert[2] = { 1, 0 };
-        tls_encrypt_and_send(c, 0x15, alert, 2, 200);
+        tls_encrypt_and_send(c, TLS_CT_ALERT, alert, 2, 200);
     }
     if (c->rec_buf) {
         tb_crypto_wipe(c->rec_buf, TLS_MAX_CIPHERTEXT);

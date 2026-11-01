@@ -586,18 +586,18 @@ void tb_browser_edit_key(TbBrowser *b, uint32_t cp, int special_key) {
     size_t len = strlen(cur);
     if (b->edit_cursor > len) b->edit_cursor = len;
 
-    if (special_key == 1) { /* Left */
+    if (special_key == TB_EDIT_LEFT) {
         if (b->edit_cursor > 0) b->edit_cursor--;
         tb_browser_relayout_if_needed(b, true);
         return;
     }
-    if (special_key == 2) { /* Right */
+    if (special_key == TB_EDIT_RIGHT) {
         if (b->edit_cursor < len) b->edit_cursor++;
         tb_browser_relayout_if_needed(b, true);
         return;
     }
 
-    if (special_key == 13) { /* Enter inside <input> */
+    if (special_key == TB_EDIT_ENTER) { /* Enter inside <input> */
         bool allow = true;
         if (b->vm) allow = js_dispatch_dom_event(b->vm, n, "keydown", "Enter", true);
         tb_browser_stop_editing(b);
@@ -611,14 +611,14 @@ void tb_browser_edit_key(TbBrowser *b, uint32_t cp, int special_key) {
     size_t cpos = b->edit_cursor;
     if (cpos > len) cpos = len;
 
-    if (special_key == 8) { /* Backspace */
+    if (special_key == TB_EDIT_BACKSPACE) {
         if (cpos > 0) {
             tb_buf_append(&nb, cur, cpos - 1);
             tb_buf_append_cstr(&nb, cur + cpos);
             b->edit_cursor = cpos - 1;
             changed = true;
         }
-    } else if (special_key == 127) { /* Delete */
+    } else if (special_key == TB_EDIT_DELETE) {
         if (cpos < len) {
             tb_buf_append(&nb, cur, cpos);
             tb_buf_append_cstr(&nb, cur + cpos + 1);

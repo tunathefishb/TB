@@ -21,13 +21,6 @@ void css_stylesheet_free(CssStylesheet *ss) {
     ss->rule_count = 0;
 }
 
-static int hex_nibble(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
-    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
-    return -1;
-}
-
 bool css_parse_color(const char *str, CssColor *out) {
     if (!str || !out) return false;
     while (*str && tb_isspace(*str)) str++;
@@ -44,15 +37,15 @@ bool css_parse_color(const char *str, CssColor *out) {
 
     if (str[0] == '#') {
         if (len == 4) {
-            int r = hex_nibble(str[1]), g = hex_nibble(str[2]), b = hex_nibble(str[3]);
+            int r = tb_hex_val(str[1]), g = tb_hex_val(str[2]), b = tb_hex_val(str[3]);
             if (r >= 0 && g >= 0 && b >= 0) {
                 *out = css_rgb((uint8_t)(r * 17), (uint8_t)(g * 17), (uint8_t)(b * 17));
                 return true;
             }
         } else if (len >= 7) {
-            int r1 = hex_nibble(str[1]), r2 = hex_nibble(str[2]);
-            int g1 = hex_nibble(str[3]), g2 = hex_nibble(str[4]);
-            int b1 = hex_nibble(str[5]), b2 = hex_nibble(str[6]);
+            int r1 = tb_hex_val(str[1]), r2 = tb_hex_val(str[2]);
+            int g1 = tb_hex_val(str[3]), g2 = tb_hex_val(str[4]);
+            int b1 = tb_hex_val(str[5]), b2 = tb_hex_val(str[6]);
             if (r1 >= 0 && r2 >= 0 && g1 >= 0 && g2 >= 0 && b1 >= 0 && b2 >= 0) {
                 *out = css_rgb((uint8_t)((r1 << 4) | r2),
                                (uint8_t)((g1 << 4) | g2),
@@ -229,13 +222,13 @@ void css_apply_decl(CssStyle *st, const char *prop, const char *val) {
             if (strstr(vclean, "line-through")) st->strike = 1;
         }
     } else if (tb_strcasecmp(prop, "text-align") == 0) {
-        if (tb_strcasecmp(vclean, "center") == 0) st->text_align = 1;
-        else if (tb_strcasecmp(vclean, "right") == 0) st->text_align = 2;
-        else st->text_align = 0;
+        if (tb_strcasecmp(vclean, "center") == 0) st->text_align = CSS_ALIGN_CENTER;
+        else if (tb_strcasecmp(vclean, "right") == 0) st->text_align = CSS_ALIGN_RIGHT;
+        else st->text_align = CSS_ALIGN_LEFT;
     } else if (tb_strcasecmp(prop, "text-transform") == 0) {
-        if (tb_strcasecmp(vclean, "uppercase") == 0) st->text_transform = 1;
-        else if (tb_strcasecmp(vclean, "lowercase") == 0) st->text_transform = 2;
-        else st->text_transform = 0;
+        if (tb_strcasecmp(vclean, "uppercase") == 0) st->text_transform = CSS_TRANSFORM_UPPER;
+        else if (tb_strcasecmp(vclean, "lowercase") == 0) st->text_transform = CSS_TRANSFORM_LOWER;
+        else st->text_transform = CSS_TRANSFORM_NONE;
     } else if (tb_strcasecmp(prop, "white-space") == 0) {
         st->pre = (tb_strncasecmp(vclean, "pre", 3) == 0) ? 1 : 0;
     } else if (tb_strcasecmp(prop, "border") == 0) {

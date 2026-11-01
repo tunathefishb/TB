@@ -108,30 +108,37 @@ static void camel_to_kebab(const char *in, char *out, size_t cap) {
 }
 
 /* classList methods */
+typedef enum {
+    CL_ADD = 0,
+    CL_REMOVE,
+    CL_TOGGLE,
+    CL_CONTAINS
+} JsClassListMagic;
+
 static JsVal fn_classlist(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     DomNode *n = unwrap_node(this_val);
-    if (!n) return magic >= 2 ? js_bool(false) : js_undefined();
-    if (magic == 0) { /* add */
+    if (!n) return magic >= CL_TOGGLE ? js_bool(false) : js_undefined();
+    if (magic == CL_ADD) {
         for (int i = 0; i < argc; i++) {
             JsStr *s = js_to_str(vm, argv[i]);
             if (s) dom_class_add(n, s->data);
         }
         return js_undefined();
     }
-    if (magic == 1) { /* remove */
+    if (magic == CL_REMOVE) {
         for (int i = 0; i < argc; i++) {
             JsStr *s = js_to_str(vm, argv[i]);
             if (s) dom_class_remove(n, s->data);
         }
         return js_undefined();
     }
-    if (magic == 2) { /* toggle */
+    if (magic == CL_TOGGLE) {
         if (argc == 0) return js_bool(false);
         JsStr *s  = js_to_str(vm, argv[0]);
         int force = (argc > 1 && argv[1].type != JS_UNDEFINED) ? (js_to_bool(argv[1]) ? 1 : 0) : -1;
         return js_bool(s ? dom_class_toggle(n, s->data, force) : false);
     }
-    /* contains */
+    /* CL_CONTAINS */
     if (argc == 0) return js_bool(false);
     JsStr *s = js_to_str(vm, argv[0]);
     return js_bool(s && dom_class_contains(n, s->data));
@@ -144,10 +151,10 @@ static JsObj *make_proxy_obj(JsVm *vm, DomNode *node, JsNativeTag tag) {
         m->hdr.native_tag = (uint8_t)tag;
         m->native_ptr     = node;
         if (tag == NATIVE_TAG_CLASSLIST) {
-            js_define_native(vm, (JsObj *)m, "add", fn_classlist, 0);
-            js_define_native(vm, (JsObj *)m, "remove", fn_classlist, 1);
-            js_define_native(vm, (JsObj *)m, "toggle", fn_classlist, 2);
-            js_define_native(vm, (JsObj *)m, "contains", fn_classlist, 3);
+            js_define_native(vm, (JsObj *)m, "add", fn_classlist, CL_ADD);
+            js_define_native(vm, (JsObj *)m, "remove", fn_classlist, CL_REMOVE);
+            js_define_native(vm, (JsObj *)m, "toggle", fn_classlist, CL_TOGGLE);
+            js_define_native(vm, (JsObj *)m, "contains", fn_classlist, CL_CONTAINS);
         }
     }
     vm->gc_pause--;
@@ -572,34 +579,60 @@ bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
 }
 
 /* Document & Element Native Methods */
+typedef enum {
+    DOM_APPEND_CHILD = 0,
+    DOM_INSERT_BEFORE,
+    DOM_REMOVE_CHILD,
+    DOM_REPLACE_CHILD,
+    DOM_REMOVE,
+    DOM_CLONE_NODE,
+    DOM_GET_ATTRIBUTE,
+    DOM_SET_ATTRIBUTE,
+    DOM_REMOVE_ATTRIBUTE,
+    DOM_HAS_ATTRIBUTE,
+    DOM_MATCHES,
+    DOM_CLOSEST,
+    DOM_ADD_EVENT_LISTENER,
+    DOM_REMOVE_EVENT_LISTENER,
+    DOM_CLICK,
+    DOM_FOCUS_BLUR,
+    DOM_GET_ELEMENT_BY_ID = 20,
+    DOM_QUERY_SELECTOR,
+    DOM_QUERY_SELECTOR_ALL,
+    DOM_GET_ELEMENTS_BY_TAG_NAME,
+    DOM_GET_ELEMENTS_BY_CLASS_NAME,
+    DOM_CREATE_ELEMENT,
+    DOM_CREATE_TEXT_NODE
+} JsDomMethodMagic;
+
 static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     DomNode *n = unwrap_node(this_val);
-    if (!n && vm->doc && (magic >= 20 && magic <= 28)) n = vm->doc->root;
+    if (!n && vm->doc && (magic >= DOM_GET_ELEMENT_BY_ID && magic <= DOM_CREATE_TEXT_NODE)) n = vm->doc->root;
     if (!n) return js_null();
 
     switch (magic) {
         /* Document creation & queries */
-        case 20: { /* getElementById */
+        case DOM_GET_ELEMENT_BY_ID: {
             JsStr *id = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             return id ? js_wrap_dom_node(vm, dom_get_element_by_id(n, id->data)) : js_null();
         }
-        case 21: { /* querySelector */
+        case DOM_QUERY_SELECTOR: {
             JsStr *sel = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             return sel ? js_wrap_dom_node(vm, dom_query_selector(n, sel->data)) : js_null();
         }
-        case 22:   /* querySelectorAll */
-        case 23:   /* getElementsByTagName */
-        case 24: { /* getElementsByClassName */
+        case DOM_QUERY_SELECTOR_ALL:
+        case DOM_GET_ELEMENTS_BY_TAG_NAME:
+        case DOM_GET_ELEMENTS_BY_CLASS_NAME: {
             JsStr *arg = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             vm->gc_pause++;
             JsObj *arr = js_arr_new(vm, 8);
             if (arg && arg->len > 0) {
                 char sel_buf[256];
                 const char *sel = arg->data;
-                if (magic == 23) {
+                if (magic == DOM_GET_ELEMENTS_BY_TAG_NAME) {
                     snprintf(sel_buf, sizeof(sel_buf), "%s", arg->data);
                     sel = sel_buf;
-                } else if (magic == 24) {
+                } else if (magic == DOM_GET_ELEMENTS_BY_CLASS_NAME) {
                     snprintf(sel_buf, sizeof(sel_buf), ".%s", arg->data);
                     sel = sel_buf;
                 }
@@ -613,13 +646,13 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             vm->gc_pause--;
             return js_obj_val(arr);
         }
-        case 25: { /* createElement */
+        case DOM_CREATE_ELEMENT: {
             if (!vm->doc) return js_null();
             JsStr *tn = argc > 0 ? js_to_str(vm, argv[0]) : js_str_cstr(vm, "div");
             DomNode *el = dom_create_element(vm->doc, tn ? tn->data : "div");
             return js_wrap_dom_node(vm, el);
         }
-        case 26: { /* createTextNode */
+        case DOM_CREATE_TEXT_NODE: {
             if (!vm->doc) return js_null();
             JsStr *tx = argc > 0 ? js_to_str(vm, argv[0]) : js_str_cstr(vm, "");
             DomNode *tn = dom_create_text(vm->doc, tx ? tx->data : "");
@@ -627,45 +660,45 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
         }
 
         /* Node tree mutations */
-        case 0: { /* appendChild */
+        case DOM_APPEND_CHILD: {
             DomNode *ch = argc > 0 ? unwrap_node(argv[0]) : NULL;
             if (!ch || !dom_append_child(n, ch)) return js_null();
             return argv[0];
         }
-        case 1: { /* insertBefore */
+        case DOM_INSERT_BEFORE: {
             DomNode *nn  = argc > 0 ? unwrap_node(argv[0]) : NULL;
             DomNode *ref = (argc > 1 && argv[1].type != JS_NULL) ? unwrap_node(argv[1]) : NULL;
             if (!nn || !dom_insert_before(n, nn, ref)) return js_null();
             return argv[0];
         }
-        case 2: { /* removeChild */
+        case DOM_REMOVE_CHILD: {
             DomNode *ch = argc > 0 ? unwrap_node(argv[0]) : NULL;
             if (!ch || !dom_remove_child(n, ch)) return js_null();
             return argv[0];
         }
-        case 3: { /* replaceChild */
+        case DOM_REPLACE_CHILD: {
             DomNode *nn = argc > 0 ? unwrap_node(argv[0]) : NULL;
             DomNode *on = argc > 1 ? unwrap_node(argv[1]) : NULL;
             if (!nn || !on || !dom_replace_child(n, nn, on)) return js_null();
             return argv[1];
         }
-        case 4: { /* remove */
+        case DOM_REMOVE: {
             if (n->parent) dom_remove_child(n->parent, n);
             return js_undefined();
         }
-        case 5: { /* cloneNode */
+        case DOM_CLONE_NODE: {
             bool deep = argc > 0 && js_to_bool(argv[0]);
             DomNode *cl = dom_clone_node(vm->doc, n, deep);
             return js_wrap_dom_node(vm, cl);
         }
 
         /* Attributes & Matching */
-        case 6: { /* getAttribute */
+        case DOM_GET_ATTRIBUTE: {
             JsStr *nm = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             const char *v = nm ? dom_get_attr(n, nm->data) : NULL;
             return v ? js_obj_val((JsObj *)js_str_cstr(vm, v)) : js_null();
         }
-        case 7: { /* setAttribute */
+        case DOM_SET_ATTRIBUTE: {
             if (argc >= 2) {
                 JsStr *nm = js_to_str(vm, argv[0]);
                 JsStr *vl = js_to_str(vm, argv[1]);
@@ -673,20 +706,20 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             }
             return js_undefined();
         }
-        case 8: { /* removeAttribute */
+        case DOM_REMOVE_ATTRIBUTE: {
             JsStr *nm = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             if (nm) dom_remove_attr(n, nm->data);
             return js_undefined();
         }
-        case 9: { /* hasAttribute */
+        case DOM_HAS_ATTRIBUTE: {
             JsStr *nm = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             return js_bool(nm && dom_has_attr(n, nm->data));
         }
-        case 10: { /* matches */
+        case DOM_MATCHES: {
             JsStr *sel = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             return js_bool(sel && dom_matches_selector(n, sel->data));
         }
-        case 11: { /* closest */
+        case DOM_CLOSEST: {
             JsStr *sel = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             if (!sel) return js_null();
             for (DomNode *cur = n; cur && cur->type == DOM_NODE_ELEMENT; cur = cur->parent) {
@@ -696,25 +729,25 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
         }
 
         /* Event Listeners & Programmatic click() */
-        case 12: { /* addEventListener */
+        case DOM_ADD_EVENT_LISTENER: {
             if (argc >= 2 && argv[1].type == JS_OBJECT && argv[1].u.obj) {
                 JsStr *tp = js_to_str(vm, argv[0]);
                 if (tp) add_node_listener(n, tp->data, argv[1].u.obj, false);
             }
             return js_undefined();
         }
-        case 13: { /* removeEventListener */
+        case DOM_REMOVE_EVENT_LISTENER: {
             if (argc >= 2 && argv[1].type == JS_OBJECT) {
                 JsStr *tp = js_to_str(vm, argv[0]);
                 if (tp) remove_node_listener(n, tp->data, argv[1].u.obj);
             }
             return js_undefined();
         }
-        case 14: { /* click() */
+        case DOM_CLICK: {
             js_dispatch_dom_event(vm, n, "click", NULL, true);
             return js_undefined();
         }
-        case 15: /* focus() / blur() */
+        case DOM_FOCUS_BLUR:
             return js_undefined();
         default:
             return js_undefined();
@@ -722,9 +755,14 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
 }
 
 /* Event object methods: preventDefault() & stopPropagation() */
+typedef enum {
+    EV_PREVENT_DEFAULT = 0,
+    EV_STOP_PROPAGATION
+} JsEventCtrlMagic;
+
 static JsVal fn_event_ctrl(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     (void)argc; (void)argv;
-    if (magic == 0) js_set_prop(vm, this_val, "defaultPrevented", js_bool(true));
+    if (magic == EV_PREVENT_DEFAULT) js_set_prop(vm, this_val, "defaultPrevented", js_bool(true));
     else js_set_prop(vm, this_val, "_stopped", js_bool(true));
     return js_undefined();
 }
@@ -763,8 +801,8 @@ bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
     js_set_prop(vm, ev_val, "defaultPrevented", js_bool(false));
     js_set_prop(vm, ev_val, "_stopped", js_bool(false));
     if (key_name) js_set_prop(vm, ev_val, "key", js_obj_val((JsObj *)js_str_cstr(vm, key_name)));
-    js_define_native(vm, ev, "preventDefault", fn_event_ctrl, 0);
-    js_define_native(vm, ev, "stopPropagation", fn_event_ctrl, 1);
+    js_define_native(vm, ev, "preventDefault", fn_event_ctrl, EV_PREVENT_DEFAULT);
+    js_define_native(vm, ev, "stopPropagation", fn_event_ctrl, EV_STOP_PROPAGATION);
     vm->gc_pause--;
 
     js_temp_push(vm, ev_val);
@@ -813,11 +851,21 @@ bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
 }
 
 /* Timers & Window APIs & Fetch */
+typedef enum {
+    WIN_SET_TIMEOUT = 0,
+    WIN_SET_INTERVAL,
+    WIN_CLEAR_TIMER,
+    WIN_PERF_NOW,
+    WIN_ALERT,
+    WIN_SCROLL_TO,
+    WIN_LOC_RELOAD
+} JsWindowApiMagic;
+
 static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     (void)this_val;
     switch (magic) {
-        case 0:   /* setTimeout */
-        case 1: { /* setInterval */
+        case WIN_SET_TIMEOUT:
+        case WIN_SET_INTERVAL: {
             if (argc == 0 || argv[0].type != JS_OBJECT || !argv[0].u.obj) return js_num(0);
             int64_t delay = argc > 1 ? (int64_t)js_to_num(vm, argv[1]) : 0;
             if (delay < 0) delay = 0;
@@ -826,8 +874,8 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
                     int id = vm->next_timer_id++;
                     vm->timers[i].id          = id;
                     vm->timers[i].active      = true;
-                    vm->timers[i].repeat      = (magic == 1);
-                    vm->timers[i].interval_ms = (magic == 1 && delay < 10) ? 10 : delay;
+                    vm->timers[i].repeat      = (magic == WIN_SET_INTERVAL);
+                    vm->timers[i].interval_ms = (magic == WIN_SET_INTERVAL && delay < 10) ? 10 : delay;
                     vm->timers[i].due_ms      = js_now_ms() + delay;
                     vm->timers[i].fn_obj      = argv[0].u.obj;
                     return js_num((double)id);
@@ -835,7 +883,7 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             }
             return js_num(0);
         }
-        case 2: { /* clearTimeout / clearInterval */
+        case WIN_CLEAR_TIMER: {
             int id = argc > 0 ? (int)js_to_num(vm, argv[0]) : 0;
             for (int i = 0; i < JS_MAX_TIMERS; i++) {
                 if (vm->timers[i].active && vm->timers[i].id == id) {
@@ -845,23 +893,23 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             }
             return js_undefined();
         }
-        case 3: { /* performance.now() */
+        case WIN_PERF_NOW: {
             return js_num((double)(js_now_ms() - vm->boot_ms));
         }
-        case 4: { /* alert() */
+        case WIN_ALERT: {
             JsStr *s = argc > 0 ? js_to_str(vm, argv[0]) : js_str_cstr(vm, "");
             if (vm->on_alert && s) vm->on_alert(vm->host_userdata, s->data);
             js_log(vm, JS_LOG_INFO, "[alert] %s", s ? s->data : "");
             return js_undefined();
         }
-        case 5: { /* window.scrollTo(x, y) */
+        case WIN_SCROLL_TO: {
             int ny = argc > 1 ? (int)js_to_num(vm, argv[1]) : (argc > 0 ? (int)js_to_num(vm, argv[0]) : 0);
             if (ny < 0) ny = 0;
             vm->scroll_y = ny;
             if (vm->scroll_y_ptr) *vm->scroll_y_ptr = ny;
             return js_undefined();
         }
-        case 6: { /* location.reload() */
+        case WIN_LOC_RELOAD: {
             if (vm->on_navigate) vm->on_navigate(vm->host_userdata, vm->current_url, true);
             return js_undefined();
         }
@@ -871,12 +919,17 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
 }
 
 /* Synchronous Promise-like object for fetch() `.then(...).catch(...)` */
+typedef enum {
+    PROMISE_THEN = 0,
+    PROMISE_CATCH
+} JsPromiseMagic;
+
 static JsVal make_sync_promise(JsVm *vm, JsVal val, bool rejected);
 
 static JsVal fn_promise_chain(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     bool is_rej = js_to_bool(js_get_prop(vm, this_val, "_rej"));
     JsVal cur   = js_get_prop(vm, this_val, "_val");
-    if (magic == 0) { /* .then(onFulfilled, onRejected) */
+    if (magic == PROMISE_THEN) {
         if (!is_rej && argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj) {
             JsVal nxt = js_call(vm, argv[0], js_undefined(), 1, &cur);
             if (vm->has_thrown) {
@@ -898,7 +951,7 @@ static JsVal fn_promise_chain(JsVm *vm, JsVal this_val, int argc, const JsVal *a
         }
         return this_val;
     }
-    /* .catch(onRejected) */
+    /* PROMISE_CATCH */
     if (is_rej && argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj) {
         JsVal nxt = js_call(vm, argv[0], js_undefined(), 1, &cur);
         vm->has_thrown = false;
@@ -916,19 +969,24 @@ static JsVal make_sync_promise(JsVm *vm, JsVal val, bool rejected) {
         js_set_prop(vm, js_obj_val(p), "_isPromise", js_bool(true));
         js_set_prop(vm, js_obj_val(p), "_rej", js_bool(rejected));
         js_set_prop(vm, js_obj_val(p), "_val", val);
-        js_define_native(vm, p, "then", fn_promise_chain, 0);
-        js_define_native(vm, p, "catch", fn_promise_chain, 1);
+        js_define_native(vm, p, "then", fn_promise_chain, PROMISE_THEN);
+        js_define_native(vm, p, "catch", fn_promise_chain, PROMISE_CATCH);
     }
     vm->gc_pause--;
     vm->temp_sp = sp;
     return js_obj_val(p);
 }
 
+typedef enum {
+    FETCH_RESP_TEXT = 0,
+    FETCH_RESP_JSON
+} JsFetchRespMagic;
+
 static JsVal fn_fetch_resp(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     (void)argc; (void)argv;
     JsVal body = js_get_prop(vm, this_val, "_body");
-    if (magic == 0) return make_sync_promise(vm, body, false); /* .text() */
-    /* .json() */
+    if (magic == FETCH_RESP_TEXT) return make_sync_promise(vm, body, false);
+    /* FETCH_RESP_JSON */
     JsVal json_obj = js_get_prop(vm, js_obj_val(vm->global_obj), "JSON");
     JsVal parse_fn = js_get_prop(vm, json_obj, "parse");
     JsVal parsed   = js_call(vm, parse_fn, json_obj, 1, &body);
@@ -974,8 +1032,8 @@ static JsVal fn_fetch(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int
         js_set_prop(vm, js_obj_val(ro), "status", js_num((double)status));
         js_set_prop(vm, js_obj_val(ro), "ok", js_bool(status >= 200 && status < 300));
         js_set_prop(vm, js_obj_val(ro), "_body", js_obj_val((JsObj *)bs));
-        js_define_native(vm, ro, "text", fn_fetch_resp, 0);
-        js_define_native(vm, ro, "json", fn_fetch_resp, 1);
+        js_define_native(vm, ro, "text", fn_fetch_resp, FETCH_RESP_TEXT);
+        js_define_native(vm, ro, "json", fn_fetch_resp, FETCH_RESP_JSON);
     }
     vm->gc_pause--;
     return make_sync_promise(vm, js_obj_val(ro), false);
@@ -1039,62 +1097,62 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
 
     /* Element.prototype methods */
     JsObj *ep = vm->elem_proto;
-    js_define_native(vm, ep, "appendChild", fn_dom_method, 0);
-    js_define_native(vm, ep, "insertBefore", fn_dom_method, 1);
-    js_define_native(vm, ep, "removeChild", fn_dom_method, 2);
-    js_define_native(vm, ep, "replaceChild", fn_dom_method, 3);
-    js_define_native(vm, ep, "remove", fn_dom_method, 4);
-    js_define_native(vm, ep, "cloneNode", fn_dom_method, 5);
-    js_define_native(vm, ep, "getAttribute", fn_dom_method, 6);
-    js_define_native(vm, ep, "setAttribute", fn_dom_method, 7);
-    js_define_native(vm, ep, "removeAttribute", fn_dom_method, 8);
-    js_define_native(vm, ep, "hasAttribute", fn_dom_method, 9);
-    js_define_native(vm, ep, "matches", fn_dom_method, 10);
-    js_define_native(vm, ep, "closest", fn_dom_method, 11);
-    js_define_native(vm, ep, "addEventListener", fn_dom_method, 12);
-    js_define_native(vm, ep, "removeEventListener", fn_dom_method, 13);
-    js_define_native(vm, ep, "click", fn_dom_method, 14);
-    js_define_native(vm, ep, "focus", fn_dom_method, 15);
-    js_define_native(vm, ep, "blur", fn_dom_method, 15);
-    js_define_native(vm, ep, "querySelector", fn_dom_method, 21);
-    js_define_native(vm, ep, "querySelectorAll", fn_dom_method, 22);
-    js_define_native(vm, ep, "getElementsByTagName", fn_dom_method, 23);
-    js_define_native(vm, ep, "getElementsByClassName", fn_dom_method, 24);
+    js_define_native(vm, ep, "appendChild", fn_dom_method, DOM_APPEND_CHILD);
+    js_define_native(vm, ep, "insertBefore", fn_dom_method, DOM_INSERT_BEFORE);
+    js_define_native(vm, ep, "removeChild", fn_dom_method, DOM_REMOVE_CHILD);
+    js_define_native(vm, ep, "replaceChild", fn_dom_method, DOM_REPLACE_CHILD);
+    js_define_native(vm, ep, "remove", fn_dom_method, DOM_REMOVE);
+    js_define_native(vm, ep, "cloneNode", fn_dom_method, DOM_CLONE_NODE);
+    js_define_native(vm, ep, "getAttribute", fn_dom_method, DOM_GET_ATTRIBUTE);
+    js_define_native(vm, ep, "setAttribute", fn_dom_method, DOM_SET_ATTRIBUTE);
+    js_define_native(vm, ep, "removeAttribute", fn_dom_method, DOM_REMOVE_ATTRIBUTE);
+    js_define_native(vm, ep, "hasAttribute", fn_dom_method, DOM_HAS_ATTRIBUTE);
+    js_define_native(vm, ep, "matches", fn_dom_method, DOM_MATCHES);
+    js_define_native(vm, ep, "closest", fn_dom_method, DOM_CLOSEST);
+    js_define_native(vm, ep, "addEventListener", fn_dom_method, DOM_ADD_EVENT_LISTENER);
+    js_define_native(vm, ep, "removeEventListener", fn_dom_method, DOM_REMOVE_EVENT_LISTENER);
+    js_define_native(vm, ep, "click", fn_dom_method, DOM_CLICK);
+    js_define_native(vm, ep, "focus", fn_dom_method, DOM_FOCUS_BLUR);
+    js_define_native(vm, ep, "blur", fn_dom_method, DOM_FOCUS_BLUR);
+    js_define_native(vm, ep, "querySelector", fn_dom_method, DOM_QUERY_SELECTOR);
+    js_define_native(vm, ep, "querySelectorAll", fn_dom_method, DOM_QUERY_SELECTOR_ALL);
+    js_define_native(vm, ep, "getElementsByTagName", fn_dom_method, DOM_GET_ELEMENTS_BY_TAG_NAME);
+    js_define_native(vm, ep, "getElementsByClassName", fn_dom_method, DOM_GET_ELEMENTS_BY_CLASS_NAME);
 
     /* document object */
     JsMapObj *dobj = (JsMapObj *)js_map_new(vm, ep);
     dobj->hdr.native_tag = NATIVE_TAG_DOCUMENT;
     dobj->native_ptr     = doc ? doc->root : NULL;
     vm->doc_obj          = (JsObj *)dobj;
-    js_define_native(vm, vm->doc_obj, "getElementById", fn_dom_method, 20);
-    js_define_native(vm, vm->doc_obj, "querySelector", fn_dom_method, 21);
-    js_define_native(vm, vm->doc_obj, "querySelectorAll", fn_dom_method, 22);
-    js_define_native(vm, vm->doc_obj, "getElementsByTagName", fn_dom_method, 23);
-    js_define_native(vm, vm->doc_obj, "getElementsByClassName", fn_dom_method, 24);
-    js_define_native(vm, vm->doc_obj, "createElement", fn_dom_method, 25);
-    js_define_native(vm, vm->doc_obj, "createTextNode", fn_dom_method, 26);
+    js_define_native(vm, vm->doc_obj, "getElementById", fn_dom_method, DOM_GET_ELEMENT_BY_ID);
+    js_define_native(vm, vm->doc_obj, "querySelector", fn_dom_method, DOM_QUERY_SELECTOR);
+    js_define_native(vm, vm->doc_obj, "querySelectorAll", fn_dom_method, DOM_QUERY_SELECTOR_ALL);
+    js_define_native(vm, vm->doc_obj, "getElementsByTagName", fn_dom_method, DOM_GET_ELEMENTS_BY_TAG_NAME);
+    js_define_native(vm, vm->doc_obj, "getElementsByClassName", fn_dom_method, DOM_GET_ELEMENTS_BY_CLASS_NAME);
+    js_define_native(vm, vm->doc_obj, "createElement", fn_dom_method, DOM_CREATE_ELEMENT);
+    js_define_native(vm, vm->doc_obj, "createTextNode", fn_dom_method, DOM_CREATE_TEXT_NODE);
     js_set_prop(vm, js_obj_val(g), "document", js_obj_val(vm->doc_obj));
 
     /* window timers, alert, scrollTo, fetch */
-    js_define_native(vm, g, "setTimeout", fn_window_api, 0);
-    js_define_native(vm, g, "setInterval", fn_window_api, 1);
-    js_define_native(vm, g, "clearTimeout", fn_window_api, 2);
-    js_define_native(vm, g, "clearInterval", fn_window_api, 2);
-    js_define_native(vm, g, "alert", fn_window_api, 4);
-    js_define_native(vm, g, "scrollTo", fn_window_api, 5);
+    js_define_native(vm, g, "setTimeout", fn_window_api, WIN_SET_TIMEOUT);
+    js_define_native(vm, g, "setInterval", fn_window_api, WIN_SET_INTERVAL);
+    js_define_native(vm, g, "clearTimeout", fn_window_api, WIN_CLEAR_TIMER);
+    js_define_native(vm, g, "clearInterval", fn_window_api, WIN_CLEAR_TIMER);
+    js_define_native(vm, g, "alert", fn_window_api, WIN_ALERT);
+    js_define_native(vm, g, "scrollTo", fn_window_api, WIN_SCROLL_TO);
     js_define_native(vm, g, "fetch", fn_fetch, 0);
-    js_define_native(vm, g, "addEventListener", fn_dom_method, 12);
+    js_define_native(vm, g, "addEventListener", fn_dom_method, DOM_ADD_EVENT_LISTENER);
 
     /* performance */
     JsObj *perf = js_map_new(vm, vm->object_proto);
     perf->native_tag = NATIVE_TAG_PERF;
-    js_define_native(vm, perf, "now", fn_window_api, 3);
+    js_define_native(vm, perf, "now", fn_window_api, WIN_PERF_NOW);
     js_set_prop(vm, js_obj_val(g), "performance", js_obj_val(perf));
 
     /* location */
     JsObj *loc = js_map_new(vm, vm->object_proto);
     loc->native_tag = NATIVE_TAG_LOCATION;
-    js_define_native(vm, loc, "reload", fn_window_api, 6);
+    js_define_native(vm, loc, "reload", fn_window_api, WIN_LOC_RELOAD);
     js_set_prop(vm, js_obj_val(g), "location", js_obj_val(loc));
 
     /* navigator */
