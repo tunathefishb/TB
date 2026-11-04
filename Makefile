@@ -7,7 +7,7 @@ LDFLAGS      ?=
 
 BUILD_DIR    := build
 
-INC_DIRS     := -Isrc/core -Isrc/net -Isrc/tls -Isrc/js -Isrc/engine -Isrc/ui
+INC_DIRS     := -Isrc/core -Isrc/net -Isrc/tls -Isrc/js -Isrc/engine -Isrc/ui -Itests
 
 MODE_CFLAGS  := $(INC_DIRS)
 MODE_LDFLAGS :=
@@ -65,12 +65,20 @@ CORE_SRCS := \
 	src/ui/tui.c \
 	$(TLS_SRCS)
 
-vpath %.c src/core src/net src/tls src/js src/engine src/ui
+TEST_SRCS := \
+	tests/test_main.c \
+	tests/test_core.c \
+	tests/test_engine.c \
+	tests/test_js.c \
+	tests/test_net.c \
+	tests/test_tls.c
+
+vpath %.c src/core src/net src/tls src/js src/engine src/ui tests
 
 CORE_OBJS    := $(addprefix $(BUILD_DIR)/,$(notdir $(CORE_SRCS:.c=.o)))
 MAIN_OBJ     := $(BUILD_DIR)/main.o
-TEST_OBJ     := $(BUILD_DIR)/test_suite.o
-HEADERS      := $(wildcard src/*/*.h)
+TEST_OBJS    := $(addprefix $(BUILD_DIR)/,$(notdir $(TEST_SRCS:.c=.o)))
+HEADERS      := $(wildcard src/*/*.h tests/*.h)
 
 CONFIG_STR   := FREESTANDING=$(FREESTANDING) TLS=$(TLS)
 CONFIG_STAMP := $(BUILD_DIR)/.config
@@ -90,14 +98,11 @@ tb: $(CORE_OBJS) $(MAIN_OBJ) $(CONFIG_STAMP)
 $(BUILD_DIR)/%.o: %.c $(HEADERS) $(CONFIG_STAMP) | $(BUILD_DIR)
 	$(CC) $(ALL_CFLAGS) -c -o $@ $<
 
-$(TEST_OBJ): tests/test_suite.c $(HEADERS) $(CONFIG_STAMP) | $(BUILD_DIR)
-	$(CC) $(ALL_CFLAGS) -c -o $@ $<
-
-$(BUILD_DIR)/test_suite: $(CORE_OBJS) $(TEST_OBJ) $(CONFIG_STAMP)
-	$(CC) $(ALL_CFLAGS) -o $@ $(CORE_OBJS) $(TEST_OBJ) $(ALL_LDFLAGS)
+$(BUILD_DIR)/test_suite: $(CORE_OBJS) $(TEST_OBJS) $(CONFIG_STAMP)
+	$(CC) $(ALL_CFLAGS) -o $@ $(CORE_OBJS) $(TEST_OBJS) $(ALL_LDFLAGS)
 
 test: $(BUILD_DIR)/test_suite
-	./$(BUILD_DIR)/test_suite
+	./$(BUILD_DIR)/test_suite $(FILTER)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)

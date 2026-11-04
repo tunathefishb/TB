@@ -39,6 +39,9 @@ By default (`FREESTANDING=1 TLS=builtin`), `tb` compiles with `-ffreestanding -n
   - [`src/ui/browser.c`](src/ui/browser.c): Navigation controller, history ring, form submission, and script lifecycle.
   - [`src/ui/tui.c`](src/ui/tui.c): Interactive terminal UI with live `VmRSS` gauge, mouse tracking, and split-pane JS REPL drawer.
   - [`src/ui/main.c`](src/ui/main.c): CLI argument parser, headless `--dump` renderer, and entry point.
+- **`tests/` — Verification & Memory Stress Suite:**
+  - [`tests/test_harness.h`](tests/test_harness.h) & [`tests/test_main.c`](tests/test_main.c): Shared assertion macros, compression fixtures, and CLI test runner.
+  - [`tests/test_core.c`](tests/test_core.c), [`tests/test_engine.c`](tests/test_engine.c), [`tests/test_js.c`](tests/test_js.c), [`tests/test_net.c`](tests/test_net.c), [`tests/test_tls.c`](tests/test_tls.c): Per-subsystem unit, loopback integration, GC stress, and `< 10 MB VmRSS` / `< 1 MB` freestanding post-HTTPS memory tests.
 
 ## Build & Test
 
@@ -48,8 +51,9 @@ Requires Linux `x86_64` and `gcc` (or `clang`):
 # Build freestanding static binary (default: FREESTANDING=1 TLS=builtin)
 make
 
-# Run test suite
+# Run full test suite (or filter by group/suite: core, engine, js, net, tls)
 make test
+make test FILTER=js
 ```
 
 For portable libc builds on non-`x86_64` hosts or with dynamic OpenSSL fallback:
