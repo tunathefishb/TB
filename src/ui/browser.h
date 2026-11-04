@@ -36,6 +36,7 @@ typedef struct {
     int          scroll_y;
     int          focused_hit;
     DomNode     *editing_node;
+    DomNode     *active_node;
     size_t       edit_cursor;
 
     /* Deferred navigation (safe when triggered inside JS execution) */

@@ -122,8 +122,13 @@ DomDocument *dom_doc_new(void) {
 
 void dom_node_free(DomNode *node) {
     if (!node) return;
-    if (node->owner_doc && node->owner_doc->on_node_destroy) {
-        node->owner_doc->on_node_destroy(node->owner_doc->userdata, node);
+    if (node->owner_doc) {
+        if (node->owner_doc->html == node) node->owner_doc->html = NULL;
+        if (node->owner_doc->head == node) node->owner_doc->head = NULL;
+        if (node->owner_doc->body == node) node->owner_doc->body = NULL;
+        if (node->owner_doc->on_node_destroy) {
+            node->owner_doc->on_node_destroy(node->owner_doc->userdata, node);
+        }
     }
     DomNode *ch = node->first_child;
     while (ch) {

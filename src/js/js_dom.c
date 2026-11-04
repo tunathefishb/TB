@@ -2,11 +2,14 @@
 #include "net.h"
 
 static void on_dom_node_destroy(void *userdata, DomNode *node) {
-    (void)userdata;
+    JsVm *vm = (JsVm *)userdata;
     if (node && node->js_wrapper) {
         JsMapObj *m   = (JsMapObj *)node->js_wrapper;
         m->native_ptr = NULL;
         node->js_wrapper = NULL;
+    }
+    if (vm && vm->on_node_destroy) {
+        vm->on_node_destroy(vm->host_userdata, node);
     }
 }
 
@@ -807,26 +810,52 @@ bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
 
     js_temp_push(vm, ev_val);
 
-    DomNode *cur = target;
-    while (cur) {
+    /* Snapshot propagation path as wrapped DOM nodes (rooted on temp_roots)
+     * before invoking listeners, per W3C DOM Event Dispatch spec. This also
+     * prevents use-after-free if an event listener removes/destroys `cur`
+     * (e.g. via parent.innerHTML = '' or node.remove()). */
+    DomNode *path[128];
+    int path_len = 0;
+    for (DomNode *p = target; p && path_len < 128; p = p->parent) {
+        path[path_len++] = p;
+        if (!bubbles) break;
+    }
+
+    int path_sp = vm->temp_sp;
+    int actual_path_len = 0;
+    for (int p = 0; p < path_len; p++) {
+        JsVal w = js_wrap_dom_node(vm, path[p]);
+        if (!js_temp_push(vm, w)) break;
+        actual_path_len++;
+    }
+
+    for (int p = 0; p < actual_path_len; p++) {
+        JsVal cur_wrap = vm->temp_roots[path_sp + p];
+        DomNode *cur   = unwrap_node(cur_wrap);
+        if (!cur) continue; /* Node was destroyed during an earlier listener */
+
         if (cur->type == DOM_NODE_ELEMENT) {
             ensure_inline_handler_compiled(vm, cur, type);
+            cur = unwrap_node(cur_wrap);
+            if (!cur) continue;
         }
         if (cur->listeners) {
-            JsVal cur_wrap = js_wrap_dom_node(vm, cur);
             js_set_prop(vm, ev_val, "currentTarget", cur_wrap);
 
-            /* Snapshot listeners on this node in case handler mutates listeners */
-            JsObj *fns[32];
-            int nfns = 0;
+            /* Snapshot & root listeners on this node in case handler mutates listeners or triggers GC */
+            int fn_sp = vm->temp_sp;
+            int nfns  = 0;
             for (DomListener *ls = cur->listeners; ls && nfns < 32; ls = ls->next) {
                 if (strcmp(ls->type, type) == 0 && ls->js_fn) {
-                    fns[nfns++] = (JsObj *)ls->js_fn;
+                    if (js_temp_push(vm, js_obj_val((JsObj *)ls->js_fn))) {
+                        nfns++;
+                    }
                 }
             }
             for (int i = 0; i < nfns; i++) {
+                JsVal fn_val = vm->temp_roots[fn_sp + i];
                 vm->steps = 0;
-                js_call(vm, js_obj_val(fns[i]), cur_wrap, 1, &ev_val);
+                js_call(vm, fn_val, cur_wrap, 1, &ev_val);
                 if (vm->has_thrown) {
                     TbBuf eb;
                     tb_buf_init(&eb);
@@ -838,11 +867,11 @@ bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
                     vm->thrown_val = js_undefined();
                 }
             }
+            vm->temp_sp = fn_sp;
         }
         if (!bubbles) break;
         JsVal stopped = js_get_prop(vm, ev_val, "_stopped");
         if (js_to_bool(stopped)) break;
-        cur = cur->parent;
     }
 
     bool prevented = js_to_bool(js_get_prop(vm, ev_val, "defaultPrevented"));

@@ -34,6 +34,23 @@ static void cb_alert(void *ud, const char *msg) {
     snprintf(b->status_msg, sizeof(b->status_msg), "ALERT: %s", msg ? msg : "");
 }
 
+static void cb_node_destroy(void *ud, DomNode *node) {
+    TbBrowser *b = (TbBrowser *)ud;
+    if (!b || !node) return;
+    if (b->editing_node == node) {
+        b->editing_node = NULL;
+        b->edit_cursor  = 0;
+    }
+    if (b->active_node == node) {
+        b->active_node = NULL;
+    }
+    for (int i = 0; i < b->layout.hit_count; i++) {
+        if (b->layout.hits[i].node == node) {
+            b->layout.hits[i].node = NULL;
+        }
+    }
+}
+
 static void cb_navigate(void *ud, const char *url, bool reload) {
     TbBrowser *b = (TbBrowser *)ud;
     if (!b) return;
@@ -88,6 +105,7 @@ void tb_browser_init(TbBrowser *b, int vw, int vh, bool insecure_tls) {
 
 static void teardown_current_page(TbBrowser *b) {
     b->editing_node = NULL;
+    b->active_node  = NULL;
     b->edit_cursor  = 0;
     b->focused_hit  = -1;
     if (b->vm) {
@@ -287,11 +305,12 @@ static bool navigate_with_method(TbBrowser *b, const char *raw_url, const char *
         b->vm->viewport_w    = b->viewport_w;
         b->vm->viewport_h    = b->viewport_h;
         b->vm->scroll_y_ptr  = &b->scroll_y;
-        b->vm->on_console    = cb_console;
-        b->vm->on_alert      = cb_alert;
-        b->vm->on_navigate   = cb_navigate;
-        b->vm->on_fetch      = cb_fetch;
-        b->vm->host_userdata = b;
+        b->vm->on_console      = cb_console;
+        b->vm->on_alert        = cb_alert;
+        b->vm->on_navigate     = cb_navigate;
+        b->vm->on_fetch        = cb_fetch;
+        b->vm->on_node_destroy = cb_node_destroy;
+        b->vm->host_userdata   = b;
 
         js_bind_document(b->vm, b->doc, b->current_url);
         execute_page_scripts(b);
@@ -421,10 +440,16 @@ static void submit_enclosing_form(TbBrowser *b, DomNode *control) {
     }
     if (!form) return;
 
+    b->active_node = form;
     if (b->vm && !js_dispatch_dom_event(b->vm, form, "submit", NULL, true)) {
         process_pending_nav(b);
         tb_browser_relayout_if_needed(b, false);
         return; /* preventDefault() handled form in JS! */
+    }
+    if (b->pending_nav || b->active_node != form || !b->doc) {
+        process_pending_nav(b);
+        tb_browser_relayout_if_needed(b, false);
+        return;
     }
 
     const char *action = dom_get_attr(form, "action");
@@ -494,9 +519,12 @@ void tb_browser_activate_hit(TbBrowser *b, int hit_idx) {
         } else {
             dom_input_set_checked(node, !dom_input_get_checked(node));
         }
+        b->active_node = node;
         if (b->vm) {
             js_dispatch_dom_event(b->vm, node, "click", NULL, true);
-            js_dispatch_dom_event(b->vm, node, "change", NULL, true);
+            if (b->vm && b->active_node == node && !b->pending_nav) {
+                js_dispatch_dom_event(b->vm, node, "change", NULL, true);
+            }
         }
         process_pending_nav(b);
         tb_browser_relayout_if_needed(b, true);
@@ -540,13 +568,14 @@ void tb_browser_activate_hit(TbBrowser *b, int hit_idx) {
     }
 
     /* Dispatch JS click event first; honor preventDefault() */
+    b->active_node = node;
     bool allow_default = true;
     if (b->vm) {
         allow_default = js_dispatch_dom_event(b->vm, node, "click", NULL, true);
     }
     process_pending_nav(b);
     tb_browser_relayout_if_needed(b, false);
-    if (!allow_default) return;
+    if (!allow_default || b->active_node != node || !b->doc) return;
 
     if (hb.kind == HIT_LINK) {
         const char *href = dom_get_attr(node, "href");
@@ -598,10 +627,18 @@ void tb_browser_edit_key(TbBrowser *b, uint32_t cp, int special_key) {
     }
 
     if (special_key == TB_EDIT_ENTER) { /* Enter inside <input> */
+        b->active_node = n;
         bool allow = true;
         if (b->vm) allow = js_dispatch_dom_event(b->vm, n, "keydown", "Enter", true);
-        tb_browser_stop_editing(b);
-        if (allow) submit_enclosing_form(b, n);
+        process_pending_nav(b);
+        if (b->editing_node == n) {
+            tb_browser_stop_editing(b);
+        } else {
+            tb_browser_relayout_if_needed(b, true);
+        }
+        if (allow && b->active_node == n && b->doc) {
+            submit_enclosing_form(b, n);
+        }
         return;
     }
 

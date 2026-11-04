@@ -347,6 +347,44 @@ static void test_browser_lifecycle(void) {
                 "Newly added Todo item appears in rendered TUI layout");
     tb_buf_free(&dump);
 
+    /* 2b. Toggle Todo item button (whose click handler sets ul.innerHTML='' and frees the clicked button mid-dispatch!) */
+    ASSERT_TRUE(tb_browser_eval_repl(&b,
+        "window._todoBubbled = 0; "
+        "document.getElementById('todo-list').addEventListener('click', function(){ window._todoBubbled++; });"),
+        "Attach bubbling click listener on #todo-list");
+    DomNode *todo_btn0 = dom_query_selector(b.doc->root, "#todo-list button");
+    int btn0_hit = layout_find_node_hit(&b.layout, todo_btn0);
+    ASSERT_TRUE(btn0_hit >= 0, "Locate first #todo-list button HitBox");
+    tb_browser_activate_hit(&b, btn0_hit);
+
+    DomNode *todo_stats = dom_get_element_by_id(b.doc->root, "todo-stats");
+    char *stats_txt = dom_get_text_content(todo_stats);
+    ASSERT_STR_EQ(stats_txt, "3 remaining of 4 tasks",
+                  "Toggling first Todo button via HitBox updated #todo-stats without UAF/segfault");
+    tb_free(stats_txt);
+
+    JsVal bub_v = js_undefined();
+    ASSERT_TRUE(js_eval(b.vm, "window._todoBubbled", 19, &bub_v) &&
+                bub_v.type == JS_NUMBER && (int)bub_v.u.num == 1,
+                "Click event still bubbles to parent #todo-list after target <button> is destroyed by innerHTML=''");
+
+    /* Toggle again and click #todo-clear */
+    DomNode *todo_btn1 = dom_query_selector(b.doc->root, "#todo-list button");
+    int btn1_hit = layout_find_node_hit(&b.layout, todo_btn1);
+    ASSERT_TRUE(btn1_hit >= 0, "Locate re-rendered #todo-list button HitBox");
+    tb_browser_activate_hit(&b, btn1_hit);
+
+    DomNode *todo_clear = dom_get_element_by_id(b.doc->root, "todo-clear");
+    int clear_hit = layout_find_node_hit(&b.layout, todo_clear);
+    ASSERT_TRUE(clear_hit >= 0, "Locate #todo-clear HitBox");
+    tb_browser_activate_hit(&b, clear_hit);
+
+    todo_stats = dom_get_element_by_id(b.doc->root, "todo-stats");
+    stats_txt = dom_get_text_content(todo_stats);
+    ASSERT_STR_EQ(stats_txt, "2 remaining of 2 tasks",
+                  "Clicking #todo-clear removed completed Todo items cleanly");
+    tb_free(stats_txt);
+
     /* 3. about:memory churn button & demos/index.html external script + history back */
     ASSERT_TRUE(tb_browser_navigate(&b, "about:memory", true), "Navigate to about:memory");
     ASSERT_TRUE(tb_browser_eval_repl(&b, "document.getElementById('btn-churn').click()"),

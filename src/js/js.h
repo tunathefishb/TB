@@ -337,11 +337,12 @@ struct JsVm {
     int          scroll_y;
     int         *scroll_y_ptr;
 
-    JsConsoleCb  on_console;
-    JsNavigateCb on_navigate;
-    JsAlertCb    on_alert;
-    JsFetchCb    on_fetch;
-    void        *host_userdata;
+    JsConsoleCb      on_console;
+    JsNavigateCb     on_navigate;
+    JsAlertCb        on_alert;
+    JsFetchCb        on_fetch;
+    DomNodeDestroyCb on_node_destroy;
+    void            *host_userdata;
 };
 
 /* Value constructors */
