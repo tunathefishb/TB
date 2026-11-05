@@ -124,6 +124,7 @@ DomNode *dom_remove_child(DomNode *parent, DomNode *child);
 bool     dom_replace_child(DomNode *parent, DomNode *new_node, DomNode *old_node);
 void     dom_clear_children(DomNode *parent);
 DomNode *dom_clone_node(DomDocument *doc, const DomNode *src, bool deep);
+bool     dom_contains(const DomNode *parent, const DomNode *other);
 
 const char *dom_get_attr(const DomNode *node, const char *name);
 bool        dom_has_attr(const DomNode *node, const char *name);

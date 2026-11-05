@@ -154,21 +154,11 @@ typedef enum {
     STYLE_REMOVE_PROP
 } JsStyleMagic;
 
-static void color_to_css_str(TbColor c, bool is_bg, char *buf, size_t cap) {
-    if (c.mode == TB_COLOR_DEFAULT) {
-        snprintf(buf, cap, "%s", is_bg ? "rgba(0, 0, 0, 0)" : "rgb(208, 208, 208)");
-    } else if (c.mode == TB_COLOR_RGB) {
+static void color_to_css_str(CssColor c, bool is_bg, char *buf, size_t cap) {
+    if (c.mode == CSS_COLOR_RGB) {
         snprintf(buf, cap, "rgb(%u, %u, %u)", (unsigned)c.r, (unsigned)c.g, (unsigned)c.b);
     } else {
-        /* Basic 16/256 ANSI fallback to rgb() */
-        static const uint8_t ansi16[16][3] = {
-            {0,0,0}, {205,0,0}, {0,205,0}, {205,205,0},
-            {0,0,238}, {205,0,205}, {0,205,205}, {229,229,229},
-            {127,127,127}, {255,0,0}, {0,255,0}, {255,255,0},
-            {92,92,255}, {255,0,255}, {0,255,255}, {255,255,255}
-        };
-        uint8_t idx = c.index < 16 ? c.index : 7;
-        snprintf(buf, cap, "rgb(%u, %u, %u)", ansi16[idx][0], ansi16[idx][1], ansi16[idx][2]);
+        snprintf(buf, cap, "%s", is_bg ? "rgba(0, 0, 0, 0)" : "rgb(208, 208, 208)");
     }
 }
 
@@ -210,25 +200,24 @@ static bool get_computed_style_prop(JsVm *vm, DomNode *n, const char *prop_in, J
         }
     }
 
-    /* Check inline style first for exact custom or standard property string if not yet cascaded */
-    const char *inl = dom_get_attr(n, "style");
-    if (inl && kebab[0] == '-' && kebab[1] == '-') {
-        *out = js_obj_val((JsObj *)js_str_cstr(vm, ""));
-        return true;
-    }
-
     /* Recompute document styles if needed so getComputedStyle reflects latest DOM/class/inline mutations */
     if (vm->doc) {
         css_compute_document_ex(vm->doc, NULL, vm->viewport_w > 0 ? vm->viewport_w : 80);
     }
 
+    if (kebab[0] == '-' && kebab[1] == '-') {
+        const char *cv = dom_get_css_var(n, kebab);
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, cv ? cv : ""));
+        return true;
+    }
+
+    const char *inl = dom_get_attr(n, "style");
     const CssStyle *st = &n->style;
     char buf[64];
     if (strcmp(kebab, "display") == 0) {
         const char *d = "block";
         if (st->display == CSS_DISP_NONE) d = "none";
         else if (st->display == CSS_DISP_INLINE) d = "inline";
-        else if (st->display == CSS_DISP_INLINE_BLOCK) d = "inline-block";
         else if (st->display == CSS_DISP_LIST_ITEM) d = "list-item";
         else if (st->display == CSS_DISP_TABLE) d = "table";
         else if (st->display == CSS_DISP_TABLE_ROW) d = "table-row";
@@ -238,7 +227,7 @@ static bool get_computed_style_prop(JsVm *vm, DomNode *n, const char *prop_in, J
         return true;
     }
     if (strcmp(kebab, "visibility") == 0) {
-        *out = js_obj_val((JsObj *)js_str_cstr(vm, st->visibility_hidden ? "hidden" : "visible"));
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, st->display == CSS_DISP_NONE ? "hidden" : "visible"));
         return true;
     }
     if (strcmp(kebab, "color") == 0) {
@@ -657,9 +646,12 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
         }
         if (strcmp(key, "cookie") == 0) {
             const char *u_raw = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "http://localhost/");
-            char *ck = tb_cookie_get_for_url(u_raw);
-            *out = js_obj_val((JsObj *)js_str_cstr(vm, ck ? ck : ""));
-            tb_free(ck);
+            TbUrl cu;
+            char cbuf[1024] = "";
+            if (tb_url_parse(u_raw, &cu)) {
+                tb_cookie_get_for_url(&cu, true, cbuf, sizeof(cbuf));
+            }
+            *out = js_obj_val((JsObj *)js_str_cstr(vm, cbuf));
             return true;
         }
         if (strcmp(key, "readyState") == 0)      { *out = js_obj_val((JsObj *)js_str_cstr(vm, "complete")); return true; }
@@ -922,7 +914,10 @@ bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
             JsStr *vs = js_to_str(vm, val);
             if (vs) {
                 const char *u_raw = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "http://localhost/");
-                tb_cookie_set_from_header(u_raw, vs->data);
+                TbUrl cu;
+                if (tb_url_parse(u_raw, &cu)) {
+                    tb_cookie_set_from_header(&cu, vs->data, true);
+                }
             }
             return true;
         }
@@ -1642,8 +1637,7 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
         }
         case WIN_MATCH_MEDIA: {
             JsStr *q = argc > 0 ? js_to_str(vm, argv[0]) : js_str_cstr(vm, "");
-            bool matches = true;
-            if (q && strstr(q->data, "print")) matches = false;
+            bool matches = css_eval_media_query(q ? q->data : "", vm->viewport_w);
             vm->gc_pause++;
             JsObj *mql = js_map_new(vm, vm->object_proto);
             if (mql) {
@@ -1689,9 +1683,11 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             if (argc > 2 && argv[2].type != JS_UNDEFINED && argv[2].type != JS_NULL) {
                 JsStr *us = js_to_str(vm, argv[2]);
                 if (us && us->len > 0) {
-                    const char *base = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "http://localhost/");
-                    char resolved[1536];
-                    if (tb_url_resolve(base, us->data, resolved, sizeof(resolved))) {
+                    const char *base_str = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "http://localhost/");
+                    TbUrl base_u;
+                    if (tb_url_parse(base_str, &base_u)) {
+                        char resolved[1536];
+                        tb_url_resolve(&base_u, us->data, resolved, sizeof(resolved));
                         snprintf(vm->pushed_url, sizeof(vm->pushed_url), "%s", resolved);
                     } else {
                         snprintf(vm->pushed_url, sizeof(vm->pushed_url), "%s", us->data);

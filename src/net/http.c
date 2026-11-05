@@ -237,9 +237,16 @@ void tb_cookie_set_from_header(const TbUrl *req_url, const char *set_cookie_val,
             } else if (aklen == 6 && tb_strncasecmp(attr_p, "Domain", 6) == 0 && avlen > 0) {
                 if (*av == '.') { av++; avlen--; }
                 if (avlen > 0 && avlen < sizeof(c.domain)) {
-                    memcpy(c.domain, av, avlen);
-                    c.domain[avlen] = '\0';
-                    c.host_only = false;
+                    char dom_cand[128];
+                    memcpy(dom_cand, av, avlen);
+                    dom_cand[avlen] = '\0';
+                    if (cookie_domain_matches(host, dom_cand, false) &&
+                        (tb_strcasecmp(host, dom_cand) == 0 || strchr(dom_cand, '.') != NULL)) {
+                        memcpy(c.domain, dom_cand, avlen + 1);
+                        c.host_only = false;
+                    } else {
+                        return; /* Reject cross-domain or TLD cookie tossing (RFC 6265 §5.3) */
+                    }
                 }
             } else if (aklen == 7 && tb_strncasecmp(attr_p, "Max-Age", 7) == 0 && avlen > 0) {
                 char mbuf[32];

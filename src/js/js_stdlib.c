@@ -635,11 +635,23 @@ static JsVal fn_object(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, in
     }
     if (magic == OBJ_GET_PROTO_OF) {
         if (a0.type != JS_OBJECT || !a0.u.obj) return js_null();
-        return a0.u.obj->proto ? js_obj_val(a0.u.obj->proto) : js_null();
+        JsObj *o = a0.u.obj;
+        JsObj *p = NULL;
+        if (o->obj_type == OBJ_OBJECT) p = ((JsMapObj *)o)->proto;
+        else if (o->obj_type == OBJ_ARRAY) p = ((JsArrObj *)o)->proto;
+        else if (o->obj_type == OBJ_FUNC) p = ((JsFuncObj *)o)->proto;
+        else if (o->obj_type == OBJ_REGEX) p = ((JsRegexObj *)o)->proto;
+        else if (o->obj_type == OBJ_STRING) p = vm->string_proto;
+        return p ? js_obj_val(p) : js_null();
     }
     if (magic == OBJ_SET_PROTO_OF) {
         if (a0.type != JS_OBJECT || !a0.u.obj) return a0;
-        a0.u.obj->proto = (argc > 1 && argv[1].type == JS_OBJECT) ? argv[1].u.obj : NULL;
+        JsObj *o = a0.u.obj;
+        JsObj *np = (argc > 1 && argv[1].type == JS_OBJECT) ? argv[1].u.obj : NULL;
+        if (o->obj_type == OBJ_OBJECT) ((JsMapObj *)o)->proto = np;
+        else if (o->obj_type == OBJ_ARRAY) ((JsArrObj *)o)->proto = np;
+        else if (o->obj_type == OBJ_FUNC) ((JsFuncObj *)o)->proto = np;
+        else if (o->obj_type == OBJ_REGEX) ((JsRegexObj *)o)->proto = np;
         return a0;
     }
     if (magic == OBJ_ASSIGN) {

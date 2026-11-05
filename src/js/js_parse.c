@@ -869,6 +869,7 @@ static uint32_t parse_class(Parser *p, bool is_stmt) {
             uint32_t body   = parse_block(p);
             val_b = emit_node(p, AST_FUNC, OP_NONE, func_flags, UINT32_MAX, params, body);
         } else {
+            prop_flags |= PROP_FLAG_FIELD;
             if (match_tok(p, TOK_ASSIGN)) {
                 val_b = parse_assign(p, true);
             } else {

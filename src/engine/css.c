@@ -1079,3 +1079,17 @@ void css_compute_document_ex(DomDocument *doc, const CssStylesheet *external_ss,
 void css_compute_document(DomDocument *doc, const CssStylesheet *external_ss) {
     css_compute_document_ex(doc, external_ss, 80);
 }
+
+bool css_eval_media_query(const char *query, int viewport_w) {
+    if (!query || !*query) return true;
+    int16_t min_px = 0, max_px = 0;
+    int8_t  scheme = 0;
+    if (!parse_media_condition(query, strlen(query), &min_px, &max_px, &scheme)) return false;
+    CssRule dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    dummy.media_min_px = min_px;
+    dummy.media_max_px = max_px;
+    dummy.media_scheme = scheme;
+    int vcols = viewport_w > 0 ? viewport_w : 80;
+    return rule_media_matches(&dummy, vcols * 8);
+}

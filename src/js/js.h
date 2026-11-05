@@ -66,7 +66,8 @@ typedef enum {
     NATIVE_TAG_MAP,
     NATIVE_TAG_SET,
     NATIVE_TAG_PROMISE,
-    NATIVE_TAG_HEADERS
+    NATIVE_TAG_HEADERS,
+    NATIVE_TAG_COMPUTED_STYLE
 } JsNativeTag;
 
 #define OBJ_FLAG_HAS_ACCESSORS 0x01
@@ -252,6 +253,7 @@ typedef enum {
 #define PROP_FLAG_SETTER     0x08
 #define PROP_FLAG_STATIC     0x10
 #define PROP_FLAG_METHOD     0x20
+#define PROP_FLAG_FIELD      0x40
 
 #define DESTRUCT_FLAG_REST   0x01
 #define DESTRUCT_FLAG_NESTED 0x02

@@ -74,7 +74,7 @@ void test_dom_and_css(void) {
 
     LayoutDoc ldoc;
     layout_init(&ldoc);
-    layout_build(&ldoc, mdoc, 80);
+    layout_build(&ldoc, mdoc, 80, NULL, 0);
 
     DomNode *item1 = dom_get_element_by_id(mdoc->root, "item1");
     DomNode *item2 = dom_get_element_by_id(mdoc->root, "item2");

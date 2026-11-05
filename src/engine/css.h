@@ -116,5 +116,6 @@ void css_apply_decl_ex(CssStyle *st, const char *prop, const char *val, bool imp
 void css_parse_inline(CssStyle *st, const char *inline_css);
 void css_compute_document(struct DomDocument *doc, const CssStylesheet *ss);
 void css_compute_document_ex(struct DomDocument *doc, const CssStylesheet *ss, int viewport_w);
+bool css_eval_media_query(const char *query, int viewport_w);
 
 #endif /* TB_CSS_H */

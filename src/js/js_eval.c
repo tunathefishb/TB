@@ -261,10 +261,12 @@ static EvalRes bind_pattern(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t pat_idx,
     if (pn->kind == AST_DESTRUCT_ARR) {
         JsVal src_arr = val;
         if (!(val.type == JS_OBJECT && val.u.obj && val.u.obj->obj_type == OBJ_ARRAY)) {
-            JsObj *conv = js_iterable_to_array(vm, val);
+            JsObj *conv = js_arr_new(vm, 4);
             if (conv) {
-                src_arr = js_obj_val(conv);
-                js_temp_push(vm, src_arr);
+                js_temp_push(vm, js_obj_val(conv));
+                if (js_iterable_to_array(vm, val, conv)) {
+                    src_arr = js_obj_val(conv);
+                }
             }
         }
         uint32_t idx = 0;
@@ -299,7 +301,7 @@ static EvalRes bind_pattern(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t pat_idx,
                 elem = dr.val;
             }
             if (it->flags & DESTRUCT_FLAG_NESTED) {
-                EvalRes nr = bind_pattern(vm, ch, env, it->a, elem, decl_kind, is_assign);
+                EvalRes nr = bind_pattern(vm, ch, env, it->c, elem, decl_kind, is_assign);
                 if (nr.flow != FLOW_NONE) { vm->temp_sp = sp; return nr; }
             } else {
                 JsStr *nm = chunk_js_str(vm, ch, it->a);
@@ -319,7 +321,7 @@ static EvalRes bind_pattern(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t pat_idx,
                     for (uint32_t i = 0; i < m->count; i++) {
                         JsStr *k = m->props[i].key;
                         if (k->len > 0 && k->data[0] == '\x01') continue;
-                        if (m->native_tag != 0 && k->len > 0 && k->data[0] == '_') continue;
+                        if (m->hdr.native_tag != 0 && k->len > 0 && k->data[0] == '_') continue;
                         bool taken = false;
                         for (uint32_t prev = pn->a; prev != cur && prev != 0; prev = ch->nodes[prev].next) {
                             const AstNode *pit = &ch->nodes[prev];
@@ -372,14 +374,20 @@ static EvalRes eval_arg_list_onto_roots(JsVm *vm, JsChunk *ch, JsEnv *env,
         if (an->kind == AST_SPREAD) {
             EvalRes sr = eval_expr(vm, ch, env, an->a);
             if (sr.flow != FLOW_NONE) return sr;
-            JsObj *arr_obj = (sr.val.type == JS_OBJECT && sr.val.u.obj && sr.val.u.obj->obj_type == OBJ_ARRAY)
-                                 ? sr.val.u.obj
-                                 : js_iterable_to_array(vm, sr.val);
-            if (arr_obj && arr_obj->obj_type == OBJ_ARRAY) {
-                JsArrObj *arr = (JsArrObj *)arr_obj;
+            if (sr.val.type == JS_OBJECT && sr.val.u.obj && sr.val.u.obj->obj_type == OBJ_ARRAY) {
+                JsArrObj *arr = (JsArrObj *)sr.val.u.obj;
                 for (uint32_t i = 0; i < arr->len; i++) {
                     if (!js_temp_push(vm, arr->items[i])) break;
                     argc++;
+                }
+            } else {
+                JsObj *conv = js_arr_new(vm, 4);
+                if (conv && js_iterable_to_array(vm, sr.val, conv)) {
+                    JsArrObj *arr = (JsArrObj *)conv;
+                    for (uint32_t i = 0; i < arr->len; i++) {
+                        if (!js_temp_push(vm, arr->items[i])) break;
+                        argc++;
+                    }
                 }
             }
         } else {
@@ -447,7 +455,7 @@ static JsObj *resolve_super_proto(JsVm *vm, JsEnv *tenv, bool *out_is_static) {
             if (out_is_static) *out_is_static = true;
             return ((JsFuncObj *)cfn->home_proto)->super_ctor
                        ? ((JsFuncObj *)cfn->home_proto)->super_ctor
-                       : vm->function_proto;
+                       : vm->func_proto;
         }
     }
     if (cfn->super_ctor) {
@@ -623,7 +631,7 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             js_drain_microtasks(vm);
             if (r.val.type == JS_OBJECT && r.val.u.obj && r.val.u.obj->obj_type == OBJ_OBJECT) {
                 JsMapObj *m = (JsMapObj *)r.val.u.obj;
-                if (m->native_tag == NATIVE_TAG_PROMISE) {
+                if (m->hdr.native_tag == NATIVE_TAG_PROMISE) {
                     JsVal st = js_get_prop(vm, r.val, "_state");
                     if ((int)js_to_num(vm, st) == 0) {
                         js_drain_microtasks(vm);
@@ -683,14 +691,7 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                 if (en->kind == AST_SPREAD) {
                     EvalRes sr = eval_expr(vm, ch, env, en->a);
                     if (sr.flow != FLOW_NONE) { vm->temp_sp = sp; return sr; }
-                    JsObj *sa_obj = (sr.val.type == JS_OBJECT && sr.val.u.obj &&
-                                     sr.val.u.obj->obj_type == OBJ_ARRAY)
-                                        ? sr.val.u.obj
-                                        : js_iterable_to_array(vm, sr.val);
-                    if (sa_obj && sa_obj->obj_type == OBJ_ARRAY) {
-                        JsArrObj *sa = (JsArrObj *)sa_obj;
-                        for (uint32_t i = 0; i < sa->len; i++) js_arr_push(vm, arr, sa->items[i]);
-                    }
+                    js_iterable_to_array(vm, sr.val, arr);
                 } else {
                     EvalRes er = eval_expr(vm, ch, env, e);
                     if (er.flow != FLOW_NONE) { vm->temp_sp = sp; return er; }
@@ -1314,7 +1315,7 @@ static EvalRes eval_stmt(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                         for (uint32_t i = 0; i < m->count; i++) {
                             JsStr *k = m->props[i].key;
                             if (k->len > 0 && k->data[0] == '\x01') continue;
-                            if (m->native_tag != 0 && k->len > 0 && k->data[0] == '_') continue;
+                            if (m->hdr.native_tag != 0 && k->len > 0 && k->data[0] == '_') continue;
                             js_arr_push(vm, items, js_obj_val((JsObj *)k));
                         }
                     } else if (rr.val.u.obj->obj_type == OBJ_ARRAY) {
@@ -1327,13 +1328,15 @@ static EvalRes eval_stmt(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                     }
                 }
             } else { /* AST_FOR_OF */
-                items = js_iterable_to_array(vm, rr.val);
-                if (!items) items = js_arr_new(vm, 0);
-                js_temp_push(vm, js_obj_val(items));
+                items = js_arr_new(vm, 8);
+                if (items) {
+                    js_temp_push(vm, js_obj_val(items));
+                    js_iterable_to_array(vm, rr.val, items);
+                }
             }
 
             JsArrObj *ia = (JsArrObj *)items;
-            for (uint32_t i = 0; i < ia->len; i++) {
+            for (uint32_t i = 0; ia && i < ia->len; i++) {
                 int env_mark = vm->env_sp;
                 JsEnv *ienv  = env;
                 if (n->flags != JS_FOR_IN_OF_NO_DECL && n->flags != DECL_VAR) {

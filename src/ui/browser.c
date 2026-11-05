@@ -184,8 +184,8 @@ static void load_external_stylesheets(TbBrowser *b) {
             ext_loaded++;
             /* Convert in-DOM <link> into <style> node in-place to preserve cascade order */
             ln->tag = TAG_STYLE;
-            tb_free(ln->tag_Name_custom);
-            ln->tag_Name_custom = NULL;
+            tb_free(ln->tag_name);
+            ln->tag_name = NULL;
             dom_set_text_content(ln, cresp.body);
             b->doc->dirty_style = true;
         }

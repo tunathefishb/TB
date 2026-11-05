@@ -264,6 +264,11 @@ static bool is_ancestor_or_self(const DomNode *anc, const DomNode *node) {
     return false;
 }
 
+bool dom_contains(const DomNode *parent, const DomNode *other) {
+    if (!parent || !other) return false;
+    return is_ancestor_or_self(parent, other);
+}
+
 static void detach_node(DomNode *child) {
     DomNode *p = child->parent;
     if (!p) return;
