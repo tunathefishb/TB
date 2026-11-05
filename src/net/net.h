@@ -49,8 +49,16 @@ size_t tb_dns_resolve(const char *host, int timeout_ms,
 
 bool tb_fetch(const char *url, const char *method, const char *post_body,
               const char *post_ctype, bool insecure_tls, TbResponse *resp);
+bool tb_fetch_ex(const char *url, const char *method, const char *post_body,
+                 const char *post_ctype, const char *extra_headers,
+                 bool insecure_tls, TbResponse *resp);
 void tb_response_free(TbResponse *resp);
 void tb_net_cleanup(void);
+
+/* Session Cookie Jar (RFC 6265 subset) */
+void tb_cookie_set_from_header(const TbUrl *req_url, const char *set_cookie_val, bool from_js);
+void tb_cookie_get_for_url(const TbUrl *req_url, bool for_js, char *out, size_t cap);
+void tb_cookies_clear(void);
 
 /* Internal network helpers shared across net/ modules */
 bool tb_net_load_local_scheme(const TbUrl *u, TbResponse *resp);

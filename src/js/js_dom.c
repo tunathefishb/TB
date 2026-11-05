@@ -147,6 +147,209 @@ static JsVal fn_classlist(JsVm *vm, JsVal this_val, int argc, const JsVal *argv,
     return js_bool(s && dom_class_contains(n, s->data));
 }
 
+/* CSSStyleDeclaration methods: getPropertyValue(prop), setProperty(prop, val), removeProperty(prop) */
+typedef enum {
+    STYLE_GET_PROP_VAL = 0,
+    STYLE_SET_PROP,
+    STYLE_REMOVE_PROP
+} JsStyleMagic;
+
+static void color_to_css_str(TbColor c, bool is_bg, char *buf, size_t cap) {
+    if (c.mode == TB_COLOR_DEFAULT) {
+        snprintf(buf, cap, "%s", is_bg ? "rgba(0, 0, 0, 0)" : "rgb(208, 208, 208)");
+    } else if (c.mode == TB_COLOR_RGB) {
+        snprintf(buf, cap, "rgb(%u, %u, %u)", (unsigned)c.r, (unsigned)c.g, (unsigned)c.b);
+    } else {
+        /* Basic 16/256 ANSI fallback to rgb() */
+        static const uint8_t ansi16[16][3] = {
+            {0,0,0}, {205,0,0}, {0,205,0}, {205,205,0},
+            {0,0,238}, {205,0,205}, {0,205,205}, {229,229,229},
+            {127,127,127}, {255,0,0}, {0,255,0}, {255,255,0},
+            {92,92,255}, {255,0,255}, {0,255,255}, {255,255,255}
+        };
+        uint8_t idx = c.index < 16 ? c.index : 7;
+        snprintf(buf, cap, "rgb(%u, %u, %u)", ansi16[idx][0], ansi16[idx][1], ansi16[idx][2]);
+    }
+}
+
+static bool get_computed_style_prop(JsVm *vm, DomNode *n, const char *prop_in, JsVal *out) {
+    if (!n) { *out = js_obj_val((JsObj *)js_str_cstr(vm, "")); return true; }
+    char kebab[64];
+    if (prop_in[0] == '-' && prop_in[1] == '-') {
+        snprintf(kebab, sizeof(kebab), "%s", prop_in);
+    } else {
+        camel_to_kebab(prop_in, kebab, sizeof(kebab));
+    }
+
+    /* Custom property lookup across inline + ancestors, or stylesheet rules */
+    if (kebab[0] == '-' && kebab[1] == '-') {
+        for (DomNode *cur = n; cur; cur = cur->parent) {
+            const char *inl = dom_get_attr(cur, "style");
+            if (inl) {
+                size_t klen = strlen(kebab);
+                const char *p = inl;
+                while (*p) {
+                    while (*p && (tb_isspace(*p) || *p == ';')) p++;
+                    if (strncmp(p, kebab, klen) == 0 && (p[klen] == ':' || tb_isspace(p[klen]))) {
+                        const char *col = strchr(p + klen, ':');
+                        if (col) {
+                            col++;
+                            while (*col && tb_isspace(*col)) col++;
+                            const char *semi = strchr(col, ';');
+                            size_t vlen = semi ? (size_t)(semi - col) : strlen(col);
+                            while (vlen > 0 && tb_isspace(col[vlen - 1])) vlen--;
+                            *out = js_obj_val((JsObj *)js_str_new(vm, col, vlen));
+                            return true;
+                        }
+                    }
+                    const char *semi = strchr(p, ';');
+                    if (!semi) break;
+                    p = semi + 1;
+                }
+            }
+        }
+    }
+
+    /* Check inline style first for exact custom or standard property string if not yet cascaded */
+    const char *inl = dom_get_attr(n, "style");
+    if (inl && kebab[0] == '-' && kebab[1] == '-') {
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, ""));
+        return true;
+    }
+
+    /* Recompute document styles if needed so getComputedStyle reflects latest DOM/class/inline mutations */
+    if (vm->doc) {
+        css_compute_document_ex(vm->doc, NULL, vm->viewport_w > 0 ? vm->viewport_w : 80);
+    }
+
+    const CssStyle *st = &n->style;
+    char buf[64];
+    if (strcmp(kebab, "display") == 0) {
+        const char *d = "block";
+        if (st->display == CSS_DISP_NONE) d = "none";
+        else if (st->display == CSS_DISP_INLINE) d = "inline";
+        else if (st->display == CSS_DISP_INLINE_BLOCK) d = "inline-block";
+        else if (st->display == CSS_DISP_LIST_ITEM) d = "list-item";
+        else if (st->display == CSS_DISP_TABLE) d = "table";
+        else if (st->display == CSS_DISP_TABLE_ROW) d = "table-row";
+        else if (st->display == CSS_DISP_TABLE_CELL) d = "table-cell";
+        else if (st->display == CSS_DISP_FLEX) d = "flex";
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, d));
+        return true;
+    }
+    if (strcmp(kebab, "visibility") == 0) {
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, st->visibility_hidden ? "hidden" : "visible"));
+        return true;
+    }
+    if (strcmp(kebab, "color") == 0) {
+        color_to_css_str(st->fg, false, buf, sizeof(buf));
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, buf));
+        return true;
+    }
+    if (strcmp(kebab, "background-color") == 0 || strcmp(kebab, "background") == 0) {
+        color_to_css_str(st->bg, true, buf, sizeof(buf));
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, buf));
+        return true;
+    }
+    if (strcmp(kebab, "font-weight") == 0) {
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, st->bold ? "700" : "400"));
+        return true;
+    }
+    if (strcmp(kebab, "font-style") == 0) {
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, st->italic ? "italic" : "normal"));
+        return true;
+    }
+    if (strcmp(kebab, "text-align") == 0) {
+        const char *ta = "left";
+        if (st->text_align == CSS_ALIGN_CENTER) ta = "center";
+        else if (st->text_align == CSS_ALIGN_RIGHT) ta = "right";
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, ta));
+        return true;
+    }
+    if (strcmp(kebab, "justify-content") == 0) {
+        const char *jc = "flex-start";
+        if (st->justify_content == CSS_JUSTIFY_CENTER) jc = "center";
+        else if (st->justify_content == CSS_JUSTIFY_END) jc = "flex-end";
+        else if (st->justify_content == CSS_JUSTIFY_SPACE_BETWEEN) jc = "space-between";
+        else if (st->justify_content == CSS_JUSTIFY_SPACE_AROUND) jc = "space-around";
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, jc));
+        return true;
+    }
+    if (strcmp(kebab, "gap") == 0 || strcmp(kebab, "column-gap") == 0) {
+        snprintf(buf, sizeof(buf), "%dpx", (int)st->gap * 8);
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, buf));
+        return true;
+    }
+    if (strcmp(kebab, "width") == 0) {
+        int w = st->width_cols > 0 ? st->width_cols : n->box_w;
+        snprintf(buf, sizeof(buf), "%dpx", w);
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, buf));
+        return true;
+    }
+    if (strcmp(kebab, "height") == 0) {
+        snprintf(buf, sizeof(buf), "%dpx", n->box_h);
+        *out = js_obj_val((JsObj *)js_str_cstr(vm, buf));
+        return true;
+    }
+    /* Fallback to inline style value if present */
+    if (inl) {
+        size_t klen = strlen(kebab);
+        const char *p = inl;
+        while (*p) {
+            while (*p && (tb_isspace(*p) || *p == ';')) p++;
+            if (tb_strncasecmp(p, kebab, klen) == 0 && (p[klen] == ':' || tb_isspace(p[klen]))) {
+                const char *col = strchr(p + klen, ':');
+                if (col) {
+                    col++;
+                    while (*col && tb_isspace(*col)) col++;
+                    const char *semi = strchr(col, ';');
+                    size_t vlen = semi ? (size_t)(semi - col) : strlen(col);
+                    while (vlen > 0 && tb_isspace(col[vlen - 1])) vlen--;
+                    *out = js_obj_val((JsObj *)js_str_new(vm, col, vlen));
+                    return true;
+                }
+            }
+            const char *semi = strchr(p, ';');
+            if (!semi) break;
+            p = semi + 1;
+        }
+    }
+    *out = js_obj_val((JsObj *)js_str_cstr(vm, ""));
+    return true;
+}
+
+static JsVal fn_style_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
+    if (this_val.type != JS_OBJECT || !this_val.u.obj || this_val.u.obj->obj_type != OBJ_OBJECT)
+        return js_undefined();
+    JsMapObj *m = (JsMapObj *)this_val.u.obj;
+    DomNode *n = (DomNode *)m->native_ptr;
+    if (!n || argc == 0) return magic == STYLE_SET_PROP ? js_undefined() : js_obj_val((JsObj *)js_str_cstr(vm, ""));
+    JsStr *prop = js_to_str(vm, argv[0]);
+    if (!prop) return js_undefined();
+
+    if (magic == STYLE_GET_PROP_VAL) {
+        JsVal out = js_undefined();
+        if (m->hdr.native_tag == NATIVE_TAG_COMPUTED_STYLE) {
+            get_computed_style_prop(vm, n, prop->data, &out);
+            return out;
+        }
+        if (js_dom_get_virtual(vm, m, prop->data, &out)) return out;
+        return js_obj_val((JsObj *)js_str_cstr(vm, ""));
+    }
+    if (magic == STYLE_SET_PROP) {
+        if (m->hdr.native_tag == NATIVE_TAG_COMPUTED_STYLE) return js_undefined();
+        JsVal v = argc > 1 ? argv[1] : js_obj_val((JsObj *)js_str_cstr(vm, ""));
+        js_dom_set_virtual(vm, m, prop->data, v);
+        return js_undefined();
+    }
+    /* STYLE_REMOVE_PROP */
+    if (m->hdr.native_tag == NATIVE_TAG_COMPUTED_STYLE) return js_obj_val((JsObj *)js_str_cstr(vm, ""));
+    JsVal old_v = js_undefined();
+    js_dom_get_virtual(vm, m, prop->data, &old_v);
+    js_dom_set_virtual(vm, m, prop->data, js_obj_val((JsObj *)js_str_cstr(vm, "")));
+    return old_v;
+}
+
 static JsObj *make_proxy_obj(JsVm *vm, DomNode *node, JsNativeTag tag) {
     vm->gc_pause++;
     JsMapObj *m = (JsMapObj *)js_map_new(vm, vm->object_proto);
@@ -158,6 +361,10 @@ static JsObj *make_proxy_obj(JsVm *vm, DomNode *node, JsNativeTag tag) {
             js_define_native(vm, (JsObj *)m, "remove", fn_classlist, CL_REMOVE);
             js_define_native(vm, (JsObj *)m, "toggle", fn_classlist, CL_TOGGLE);
             js_define_native(vm, (JsObj *)m, "contains", fn_classlist, CL_CONTAINS);
+        } else if (tag == NATIVE_TAG_STYLE || tag == NATIVE_TAG_COMPUTED_STYLE) {
+            js_define_native(vm, (JsObj *)m, "getPropertyValue", fn_style_method, STYLE_GET_PROP_VAL);
+            js_define_native(vm, (JsObj *)m, "setProperty", fn_style_method, STYLE_SET_PROP);
+            js_define_native(vm, (JsObj *)m, "removeProperty", fn_style_method, STYLE_REMOVE_PROP);
         }
     }
     vm->gc_pause--;
@@ -211,7 +418,7 @@ static void remove_node_listener(DomNode *n, const char *type, JsObj *fn_obj) {
     }
 }
 
-/* Virtual Getters & Setters on DOM / Window / Style / Location / Performance */
+/* Virtual Getters & Setters on DOM / Window / Style / Location / Performance / Storage */
 bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
     JsNativeTag tag = (JsNativeTag)m->hdr.native_tag;
 
@@ -222,6 +429,37 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             int sy = vm->scroll_y_ptr ? *vm->scroll_y_ptr : vm->scroll_y;
             *out = js_num((double)sy);
             return true;
+        }
+        if (strcmp(key, "scrollX") == 0 || strcmp(key, "pageXOffset") == 0) {
+            *out = js_num(0);
+            return true;
+        }
+        return false;
+    }
+
+    if (tag == NATIVE_TAG_STORAGE) {
+        /* Handled in js_stdlib.c storage methods or backing _store */
+        uint32_t pos = 0;
+        for (uint32_t i = 0; i < m->count; i++) {
+            if (strcmp(m->props[i].key->data, key) == 0) {
+                *out = m->props[i].val;
+                return true;
+            }
+            if (strcmp(m->props[i].key->data, "_store") == 0 &&
+                m->props[i].val.type == JS_OBJECT && m->props[i].val.u.obj &&
+                m->props[i].val.u.obj->obj_type == OBJ_OBJECT) {
+                JsMapObj *sm = (JsMapObj *)m->props[i].val.u.obj;
+                if (strcmp(key, "length") == 0) {
+                    *out = js_num((double)sm->count);
+                    return true;
+                }
+                for (pos = 0; pos < sm->count; pos++) {
+                    if (strcmp(sm->props[pos].key->data, key) == 0) {
+                        *out = sm->props[pos].val;
+                        return true;
+                    }
+                }
+            }
         }
         return false;
     }
@@ -252,7 +490,7 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
     }
 
     if (tag == NATIVE_TAG_LOCATION) {
-        const char *u_raw = vm->current_url ? vm->current_url : "about:blank";
+        const char *u_raw = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "about:blank");
         TbUrl u;
         bool ok = tb_url_parse(u_raw, &u);
         if (strcmp(key, "href") == 0) {
@@ -265,12 +503,67 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             *out = js_obj_val((JsObj *)js_str_cstr(vm, pb));
             return true;
         }
-        if (strcmp(key, "host") == 0 || strcmp(key, "hostname") == 0) {
+        if (strcmp(key, "hostname") == 0) {
             *out = js_obj_val((JsObj *)js_str_cstr(vm, ok ? u.host : ""));
             return true;
         }
+        if (strcmp(key, "port") == 0) {
+            char port_b[16] = "";
+            if (ok && u.port != 0 &&
+                !((strcmp(u.scheme, "http") == 0 && u.port == 80) ||
+                  (strcmp(u.scheme, "https") == 0 && u.port == 443))) {
+                snprintf(port_b, sizeof(port_b), "%u", (unsigned)u.port);
+            }
+            *out = js_obj_val((JsObj *)js_str_cstr(vm, port_b));
+            return true;
+        }
+        if (strcmp(key, "host") == 0) {
+            char hb[280] = "";
+            if (ok) {
+                if (u.port != 0 &&
+                    !((strcmp(u.scheme, "http") == 0 && u.port == 80) ||
+                      (strcmp(u.scheme, "https") == 0 && u.port == 443))) {
+                    snprintf(hb, sizeof(hb), "%s:%u", u.host, (unsigned)u.port);
+                } else {
+                    snprintf(hb, sizeof(hb), "%s", u.host);
+                }
+            }
+            *out = js_obj_val((JsObj *)js_str_cstr(vm, hb));
+            return true;
+        }
+        if (strcmp(key, "origin") == 0) {
+            char ob[320] = "null";
+            if (ok && u.host[0]) {
+                if (u.port != 0 &&
+                    !((strcmp(u.scheme, "http") == 0 && u.port == 80) ||
+                      (strcmp(u.scheme, "https") == 0 && u.port == 443))) {
+                    snprintf(ob, sizeof(ob), "%s://%s:%u", u.scheme, u.host, (unsigned)u.port);
+                } else {
+                    snprintf(ob, sizeof(ob), "%s://%s", u.scheme, u.host);
+                }
+            }
+            *out = js_obj_val((JsObj *)js_str_cstr(vm, ob));
+            return true;
+        }
         if (strcmp(key, "pathname") == 0) {
-            *out = js_obj_val((JsObj *)js_str_cstr(vm, ok ? u.path : ""));
+            char path_only[1024] = "";
+            if (ok) {
+                const char *q = strchr(u.path, '?');
+                if (q) {
+                    size_t plen = (size_t)(q - u.path);
+                    if (plen >= sizeof(path_only)) plen = sizeof(path_only) - 1;
+                    memcpy(path_only, u.path, plen);
+                    path_only[plen] = '\0';
+                } else {
+                    snprintf(path_only, sizeof(path_only), "%s", u.path);
+                }
+            }
+            *out = js_obj_val((JsObj *)js_str_cstr(vm, path_only));
+            return true;
+        }
+        if (strcmp(key, "search") == 0) {
+            const char *q = ok ? strchr(u.path, '?') : NULL;
+            *out = js_obj_val((JsObj *)js_str_cstr(vm, (q && q[1]) ? q : ""));
             return true;
         }
         if (strcmp(key, "hash") == 0) {
@@ -282,7 +575,16 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
         return false;
     }
 
+    if (tag == NATIVE_TAG_COMPUTED_STYLE) {
+        if (strcmp(key, "getPropertyValue") == 0 || strcmp(key, "setProperty") == 0 || strcmp(key, "removeProperty") == 0)
+            return false;
+        DomNode *n = (DomNode *)m->native_ptr;
+        return get_computed_style_prop(vm, n, key, out);
+    }
+
     if (tag == NATIVE_TAG_STYLE) {
+        if (strcmp(key, "getPropertyValue") == 0 || strcmp(key, "setProperty") == 0 || strcmp(key, "removeProperty") == 0)
+            return false;
         DomNode *n = (DomNode *)m->native_ptr;
         if (!n) { *out = js_obj_val((JsObj *)js_str_cstr(vm, "")); return true; }
         if (strcmp(key, "cssText") == 0) {
@@ -291,11 +593,14 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             return true;
         }
         char kebab[64];
-        camel_to_kebab(key, kebab, sizeof(kebab));
+        if (key[0] == '-' && key[1] == '-') snprintf(kebab, sizeof(kebab), "%s", key);
+        else camel_to_kebab(key, kebab, sizeof(kebab));
         const char *inl = dom_get_attr(n, "style");
         if (inl) {
             size_t klen = strlen(kebab);
             const char *p = inl;
+            const char *found_val = NULL;
+            size_t found_len = 0;
             while (*p) {
                 while (*p && (tb_isspace(*p) || *p == ';')) p++;
                 if (tb_strncasecmp(p, kebab, klen) == 0 && (p[klen] == ':' || tb_isspace(p[klen]))) {
@@ -306,13 +611,25 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
                         const char *semi = strchr(col, ';');
                         size_t vlen = semi ? (size_t)(semi - col) : strlen(col);
                         while (vlen > 0 && tb_isspace(col[vlen - 1])) vlen--;
-                        *out = js_obj_val((JsObj *)js_str_new(vm, col, vlen));
-                        return true;
+                        /* Strip trailing !important if present */
+                        if (vlen >= 10) {
+                            const char *imp = col + vlen - 10;
+                            if (tb_strncasecmp(imp, "!important", 10) == 0) {
+                                vlen -= 10;
+                                while (vlen > 0 && tb_isspace(col[vlen - 1])) vlen--;
+                            }
+                        }
+                        found_val = col;
+                        found_len = vlen;
                     }
                 }
                 const char *semi = strchr(p, ';');
                 if (!semi) break;
                 p = semi + 1;
+            }
+            if (found_val) {
+                *out = js_obj_val((JsObj *)js_str_new(vm, found_val, found_len));
+                return true;
             }
         }
         *out = js_obj_val((JsObj *)js_str_cstr(vm, ""));
@@ -338,6 +655,14 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             tb_free(t);
             return true;
         }
+        if (strcmp(key, "cookie") == 0) {
+            const char *u_raw = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "http://localhost/");
+            char *ck = tb_cookie_get_for_url(u_raw);
+            *out = js_obj_val((JsObj *)js_str_cstr(vm, ck ? ck : ""));
+            tb_free(ck);
+            return true;
+        }
+        if (strcmp(key, "readyState") == 0)      { *out = js_obj_val((JsObj *)js_str_cstr(vm, "complete")); return true; }
         if (strcmp(key, "body") == 0)            { *out = js_wrap_dom_node(vm, doc->body); return true; }
         if (strcmp(key, "head") == 0)            { *out = js_wrap_dom_node(vm, doc->head); return true; }
         if (strcmp(key, "documentElement") == 0) { *out = js_wrap_dom_node(vm, doc->html); return true; }
@@ -350,6 +675,10 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
         if (!n) return false;
 
         if (strcmp(key, "tagName") == 0 || strcmp(key, "nodeName") == 0) {
+            if (n->type == DOM_NODE_FRAGMENT) {
+                *out = js_obj_val((JsObj *)js_str_cstr(vm, "#document-fragment"));
+                return true;
+            }
             const char *tn = dom_node_tag_name(n);
             char up[64];
             size_t i = 0;
@@ -359,7 +688,11 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             return true;
         }
         if (strcmp(key, "nodeType") == 0) {
-            int nt = (n->type == DOM_NODE_ELEMENT) ? 1 : (n->type == DOM_NODE_TEXT ? 3 : 9);
+            int nt = 9;
+            if (n->type == DOM_NODE_ELEMENT) nt = 1;
+            else if (n->type == DOM_NODE_TEXT) nt = 3;
+            else if (n->type == DOM_NODE_COMMENT) nt = 8;
+            else if (n->type == DOM_NODE_FRAGMENT) nt = 11;
             *out = js_num((double)nt);
             return true;
         }
@@ -406,6 +739,29 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             tb_free(h);
             return true;
         }
+        if (strcmp(key, "outerHTML") == 0) {
+            char *h = dom_get_outer_html(n);
+            *out = js_obj_val((JsObj *)js_str_cstr(vm, h ? h : ""));
+            tb_free(h);
+            return true;
+        }
+        /* Layout geometry properties */
+        if (strcmp(key, "offsetWidth") == 0 || strcmp(key, "clientWidth") == 0) {
+            int w = n->box_w > 0 ? n->box_w : (n->style.width_cols > 0 ? n->style.width_cols : (vm->viewport_w > 0 ? vm->viewport_w : 80));
+            if (n->style.display == CSS_DISP_NONE) w = 0;
+            *out = js_num((double)w);
+            return true;
+        }
+        if (strcmp(key, "offsetHeight") == 0 || strcmp(key, "clientHeight") == 0) {
+            int h = n->box_h > 0 ? n->box_h : (n->style.display == CSS_DISP_NONE ? 0 : 1);
+            *out = js_num((double)h);
+            return true;
+        }
+        if (strcmp(key, "offsetLeft") == 0) { *out = js_num((double)n->box_x); return true; }
+        if (strcmp(key, "offsetTop") == 0)  { *out = js_num((double)n->box_y); return true; }
+        if (strcmp(key, "scrollTop") == 0)  { *out = js_num(0); return true; }
+        if (strcmp(key, "scrollLeft") == 0) { *out = js_num(0); return true; }
+
         if (strcmp(key, "style") == 0)     { *out = js_obj_val(make_proxy_obj(vm, n, NATIVE_TAG_STYLE)); return true; }
         if (strcmp(key, "classList") == 0) { *out = js_obj_val(make_proxy_obj(vm, n, NATIVE_TAG_CLASSLIST)); return true; }
         if (strcmp(key, "dataset") == 0)   { *out = js_obj_val(make_proxy_obj(vm, n, NATIVE_TAG_DATASET)); return true; }
@@ -429,6 +785,19 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             for (DomNode *c = n->first_child; c; c = c->next_sibling)
                 if (c->type == DOM_NODE_ELEMENT) { *out = js_wrap_dom_node(vm, c); return true; }
             *out = js_null();
+            return true;
+        }
+        if (strcmp(key, "lastElementChild") == 0) {
+            for (DomNode *c = n->last_child; c; c = c->prev_sibling)
+                if (c->type == DOM_NODE_ELEMENT) { *out = js_wrap_dom_node(vm, c); return true; }
+            *out = js_null();
+            return true;
+        }
+        if (strcmp(key, "childElementCount") == 0) {
+            int cnt = 0;
+            for (DomNode *c = n->first_child; c; c = c->next_sibling)
+                if (c->type == DOM_NODE_ELEMENT) cnt++;
+            *out = js_num((double)cnt);
             return true;
         }
         if (strcmp(key, "nextElementSibling") == 0) {
@@ -463,10 +832,43 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
 bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
     JsNativeTag tag = (JsNativeTag)m->hdr.native_tag;
 
+    if (tag == NATIVE_TAG_STORAGE) {
+        if (strcmp(key, "getItem") == 0 || strcmp(key, "setItem") == 0 ||
+            strcmp(key, "removeItem") == 0 || strcmp(key, "clear") == 0 ||
+            strcmp(key, "key") == 0 || strcmp(key, "_store") == 0) {
+            return false;
+        }
+        for (uint32_t i = 0; i < m->count; i++) {
+            if (strcmp(m->props[i].key->data, "_store") == 0 &&
+                m->props[i].val.type == JS_OBJECT && m->props[i].val.u.obj) {
+                JsStr *vs = js_to_str(vm, val);
+                if (vs) js_set_prop(vm, m->props[i].val, key, js_obj_val((JsObj *)vs));
+                return true;
+            }
+        }
+        return false;
+    }
+
     if (tag == NATIVE_TAG_LOCATION) {
         if (strcmp(key, "href") == 0) {
             JsStr *s = js_to_str(vm, val);
-            if (s && vm->on_navigate) vm->on_navigate(vm->host_userdata, s->data, false);
+            if (s) {
+                snprintf(vm->pushed_url, sizeof(vm->pushed_url), "%s", s->data);
+                if (vm->on_navigate) vm->on_navigate(vm->host_userdata, s->data, false);
+            }
+            return true;
+        }
+        if (strcmp(key, "hash") == 0) {
+            JsStr *s = js_to_str(vm, val);
+            if (s) {
+                const char *base = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "http://localhost/");
+                const char *hash_pos = strchr(base, '#');
+                size_t blen = hash_pos ? (size_t)(hash_pos - base) : strlen(base);
+                char nb[1536];
+                const char *h = (s->data[0] == '#') ? s->data + 1 : s->data;
+                snprintf(nb, sizeof(nb), "%.*s#%s", (int)blen, base, h);
+                snprintf(vm->pushed_url, sizeof(vm->pushed_url), "%s", nb);
+            }
             return true;
         }
         return false;
@@ -482,7 +884,8 @@ bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
             return true;
         }
         char kebab[64];
-        camel_to_kebab(key, kebab, sizeof(kebab));
+        if (key[0] == '-' && key[1] == '-') snprintf(kebab, sizeof(kebab), "%s", key);
+        else camel_to_kebab(key, kebab, sizeof(kebab));
         const char *old_s = dom_get_attr(n, "style");
         TbBuf b;
         tb_buf_init(&b);
@@ -493,7 +896,9 @@ bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
         tb_buf_printf(&b, "%s:%s;", kebab, vstr);
         dom_set_attr(n, "style", b.data ? b.data : "");
         tb_buf_free(&b);
-        css_apply_decl(&n->style, kebab, vstr);
+        if (!(kebab[0] == '-' && kebab[1] == '-')) {
+            css_apply_decl(&n->style, kebab, vstr);
+        }
         return true;
     }
 
@@ -511,6 +916,14 @@ bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
         if (strcmp(key, "title") == 0 && vm->doc) {
             JsStr *vs = js_to_str(vm, val);
             dom_set_title(vm->doc, vs ? vs->data : "");
+            return true;
+        }
+        if (strcmp(key, "cookie") == 0) {
+            JsStr *vs = js_to_str(vm, val);
+            if (vs) {
+                const char *u_raw = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "http://localhost/");
+                tb_cookie_set_from_header(u_raw, vs->data);
+            }
             return true;
         }
         return false;
@@ -577,8 +990,24 @@ bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
             dom_set_inner_html(n, s ? s->data : "");
             return true;
         }
+        if (strcmp(key, "outerHTML") == 0) {
+            JsStr *s = (val.type == JS_NULL || val.type == JS_UNDEFINED)
+                           ? js_str_cstr(vm, "")
+                           : js_to_str(vm, val);
+            dom_set_outer_html(n, s ? s->data : "");
+            return true;
+        }
     }
     return false;
+}
+
+/* Convert a JS value argument into a DomNode (or newly created text node) */
+static DomNode *arg_to_dom_node(JsVm *vm, JsVal v) {
+    DomNode *dn = unwrap_node(v);
+    if (dn) return dn;
+    if (!vm->doc) return NULL;
+    JsStr *s = js_to_str(vm, v);
+    return dom_create_text(vm->doc, s ? s->data : "");
 }
 
 /* Document & Element Native Methods */
@@ -593,24 +1022,42 @@ typedef enum {
     DOM_SET_ATTRIBUTE,
     DOM_REMOVE_ATTRIBUTE,
     DOM_HAS_ATTRIBUTE,
+    DOM_TOGGLE_ATTRIBUTE,
     DOM_MATCHES,
     DOM_CLOSEST,
+    DOM_CONTAINS,
+    DOM_APPEND,
+    DOM_PREPEND,
+    DOM_BEFORE,
+    DOM_AFTER,
+    DOM_REPLACE_WITH,
+    DOM_REPLACE_CHILDREN,
+    DOM_INSERT_ADJ_HTML,
+    DOM_INSERT_ADJ_ELEMENT,
+    DOM_INSERT_ADJ_TEXT,
+    DOM_GET_BOUNDING_RECT,
     DOM_ADD_EVENT_LISTENER,
     DOM_REMOVE_EVENT_LISTENER,
+    DOM_DISPATCH_EVENT,
     DOM_CLICK,
     DOM_FOCUS_BLUR,
-    DOM_GET_ELEMENT_BY_ID = 20,
+    DOM_GET_ELEMENT_BY_ID = 40,
     DOM_QUERY_SELECTOR,
     DOM_QUERY_SELECTOR_ALL,
     DOM_GET_ELEMENTS_BY_TAG_NAME,
     DOM_GET_ELEMENTS_BY_CLASS_NAME,
     DOM_CREATE_ELEMENT,
-    DOM_CREATE_TEXT_NODE
+    DOM_CREATE_TEXT_NODE,
+    DOM_CREATE_DOCUMENT_FRAGMENT,
+    DOM_CREATE_COMMENT
 } JsDomMethodMagic;
+
+static bool dispatch_event_obj(JsVm *vm, DomNode *target, JsVal ev_val);
 
 static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     DomNode *n = unwrap_node(this_val);
-    if (!n && vm->doc && (magic >= DOM_GET_ELEMENT_BY_ID && magic <= DOM_CREATE_TEXT_NODE)) n = vm->doc->root;
+    if (!n && vm->doc && (magic >= DOM_GET_ELEMENT_BY_ID && magic <= DOM_CREATE_COMMENT)) n = vm->doc->root;
+    if (!n && this_val.type == JS_OBJECT && this_val.u.obj == vm->global_obj && vm->doc) n = vm->doc->root;
     if (!n) return js_null();
 
     switch (magic) {
@@ -661,6 +1108,17 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             DomNode *tn = dom_create_text(vm->doc, tx ? tx->data : "");
             return js_wrap_dom_node(vm, tn);
         }
+        case DOM_CREATE_DOCUMENT_FRAGMENT: {
+            if (!vm->doc) return js_null();
+            DomNode *df = dom_create_fragment(vm->doc);
+            return js_wrap_dom_node(vm, df);
+        }
+        case DOM_CREATE_COMMENT: {
+            if (!vm->doc) return js_null();
+            DomNode *cm = dom_create_text(vm->doc, "");
+            if (cm) cm->type = DOM_NODE_COMMENT;
+            return js_wrap_dom_node(vm, cm);
+        }
 
         /* Node tree mutations */
         case DOM_APPEND_CHILD: {
@@ -670,7 +1128,7 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
         }
         case DOM_INSERT_BEFORE: {
             DomNode *nn  = argc > 0 ? unwrap_node(argv[0]) : NULL;
-            DomNode *ref = (argc > 1 && argv[1].type != JS_NULL) ? unwrap_node(argv[1]) : NULL;
+            DomNode *ref = (argc > 1 && argv[1].type != JS_NULL && argv[1].type != JS_UNDEFINED) ? unwrap_node(argv[1]) : NULL;
             if (!nn || !dom_insert_before(n, nn, ref)) return js_null();
             return argv[0];
         }
@@ -693,6 +1151,137 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             bool deep = argc > 0 && js_to_bool(argv[0]);
             DomNode *cl = dom_clone_node(vm->doc, n, deep);
             return js_wrap_dom_node(vm, cl);
+        }
+        case DOM_CONTAINS: {
+            DomNode *other = argc > 0 ? unwrap_node(argv[0]) : NULL;
+            return js_bool(dom_contains(n, other));
+        }
+        case DOM_APPEND: {
+            for (int i = 0; i < argc; i++) {
+                DomNode *ch = arg_to_dom_node(vm, argv[i]);
+                if (ch) dom_append_child(n, ch);
+            }
+            return js_undefined();
+        }
+        case DOM_PREPEND: {
+            DomNode *first = n->first_child;
+            for (int i = 0; i < argc; i++) {
+                DomNode *ch = arg_to_dom_node(vm, argv[i]);
+                if (ch) dom_insert_before(n, ch, first);
+            }
+            return js_undefined();
+        }
+        case DOM_BEFORE: {
+            if (!n->parent) return js_undefined();
+            for (int i = 0; i < argc; i++) {
+                DomNode *ch = arg_to_dom_node(vm, argv[i]);
+                if (ch) dom_insert_before(n->parent, ch, n);
+            }
+            return js_undefined();
+        }
+        case DOM_AFTER: {
+            if (!n->parent) return js_undefined();
+            DomNode *ref = n->next_sibling;
+            for (int i = 0; i < argc; i++) {
+                DomNode *ch = arg_to_dom_node(vm, argv[i]);
+                if (ch) dom_insert_before(n->parent, ch, ref);
+            }
+            return js_undefined();
+        }
+        case DOM_REPLACE_WITH: {
+            DomNode *par = n->parent;
+            if (!par) return js_undefined();
+            DomNode *ref = n->next_sibling;
+            dom_remove_child(par, n);
+            for (int i = 0; i < argc; i++) {
+                DomNode *ch = arg_to_dom_node(vm, argv[i]);
+                if (ch) dom_insert_before(par, ch, ref);
+            }
+            return js_undefined();
+        }
+        case DOM_REPLACE_CHILDREN: {
+            while (n->first_child) {
+                DomNode *ch = n->first_child;
+                dom_remove_child(n, ch);
+                if (!ch->js_wrapper) dom_node_free(ch);
+            }
+            for (int i = 0; i < argc; i++) {
+                DomNode *ch = arg_to_dom_node(vm, argv[i]);
+                if (ch) dom_append_child(n, ch);
+            }
+            return js_undefined();
+        }
+        case DOM_INSERT_ADJ_HTML: {
+            if (argc >= 2) {
+                JsStr *pos = js_to_str(vm, argv[0]);
+                JsStr *htm = js_to_str(vm, argv[1]);
+                if (pos && htm) dom_insert_adjacent_html(n, pos->data, htm->data);
+            }
+            return js_undefined();
+        }
+        case DOM_INSERT_ADJ_ELEMENT: {
+            if (argc >= 2) {
+                JsStr *pos = js_to_str(vm, argv[0]);
+                DomNode *el = unwrap_node(argv[1]);
+                if (!pos || !el) return js_null();
+                if (tb_strcasecmp(pos->data, "beforebegin") == 0) {
+                    if (!n->parent || !dom_insert_before(n->parent, el, n)) return js_null();
+                } else if (tb_strcasecmp(pos->data, "afterbegin") == 0) {
+                    if (!dom_insert_before(n, el, n->first_child)) return js_null();
+                } else if (tb_strcasecmp(pos->data, "beforeend") == 0) {
+                    if (!dom_append_child(n, el)) return js_null();
+                } else if (tb_strcasecmp(pos->data, "afterend") == 0) {
+                    if (!n->parent || !dom_insert_before(n->parent, el, n->next_sibling)) return js_null();
+                } else {
+                    return js_null();
+                }
+                return argv[1];
+            }
+            return js_null();
+        }
+        case DOM_INSERT_ADJ_TEXT: {
+            if (argc >= 2 && vm->doc) {
+                JsStr *pos = js_to_str(vm, argv[0]);
+                JsStr *txt = js_to_str(vm, argv[1]);
+                DomNode *tn = dom_create_text(vm->doc, txt ? txt->data : "");
+                if (pos && tn) {
+                    if (tb_strcasecmp(pos->data, "beforebegin") == 0 && n->parent)
+                        dom_insert_before(n->parent, tn, n);
+                    else if (tb_strcasecmp(pos->data, "afterbegin") == 0)
+                        dom_insert_before(n, tn, n->first_child);
+                    else if (tb_strcasecmp(pos->data, "beforeend") == 0)
+                        dom_append_child(n, tn);
+                    else if (tb_strcasecmp(pos->data, "afterend") == 0 && n->parent)
+                        dom_insert_before(n->parent, tn, n->next_sibling);
+                    else
+                        dom_node_free(tn);
+                }
+            }
+            return js_undefined();
+        }
+        case DOM_GET_BOUNDING_RECT: {
+            if (vm->doc) {
+                css_compute_document_ex(vm->doc, NULL, vm->viewport_w > 0 ? vm->viewport_w : 80);
+            }
+            int x = n->box_x;
+            int y = n->box_y;
+            int w = n->box_w > 0 ? n->box_w : (n->style.width_cols > 0 ? n->style.width_cols : (vm->viewport_w > 0 ? vm->viewport_w : 80));
+            int h = n->box_h > 0 ? n->box_h : (n->style.display == CSS_DISP_NONE ? 0 : 1);
+            if (n->style.display == CSS_DISP_NONE) w = 0;
+            vm->gc_pause++;
+            JsObj *rc = js_map_new(vm, vm->object_proto);
+            if (rc) {
+                js_set_prop(vm, js_obj_val(rc), "x", js_num((double)x));
+                js_set_prop(vm, js_obj_val(rc), "y", js_num((double)y));
+                js_set_prop(vm, js_obj_val(rc), "left", js_num((double)x));
+                js_set_prop(vm, js_obj_val(rc), "top", js_num((double)y));
+                js_set_prop(vm, js_obj_val(rc), "width", js_num((double)w));
+                js_set_prop(vm, js_obj_val(rc), "height", js_num((double)h));
+                js_set_prop(vm, js_obj_val(rc), "right", js_num((double)(x + w)));
+                js_set_prop(vm, js_obj_val(rc), "bottom", js_num((double)(y + h)));
+            }
+            vm->gc_pause--;
+            return js_obj_val(rc);
         }
 
         /* Attributes & Matching */
@@ -718,6 +1307,20 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             JsStr *nm = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             return js_bool(nm && dom_has_attr(n, nm->data));
         }
+        case DOM_TOGGLE_ATTRIBUTE: {
+            if (argc == 0) return js_bool(false);
+            JsStr *nm = js_to_str(vm, argv[0]);
+            if (!nm) return js_bool(false);
+            bool has = dom_has_attr(n, nm->data);
+            bool force = (argc > 1 && argv[1].type != JS_UNDEFINED) ? js_to_bool(argv[1]) : !has;
+            if (force) {
+                if (!has) dom_set_attr(n, nm->data, "");
+                return js_bool(true);
+            } else {
+                if (has) dom_remove_attr(n, nm->data);
+                return js_bool(false);
+            }
+        }
         case DOM_MATCHES: {
             JsStr *sel = argc > 0 ? js_to_str(vm, argv[0]) : NULL;
             return js_bool(sel && dom_matches_selector(n, sel->data));
@@ -731,7 +1334,7 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             return js_null();
         }
 
-        /* Event Listeners & Programmatic click() */
+        /* Event Listeners & Programmatic click() / dispatchEvent() */
         case DOM_ADD_EVENT_LISTENER: {
             if (argc >= 2 && argv[1].type == JS_OBJECT && argv[1].u.obj) {
                 JsStr *tp = js_to_str(vm, argv[0]);
@@ -745,6 +1348,12 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
                 if (tp) remove_node_listener(n, tp->data, argv[1].u.obj);
             }
             return js_undefined();
+        }
+        case DOM_DISPATCH_EVENT: {
+            if (argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj) {
+                return js_bool(dispatch_event_obj(vm, n, argv[0]));
+            }
+            return js_bool(true);
         }
         case DOM_CLICK: {
             js_dispatch_dom_event(vm, n, "click", NULL, true);
@@ -760,14 +1369,63 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
 /* Event object methods: preventDefault() & stopPropagation() */
 typedef enum {
     EV_PREVENT_DEFAULT = 0,
-    EV_STOP_PROPAGATION
+    EV_STOP_PROPAGATION,
+    EV_STOP_IMMEDIATE,
+    EV_CTOR,
+    EV_CUSTOM_CTOR
 } JsEventCtrlMagic;
 
 static JsVal fn_event_ctrl(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
-    (void)argc; (void)argv;
-    if (magic == EV_PREVENT_DEFAULT) js_set_prop(vm, this_val, "defaultPrevented", js_bool(true));
-    else js_set_prop(vm, this_val, "_stopped", js_bool(true));
-    return js_undefined();
+    if (magic == EV_PREVENT_DEFAULT) {
+        if (js_to_bool(js_get_prop(vm, this_val, "cancelable"))) {
+            js_set_prop(vm, this_val, "defaultPrevented", js_bool(true));
+        }
+        return js_undefined();
+    }
+    if (magic == EV_STOP_PROPAGATION) {
+        js_set_prop(vm, this_val, "_stopped", js_bool(true));
+        return js_undefined();
+    }
+    if (magic == EV_STOP_IMMEDIATE) {
+        js_set_prop(vm, this_val, "_stopped", js_bool(true));
+        js_set_prop(vm, this_val, "_stopImmediate", js_bool(true));
+        return js_undefined();
+    }
+    /* EV_CTOR / EV_CUSTOM_CTOR */
+    JsObj *ev = (this_val.type == JS_OBJECT && this_val.u.obj && this_val.u.obj != vm->global_obj)
+                    ? this_val.u.obj
+                    : js_map_new(vm, vm->object_proto);
+    if (!ev) return js_undefined();
+    JsVal ev_val = js_obj_val(ev);
+    JsStr *tp = argc > 0 ? js_to_str(vm, argv[0]) : js_str_cstr(vm, "");
+    bool bubbles = false;
+    bool cancelable = true;
+    JsVal detail = js_null();
+    if (argc > 1 && argv[1].type == JS_OBJECT && argv[1].u.obj) {
+        JsVal bv = js_get_prop(vm, argv[1], "bubbles");
+        if (bv.type != JS_UNDEFINED) bubbles = js_to_bool(bv);
+        JsVal cv = js_get_prop(vm, argv[1], "cancelable");
+        if (cv.type != JS_UNDEFINED) cancelable = js_to_bool(cv);
+        if (magic == EV_CUSTOM_CTOR) {
+            JsVal dv = js_get_prop(vm, argv[1], "detail");
+            if (dv.type != JS_UNDEFINED) detail = dv;
+        }
+    }
+    vm->gc_pause++;
+    js_set_prop(vm, ev_val, "type", js_obj_val((JsObj *)tp));
+    js_set_prop(vm, ev_val, "bubbles", js_bool(bubbles));
+    js_set_prop(vm, ev_val, "cancelable", js_bool(cancelable));
+    js_set_prop(vm, ev_val, "defaultPrevented", js_bool(false));
+    js_set_prop(vm, ev_val, "_stopped", js_bool(false));
+    js_set_prop(vm, ev_val, "_stopImmediate", js_bool(false));
+    if (magic == EV_CUSTOM_CTOR) {
+        js_set_prop(vm, ev_val, "detail", detail);
+    }
+    js_define_native(vm, ev, "preventDefault", fn_event_ctrl, EV_PREVENT_DEFAULT);
+    js_define_native(vm, ev, "stopPropagation", fn_event_ctrl, EV_STOP_PROPAGATION);
+    js_define_native(vm, ev, "stopImmediatePropagation", fn_event_ctrl, EV_STOP_IMMEDIATE);
+    vm->gc_pause--;
+    return ev_val;
 }
 
 static void ensure_inline_handler_compiled(JsVm *vm, DomNode *n, const char *type) {
@@ -790,30 +1448,21 @@ static void ensure_inline_handler_compiled(JsVm *vm, DomNode *n, const char *typ
     tb_buf_free(&src);
 }
 
-bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
-                           const char *key_name, bool bubbles) {
-    if (!vm || !target || !type) return true;
-
+static bool dispatch_event_obj(JsVm *vm, DomNode *target, JsVal ev_val) {
+    if (!vm || !target || ev_val.type != JS_OBJECT || !ev_val.u.obj) return true;
     int sp = vm->temp_sp;
-    vm->gc_pause++;
-    JsObj *ev = js_map_new(vm, vm->object_proto);
-    JsVal ev_val = js_obj_val(ev);
-    js_set_prop(vm, ev_val, "type", js_obj_val((JsObj *)js_str_cstr(vm, type)));
-    js_set_prop(vm, ev_val, "target", js_wrap_dom_node(vm, target));
-    js_set_prop(vm, ev_val, "bubbles", js_bool(bubbles));
-    js_set_prop(vm, ev_val, "defaultPrevented", js_bool(false));
-    js_set_prop(vm, ev_val, "_stopped", js_bool(false));
-    if (key_name) js_set_prop(vm, ev_val, "key", js_obj_val((JsObj *)js_str_cstr(vm, key_name)));
-    js_define_native(vm, ev, "preventDefault", fn_event_ctrl, EV_PREVENT_DEFAULT);
-    js_define_native(vm, ev, "stopPropagation", fn_event_ctrl, EV_STOP_PROPAGATION);
-    vm->gc_pause--;
-
     js_temp_push(vm, ev_val);
 
+    JsStr *tp_s = js_to_str(vm, js_get_prop(vm, ev_val, "type"));
+    if (!tp_s || tp_s->len == 0) { vm->temp_sp = sp; return true; }
+    js_temp_push(vm, js_obj_val((JsObj *)tp_s));
+    const char *type = tp_s->data;
+    bool bubbles = js_to_bool(js_get_prop(vm, ev_val, "bubbles"));
+
+    js_set_prop(vm, ev_val, "target", js_wrap_dom_node(vm, target));
+
     /* Snapshot propagation path as wrapped DOM nodes (rooted on temp_roots)
-     * before invoking listeners, per W3C DOM Event Dispatch spec. This also
-     * prevents use-after-free if an event listener removes/destroys `cur`
-     * (e.g. via parent.innerHTML = '' or node.remove()). */
+     * before invoking listeners, per W3C DOM Event Dispatch spec. */
     DomNode *path[128];
     int path_len = 0;
     for (DomNode *p = target; p && path_len < 128; p = p->parent) {
@@ -832,7 +1481,7 @@ bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
     for (int p = 0; p < actual_path_len; p++) {
         JsVal cur_wrap = vm->temp_roots[path_sp + p];
         DomNode *cur   = unwrap_node(cur_wrap);
-        if (!cur) continue; /* Node was destroyed during an earlier listener */
+        if (!cur) continue;
 
         if (cur->type == DOM_NODE_ELEMENT) {
             ensure_inline_handler_compiled(vm, cur, type);
@@ -842,7 +1491,6 @@ bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
         if (cur->listeners) {
             js_set_prop(vm, ev_val, "currentTarget", cur_wrap);
 
-            /* Snapshot & root listeners on this node in case handler mutates listeners or triggers GC */
             int fn_sp = vm->temp_sp;
             int nfns  = 0;
             for (DomListener *ls = cur->listeners; ls && nfns < 32; ls = ls->next) {
@@ -866,6 +1514,7 @@ bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
                     vm->has_thrown = false;
                     vm->thrown_val = js_undefined();
                 }
+                if (js_to_bool(js_get_prop(vm, ev_val, "_stopImmediate"))) break;
             }
             vm->temp_sp = fn_sp;
         }
@@ -874,29 +1523,70 @@ bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
         if (js_to_bool(stopped)) break;
     }
 
+    js_drain_microtasks(vm);
     bool prevented = js_to_bool(js_get_prop(vm, ev_val, "defaultPrevented"));
     vm->temp_sp = sp;
     return !prevented;
 }
 
-/* Timers & Window APIs & Fetch */
+bool js_dispatch_dom_event(JsVm *vm, DomNode *target, const char *type,
+                           const char *key_name, bool bubbles) {
+    if (!vm || !target || !type) return true;
+
+    int sp = vm->temp_sp;
+    vm->gc_pause++;
+    JsObj *ev = js_map_new(vm, vm->object_proto);
+    JsVal ev_val = js_obj_val(ev);
+    js_set_prop(vm, ev_val, "type", js_obj_val((JsObj *)js_str_cstr(vm, type)));
+    js_set_prop(vm, ev_val, "target", js_wrap_dom_node(vm, target));
+    js_set_prop(vm, ev_val, "bubbles", js_bool(bubbles));
+    js_set_prop(vm, ev_val, "cancelable", js_bool(true));
+    js_set_prop(vm, ev_val, "defaultPrevented", js_bool(false));
+    js_set_prop(vm, ev_val, "_stopped", js_bool(false));
+    js_set_prop(vm, ev_val, "_stopImmediate", js_bool(false));
+    if (key_name) js_set_prop(vm, ev_val, "key", js_obj_val((JsObj *)js_str_cstr(vm, key_name)));
+    js_define_native(vm, ev, "preventDefault", fn_event_ctrl, EV_PREVENT_DEFAULT);
+    js_define_native(vm, ev, "stopPropagation", fn_event_ctrl, EV_STOP_PROPAGATION);
+    js_define_native(vm, ev, "stopImmediatePropagation", fn_event_ctrl, EV_STOP_IMMEDIATE);
+    vm->gc_pause--;
+
+    js_temp_push(vm, ev_val);
+    bool res = dispatch_event_obj(vm, target, ev_val);
+    vm->temp_sp = sp;
+    return res;
+}
+
+/* Timers, Window APIs, History, Location & Fetch */
 typedef enum {
     WIN_SET_TIMEOUT = 0,
     WIN_SET_INTERVAL,
     WIN_CLEAR_TIMER,
+    WIN_RAF,
+    WIN_CANCEL_RAF,
     WIN_PERF_NOW,
     WIN_ALERT,
     WIN_SCROLL_TO,
-    WIN_LOC_RELOAD
+    WIN_GET_COMPUTED_STYLE,
+    WIN_MATCH_MEDIA,
+    WIN_LOC_RELOAD,
+    WIN_LOC_ASSIGN,
+    WIN_LOC_REPLACE,
+    WIN_LOC_TO_STRING,
+    WIN_HIST_PUSH_STATE,
+    WIN_HIST_REPLACE_STATE,
+    WIN_HIST_BACK,
+    WIN_HIST_FORWARD,
+    WIN_HIST_GO
 } JsWindowApiMagic;
 
 static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     (void)this_val;
     switch (magic) {
         case WIN_SET_TIMEOUT:
-        case WIN_SET_INTERVAL: {
+        case WIN_SET_INTERVAL:
+        case WIN_RAF: {
             if (argc == 0 || argv[0].type != JS_OBJECT || !argv[0].u.obj) return js_num(0);
-            int64_t delay = argc > 1 ? (int64_t)js_to_num(vm, argv[1]) : 0;
+            int64_t delay = (magic == WIN_RAF) ? 16 : (argc > 1 ? (int64_t)js_to_num(vm, argv[1]) : 0);
             if (delay < 0) delay = 0;
             for (int i = 0; i < JS_MAX_TIMERS; i++) {
                 if (!vm->timers[i].active) {
@@ -904,6 +1594,7 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
                     vm->timers[i].id          = id;
                     vm->timers[i].active      = true;
                     vm->timers[i].repeat      = (magic == WIN_SET_INTERVAL);
+                    vm->timers[i].is_raf      = (magic == WIN_RAF);
                     vm->timers[i].interval_ms = (magic == WIN_SET_INTERVAL && delay < 10) ? 10 : delay;
                     vm->timers[i].due_ms      = js_now_ms() + delay;
                     vm->timers[i].fn_obj      = argv[0].u.obj;
@@ -912,7 +1603,8 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             }
             return js_num(0);
         }
-        case WIN_CLEAR_TIMER: {
+        case WIN_CLEAR_TIMER:
+        case WIN_CANCEL_RAF: {
             int id = argc > 0 ? (int)js_to_num(vm, argv[0]) : 0;
             for (int i = 0; i < JS_MAX_TIMERS; i++) {
                 if (vm->timers[i].active && vm->timers[i].id == id) {
@@ -932,78 +1624,89 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             return js_undefined();
         }
         case WIN_SCROLL_TO: {
-            int ny = argc > 1 ? (int)js_to_num(vm, argv[1]) : (argc > 0 ? (int)js_to_num(vm, argv[0]) : 0);
+            int ny = 0;
+            if (argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj) {
+                JsVal tv = js_get_prop(vm, argv[0], "top");
+                if (tv.type != JS_UNDEFINED) ny = (int)js_to_num(vm, tv);
+            } else {
+                ny = argc > 1 ? (int)js_to_num(vm, argv[1]) : (argc > 0 ? (int)js_to_num(vm, argv[0]) : 0);
+            }
             if (ny < 0) ny = 0;
             vm->scroll_y = ny;
             if (vm->scroll_y_ptr) *vm->scroll_y_ptr = ny;
             return js_undefined();
         }
+        case WIN_GET_COMPUTED_STYLE: {
+            DomNode *n = argc > 0 ? unwrap_node(argv[0]) : NULL;
+            return js_obj_val(make_proxy_obj(vm, n, NATIVE_TAG_COMPUTED_STYLE));
+        }
+        case WIN_MATCH_MEDIA: {
+            JsStr *q = argc > 0 ? js_to_str(vm, argv[0]) : js_str_cstr(vm, "");
+            bool matches = true;
+            if (q && strstr(q->data, "print")) matches = false;
+            vm->gc_pause++;
+            JsObj *mql = js_map_new(vm, vm->object_proto);
+            if (mql) {
+                js_set_prop(vm, js_obj_val(mql), "matches", js_bool(matches));
+                js_set_prop(vm, js_obj_val(mql), "media", js_obj_val((JsObj *)q));
+                js_define_native(vm, mql, "addEventListener", fn_dom_method, DOM_FOCUS_BLUR);
+                js_define_native(vm, mql, "removeEventListener", fn_dom_method, DOM_FOCUS_BLUR);
+            }
+            vm->gc_pause--;
+            return js_obj_val(mql);
+        }
         case WIN_LOC_RELOAD: {
-            if (vm->on_navigate) vm->on_navigate(vm->host_userdata, vm->current_url, true);
+            const char *u = (vm->pushed_url[0] != '\0') ? vm->pushed_url : vm->current_url;
+            if (vm->on_navigate) vm->on_navigate(vm->host_userdata, u, true);
             return js_undefined();
         }
+        case WIN_LOC_ASSIGN:
+        case WIN_LOC_REPLACE: {
+            if (argc > 0) {
+                JsStr *s = js_to_str(vm, argv[0]);
+                if (s) {
+                    snprintf(vm->pushed_url, sizeof(vm->pushed_url), "%s", s->data);
+                    if (vm->on_navigate) vm->on_navigate(vm->host_userdata, s->data, false);
+                }
+            }
+            return js_undefined();
+        }
+        case WIN_LOC_TO_STRING: {
+            const char *u_raw = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "about:blank");
+            return js_obj_val((JsObj *)js_str_cstr(vm, u_raw));
+        }
+        case WIN_HIST_PUSH_STATE:
+        case WIN_HIST_REPLACE_STATE: {
+            JsVal state = argc > 0 ? argv[0] : js_null();
+            if (vm->history_obj) {
+                js_set_prop(vm, js_obj_val(vm->history_obj), "state", state);
+                if (magic == WIN_HIST_PUSH_STATE) {
+                    JsVal lv = js_get_prop(vm, js_obj_val(vm->history_obj), "length");
+                    int len = (lv.type == JS_NUMBER) ? (int)lv.u.num : 1;
+                    js_set_prop(vm, js_obj_val(vm->history_obj), "length", js_num((double)(len + 1)));
+                }
+            }
+            if (argc > 2 && argv[2].type != JS_UNDEFINED && argv[2].type != JS_NULL) {
+                JsStr *us = js_to_str(vm, argv[2]);
+                if (us && us->len > 0) {
+                    const char *base = (vm->pushed_url[0] != '\0') ? vm->pushed_url : (vm->current_url ? vm->current_url : "http://localhost/");
+                    char resolved[1536];
+                    if (tb_url_resolve(base, us->data, resolved, sizeof(resolved))) {
+                        snprintf(vm->pushed_url, sizeof(vm->pushed_url), "%s", resolved);
+                    } else {
+                        snprintf(vm->pushed_url, sizeof(vm->pushed_url), "%s", us->data);
+                    }
+                }
+            }
+            return js_undefined();
+        }
+        case WIN_HIST_BACK:
+        case WIN_HIST_FORWARD:
+        case WIN_HIST_GO:
+            return js_undefined();
         default:
             return js_undefined();
     }
-}
-
-/* Synchronous Promise-like object for fetch() `.then(...).catch(...)` */
-typedef enum {
-    PROMISE_THEN = 0,
-    PROMISE_CATCH
-} JsPromiseMagic;
-
-static JsVal make_sync_promise(JsVm *vm, JsVal val, bool rejected);
-
-static JsVal fn_promise_chain(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
-    bool is_rej = js_to_bool(js_get_prop(vm, this_val, "_rej"));
-    JsVal cur   = js_get_prop(vm, this_val, "_val");
-    if (magic == PROMISE_THEN) {
-        if (!is_rej && argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj) {
-            JsVal nxt = js_call(vm, argv[0], js_undefined(), 1, &cur);
-            if (vm->has_thrown) {
-                JsVal tv = vm->thrown_val;
-                vm->has_thrown = false;
-                vm->thrown_val = js_undefined();
-                return make_sync_promise(vm, tv, true);
-            }
-            if (nxt.type == JS_OBJECT && nxt.u.obj &&
-                js_to_bool(js_get_prop(vm, nxt, "_isPromise"))) {
-                return nxt;
-            }
-            return make_sync_promise(vm, nxt, false);
-        }
-        if (is_rej && argc > 1 && argv[1].type == JS_OBJECT && argv[1].u.obj) {
-            JsVal nxt = js_call(vm, argv[1], js_undefined(), 1, &cur);
-            vm->has_thrown = false;
-            return make_sync_promise(vm, nxt, false);
-        }
-        return this_val;
-    }
-    /* PROMISE_CATCH */
-    if (is_rej && argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj) {
-        JsVal nxt = js_call(vm, argv[0], js_undefined(), 1, &cur);
-        vm->has_thrown = false;
-        return make_sync_promise(vm, nxt, false);
-    }
-    return this_val;
-}
-
-static JsVal make_sync_promise(JsVm *vm, JsVal val, bool rejected) {
-    int sp = vm->temp_sp;
-    js_temp_push(vm, val);
-    vm->gc_pause++;
-    JsObj *p = js_map_new(vm, vm->object_proto);
-    if (p) {
-        js_set_prop(vm, js_obj_val(p), "_isPromise", js_bool(true));
-        js_set_prop(vm, js_obj_val(p), "_rej", js_bool(rejected));
-        js_set_prop(vm, js_obj_val(p), "_val", val);
-        js_define_native(vm, p, "then", fn_promise_chain, PROMISE_THEN);
-        js_define_native(vm, p, "catch", fn_promise_chain, PROMISE_CATCH);
-    }
-    vm->gc_pause--;
-    vm->temp_sp = sp;
-    return js_obj_val(p);
 }
 
 typedef enum {
@@ -1014,7 +1717,7 @@ typedef enum {
 static JsVal fn_fetch_resp(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     (void)argc; (void)argv;
     JsVal body = js_get_prop(vm, this_val, "_body");
-    if (magic == FETCH_RESP_TEXT) return make_sync_promise(vm, body, false);
+    if (magic == FETCH_RESP_TEXT) return js_obj_val(js_promise_new(vm, 1, body));
     /* FETCH_RESP_JSON */
     JsVal json_obj = js_get_prop(vm, js_obj_val(vm->global_obj), "JSON");
     JsVal parse_fn = js_get_prop(vm, json_obj, "parse");
@@ -1023,34 +1726,71 @@ static JsVal fn_fetch_resp(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
         JsVal tv = vm->thrown_val;
         vm->has_thrown = false;
         vm->thrown_val = js_undefined();
-        return make_sync_promise(vm, tv, true);
+        return js_obj_val(js_promise_new(vm, 2, tv));
     }
-    return make_sync_promise(vm, parsed, false);
+    return js_obj_val(js_promise_new(vm, 1, parsed));
 }
 
 static JsVal fn_fetch(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
     (void)this_val; (void)magic;
     if (argc == 0 || !vm->on_fetch) {
-        return make_sync_promise(vm, js_obj_val((JsObj *)js_str_cstr(vm, "fetch unavailable")), true);
+        return js_obj_val(js_promise_new(vm, 2, js_obj_val((JsObj *)js_str_cstr(vm, "fetch unavailable"))));
     }
     JsStr *url_s = js_to_str(vm, argv[0]);
     const char *method = "GET";
     const char *body   = NULL;
     JsStr *m_str = NULL, *b_str = NULL;
+    TbBuf hdr_buf;
+    tb_buf_init(&hdr_buf);
+    char ct_buf[128] = "";
+
     if (argc > 1 && argv[1].type == JS_OBJECT && argv[1].u.obj) {
         JsVal mv = js_get_prop(vm, argv[1], "method");
         if (mv.type != JS_UNDEFINED) { m_str = js_to_str(vm, mv); if (m_str) method = m_str->data; }
         JsVal bv = js_get_prop(vm, argv[1], "body");
-        if (bv.type != JS_UNDEFINED) { b_str = js_to_str(vm, bv); if (b_str) body = b_str->data; }
+        if (bv.type != JS_UNDEFINED && bv.type != JS_NULL) { b_str = js_to_str(vm, bv); if (b_str) body = b_str->data; }
+
+        JsVal hv = js_get_prop(vm, argv[1], "headers");
+        if (hv.type == JS_OBJECT && hv.u.obj) {
+            JsObj *ho = hv.u.obj;
+            if (ho->native_tag == NATIVE_TAG_HEADERS) {
+                JsVal mv_map = js_get_prop(vm, hv, "_map");
+                if (mv_map.type == JS_OBJECT && mv_map.u.obj && mv_map.u.obj->obj_type == OBJ_OBJECT) {
+                    ho = mv_map.u.obj;
+                }
+            }
+            if (ho->obj_type == OBJ_OBJECT) {
+                JsMapObj *hm = (JsMapObj *)ho;
+                for (uint32_t i = 0; i < hm->count; i++) {
+                    const char *hk = hm->props[i].key->data;
+                    if (!hk || hk[0] == '\x01' || hk[0] == '_') continue;
+                    JsStr *hvs = js_to_str(vm, hm->props[i].val);
+                    const char *hv_c = hvs ? hvs->data : "";
+                    if (tb_strcasecmp(hk, "content-type") == 0) {
+                        snprintf(ct_buf, sizeof(ct_buf), "%s", hv_c);
+                    } else {
+                        tb_buf_printf(&hdr_buf, "%s: %s\r\n", hk, hv_c);
+                    }
+                }
+            }
+        }
     }
+
+    vm->fetch_extra_headers = hdr_buf.len > 0 ? hdr_buf.data : NULL;
+    vm->fetch_content_type  = ct_buf[0] != '\0' ? ct_buf : NULL;
 
     int status = 0;
     char *text = NULL;
     bool ok = vm->on_fetch(vm->host_userdata, url_s ? url_s->data : "", method, body, &status, &text);
+
+    vm->fetch_extra_headers = NULL;
+    vm->fetch_content_type  = NULL;
+    tb_buf_free(&hdr_buf);
+
     if (!ok) {
         JsVal err = js_obj_val((JsObj *)js_str_cstr(vm, text ? text : "NetworkError"));
         tb_free(text);
-        return make_sync_promise(vm, err, true);
+        return js_obj_val(js_promise_new(vm, 2, err));
     }
 
     vm->gc_pause++;
@@ -1060,20 +1800,31 @@ static JsVal fn_fetch(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int
     if (ro) {
         js_set_prop(vm, js_obj_val(ro), "status", js_num((double)status));
         js_set_prop(vm, js_obj_val(ro), "ok", js_bool(status >= 200 && status < 300));
+        js_set_prop(vm, js_obj_val(ro), "url", js_obj_val((JsObj *)url_s));
         js_set_prop(vm, js_obj_val(ro), "_body", js_obj_val((JsObj *)bs));
+        if (vm->headers_proto) {
+            JsObj *rh = js_map_new(vm, vm->headers_proto);
+            if (rh) {
+                rh->native_tag = NATIVE_TAG_HEADERS;
+                js_set_prop(vm, js_obj_val(rh), "_map", js_obj_val(js_map_new(vm, NULL)));
+                js_set_prop(vm, js_obj_val(ro), "headers", js_obj_val(rh));
+            }
+        }
         js_define_native(vm, ro, "text", fn_fetch_resp, FETCH_RESP_TEXT);
         js_define_native(vm, ro, "json", fn_fetch_resp, FETCH_RESP_JSON);
     }
     vm->gc_pause--;
-    return make_sync_promise(vm, js_obj_val(ro), false);
+    return js_obj_val(js_promise_new(vm, 1, js_obj_val(ro)));
 }
 
 int js_run_timers(JsVm *vm) {
     if (!vm) return -1;
+    js_drain_microtasks(vm);
     int64_t now = js_now_ms();
     for (int i = 0; i < JS_MAX_TIMERS; i++) {
         if (vm->timers[i].active && vm->timers[i].due_ms <= now) {
             JsObj *fn = vm->timers[i].fn_obj;
+            bool is_raf = vm->timers[i].is_raf;
             if (vm->timers[i].repeat) {
                 vm->timers[i].due_ms = now + vm->timers[i].interval_ms;
             } else {
@@ -1082,7 +1833,13 @@ int js_run_timers(JsVm *vm) {
             }
             if (fn) {
                 vm->steps = 0;
-                js_call(vm, js_obj_val(fn), js_obj_val(vm->global_obj), 0, NULL);
+                if (is_raf) {
+                    JsVal ts = js_num((double)(now - vm->boot_ms));
+                    js_call(vm, js_obj_val(fn), js_obj_val(vm->global_obj), 1, &ts);
+                } else {
+                    js_call(vm, js_obj_val(fn), js_obj_val(vm->global_obj), 0, NULL);
+                }
+                js_drain_microtasks(vm);
                 if (vm->has_thrown) {
                     TbBuf eb;
                     tb_buf_init(&eb);
@@ -1111,8 +1868,9 @@ int js_run_timers(JsVm *vm) {
 
 void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     if (!vm) return;
-    vm->doc         = doc;
-    vm->current_url = url;
+    vm->doc           = doc;
+    vm->current_url   = url;
+    vm->pushed_url[0] = '\0';
     if (doc) {
         doc->on_node_destroy = on_dom_node_destroy;
         doc->userdata        = vm;
@@ -1123,6 +1881,7 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     g->native_tag = NATIVE_TAG_WINDOW;
     js_set_prop(vm, js_obj_val(g), "window", js_obj_val(g));
     js_set_prop(vm, js_obj_val(g), "self", js_obj_val(g));
+    js_set_prop(vm, js_obj_val(g), "globalThis", js_obj_val(g));
 
     /* Element.prototype methods */
     JsObj *ep = vm->elem_proto;
@@ -1132,14 +1891,27 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     js_define_native(vm, ep, "replaceChild", fn_dom_method, DOM_REPLACE_CHILD);
     js_define_native(vm, ep, "remove", fn_dom_method, DOM_REMOVE);
     js_define_native(vm, ep, "cloneNode", fn_dom_method, DOM_CLONE_NODE);
+    js_define_native(vm, ep, "contains", fn_dom_method, DOM_CONTAINS);
+    js_define_native(vm, ep, "append", fn_dom_method, DOM_APPEND);
+    js_define_native(vm, ep, "prepend", fn_dom_method, DOM_PREPEND);
+    js_define_native(vm, ep, "before", fn_dom_method, DOM_BEFORE);
+    js_define_native(vm, ep, "after", fn_dom_method, DOM_AFTER);
+    js_define_native(vm, ep, "replaceWith", fn_dom_method, DOM_REPLACE_WITH);
+    js_define_native(vm, ep, "replaceChildren", fn_dom_method, DOM_REPLACE_CHILDREN);
+    js_define_native(vm, ep, "insertAdjacentHTML", fn_dom_method, DOM_INSERT_ADJ_HTML);
+    js_define_native(vm, ep, "insertAdjacentElement", fn_dom_method, DOM_INSERT_ADJ_ELEMENT);
+    js_define_native(vm, ep, "insertAdjacentText", fn_dom_method, DOM_INSERT_ADJ_TEXT);
+    js_define_native(vm, ep, "getBoundingClientRect", fn_dom_method, DOM_GET_BOUNDING_RECT);
     js_define_native(vm, ep, "getAttribute", fn_dom_method, DOM_GET_ATTRIBUTE);
     js_define_native(vm, ep, "setAttribute", fn_dom_method, DOM_SET_ATTRIBUTE);
     js_define_native(vm, ep, "removeAttribute", fn_dom_method, DOM_REMOVE_ATTRIBUTE);
     js_define_native(vm, ep, "hasAttribute", fn_dom_method, DOM_HAS_ATTRIBUTE);
+    js_define_native(vm, ep, "toggleAttribute", fn_dom_method, DOM_TOGGLE_ATTRIBUTE);
     js_define_native(vm, ep, "matches", fn_dom_method, DOM_MATCHES);
     js_define_native(vm, ep, "closest", fn_dom_method, DOM_CLOSEST);
     js_define_native(vm, ep, "addEventListener", fn_dom_method, DOM_ADD_EVENT_LISTENER);
     js_define_native(vm, ep, "removeEventListener", fn_dom_method, DOM_REMOVE_EVENT_LISTENER);
+    js_define_native(vm, ep, "dispatchEvent", fn_dom_method, DOM_DISPATCH_EVENT);
     js_define_native(vm, ep, "click", fn_dom_method, DOM_CLICK);
     js_define_native(vm, ep, "focus", fn_dom_method, DOM_FOCUS_BLUR);
     js_define_native(vm, ep, "blur", fn_dom_method, DOM_FOCUS_BLUR);
@@ -1160,17 +1932,28 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     js_define_native(vm, vm->doc_obj, "getElementsByClassName", fn_dom_method, DOM_GET_ELEMENTS_BY_CLASS_NAME);
     js_define_native(vm, vm->doc_obj, "createElement", fn_dom_method, DOM_CREATE_ELEMENT);
     js_define_native(vm, vm->doc_obj, "createTextNode", fn_dom_method, DOM_CREATE_TEXT_NODE);
+    js_define_native(vm, vm->doc_obj, "createDocumentFragment", fn_dom_method, DOM_CREATE_DOCUMENT_FRAGMENT);
+    js_define_native(vm, vm->doc_obj, "createComment", fn_dom_method, DOM_CREATE_COMMENT);
     js_set_prop(vm, js_obj_val(g), "document", js_obj_val(vm->doc_obj));
 
-    /* window timers, alert, scrollTo, fetch */
+    /* window timers, rAF, getComputedStyle, matchMedia, Event, CustomEvent, alert, scrollTo, fetch */
     js_define_native(vm, g, "setTimeout", fn_window_api, WIN_SET_TIMEOUT);
     js_define_native(vm, g, "setInterval", fn_window_api, WIN_SET_INTERVAL);
     js_define_native(vm, g, "clearTimeout", fn_window_api, WIN_CLEAR_TIMER);
     js_define_native(vm, g, "clearInterval", fn_window_api, WIN_CLEAR_TIMER);
+    js_define_native(vm, g, "requestAnimationFrame", fn_window_api, WIN_RAF);
+    js_define_native(vm, g, "cancelAnimationFrame", fn_window_api, WIN_CANCEL_RAF);
+    js_define_native(vm, g, "getComputedStyle", fn_window_api, WIN_GET_COMPUTED_STYLE);
+    js_define_native(vm, g, "matchMedia", fn_window_api, WIN_MATCH_MEDIA);
+    js_define_native(vm, g, "Event", fn_event_ctrl, EV_CTOR);
+    js_define_native(vm, g, "CustomEvent", fn_event_ctrl, EV_CUSTOM_CTOR);
     js_define_native(vm, g, "alert", fn_window_api, WIN_ALERT);
     js_define_native(vm, g, "scrollTo", fn_window_api, WIN_SCROLL_TO);
+    js_define_native(vm, g, "scrollBy", fn_window_api, WIN_SCROLL_TO);
     js_define_native(vm, g, "fetch", fn_fetch, 0);
     js_define_native(vm, g, "addEventListener", fn_dom_method, DOM_ADD_EVENT_LISTENER);
+    js_define_native(vm, g, "removeEventListener", fn_dom_method, DOM_REMOVE_EVENT_LISTENER);
+    js_define_native(vm, g, "dispatchEvent", fn_dom_method, DOM_DISPATCH_EVENT);
 
     /* performance */
     JsObj *perf = js_map_new(vm, vm->object_proto);
@@ -1182,12 +1965,33 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     JsObj *loc = js_map_new(vm, vm->object_proto);
     loc->native_tag = NATIVE_TAG_LOCATION;
     js_define_native(vm, loc, "reload", fn_window_api, WIN_LOC_RELOAD);
+    js_define_native(vm, loc, "assign", fn_window_api, WIN_LOC_ASSIGN);
+    js_define_native(vm, loc, "replace", fn_window_api, WIN_LOC_REPLACE);
+    js_define_native(vm, loc, "toString", fn_window_api, WIN_LOC_TO_STRING);
     js_set_prop(vm, js_obj_val(g), "location", js_obj_val(loc));
+    js_set_prop(vm, js_obj_val(vm->doc_obj), "location", js_obj_val(loc));
+
+    /* history */
+    JsObj *hist = js_map_new(vm, vm->object_proto);
+    vm->history_obj = hist;
+    if (hist) {
+        js_set_prop(vm, js_obj_val(hist), "length", js_num(1));
+        js_set_prop(vm, js_obj_val(hist), "state", js_null());
+        js_define_native(vm, hist, "pushState", fn_window_api, WIN_HIST_PUSH_STATE);
+        js_define_native(vm, hist, "replaceState", fn_window_api, WIN_HIST_REPLACE_STATE);
+        js_define_native(vm, hist, "back", fn_window_api, WIN_HIST_BACK);
+        js_define_native(vm, hist, "forward", fn_window_api, WIN_HIST_FORWARD);
+        js_define_native(vm, hist, "go", fn_window_api, WIN_HIST_GO);
+        js_set_prop(vm, js_obj_val(g), "history", js_obj_val(hist));
+    }
 
     /* navigator */
     JsObj *nav = js_map_new(vm, vm->object_proto);
     js_set_prop(vm, js_obj_val(nav), "userAgent",
                 js_obj_val((JsObj *)js_str_cstr(vm, "TB/1.0 (Linux; TUI; TinyJS; <10MB)")));
+    js_set_prop(vm, js_obj_val(nav), "language",
+                js_obj_val((JsObj *)js_str_cstr(vm, "en-US")));
+    js_set_prop(vm, js_obj_val(nav), "onLine", js_bool(true));
     js_set_prop(vm, js_obj_val(g), "navigator", js_obj_val(nav));
 
     vm->gc_pause--;

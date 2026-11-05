@@ -74,6 +74,92 @@ void test_js_engine(void) {
     /* VM still healthy after step-limit exception */
     ASSERT_TRUE(js_eval(vm, "21 * 2", 6, &res) && res.type == JS_NUMBER && res.u.num == 42.0,
                 "VM recovers cleanly after step-limit RangeError");
+
+    /* Phase 1 & Phase 2: Classes, extends, super, static, async/await, Promises, Map/Set,
+     * Accessors, Object.defineProperty/fromEntries/hasOwn/is, rest/nested destructuring,
+     * computed keys, URL, URLSearchParams, localStorage/sessionStorage, atob/btoa, Headers,
+     * and modern Array/String methods */
+    const char *modern_js =
+        "/* 1. ES6 Class, extends, super, static, getters/setters */\n"
+        "class Shape {\n"
+        "  static kind = 'geom';\n"
+        "  constructor(name) { this.name = name; }\n"
+        "  describe() { return `Shape:${this.name}`; }\n"
+        "  static identify() { return this.kind; }\n"
+        "}\n"
+        "class Rect extends Shape {\n"
+        "  static kind = 'rect';\n"
+        "  constructor(w, h) { super('rect'); this.w = w; this.h = h; }\n"
+        "  get area() { return this.w * this.h; }\n"
+        "  set scale(f) { this.w *= f; this.h *= f; }\n"
+        "  describe() { return `${super.describe()}=${this.area}`; }\n"
+        "}\n"
+        "const rc = new Rect(3, 4);\n"
+        "rc.scale = 2;\n"
+        "const r_class = `${rc.describe()}|${Rect.identify()}|${rc instanceof Shape}|${rc instanceof Rect}`;\n"
+        "\n"
+        "/* 2. Map, Set, for..of, spread, destructuring rest & nested, computed keys */\n"
+        "const mp = new Map([['a', 10], ['b', 20]]);\n"
+        "mp.set('c', 30);\n"
+        "let mapSum = 0;\n"
+        "for (const [k, v] of mp) { mapSum += v; }\n"
+        "const st = new Set([1, 2, 2, 3, 1]);\n"
+        "const stArr = [...st];\n"
+        "const [head, ...tail] = [10, 20, 30, 40];\n"
+        "const { x: { y: deepY }, ...restObj } = { x: { y: 77 }, p: 1, q: 2 };\n"
+        "const dynKey = 'comp';\n"
+        "const compObj = { [dynKey + '_1']: 42, get dbl() { return this.comp_1 * 2; } };\n"
+        "const r_coll = `${mapSum}|${st.size}:${stArr.join(',')}|${head}:${tail.join(',')}|${deepY}:${Object.keys(restObj).join(',')}|${compObj.dbl}`;\n"
+        "\n"
+        "/* 3. Object.defineProperty, Object.fromEntries, Object.is, Object.hasOwn, Array & String methods */\n"
+        "const defTarget = {};\n"
+        "Object.defineProperty(defTarget, 'secret', { get() { return 123; } });\n"
+        "const fromEnt = Object.fromEntries([['k1', 'v1'], ['k2', 'v2']]);\n"
+        "const arrMod = [1, [2, [3]]].flat(2).flatMap(x => [x, x * 10]);\n"
+        "const arrCopy = [3, 1, 2].toSorted((a, b) => a - b);\n"
+        "const strMod = '  hello  '.trimStart().trimEnd() + ':' + 'abcdef'.at(-2) + ':' + [9, 8, 7].at(-1);\n"
+        "const r_intr = `${defTarget.secret}|${fromEnt.k2}|${Object.hasOwn(fromEnt, 'k1')}|${Object.is(NaN, NaN)}:${Object.is(+0, -0)}|${arrMod.join(',')}|${arrCopy.join('')}|${strMod}`;\n"
+        "\n"
+        "/* 4. Promise, async/await, queueMicrotask */\n"
+        "let order = [];\n"
+        "queueMicrotask(() => order.push('mt'));\n"
+        "async function computeAsync(v) {\n"
+        "  const a = await Promise.resolve(v + 1);\n"
+        "  const [b, c] = await Promise.all([Promise.resolve(a * 2), 10]);\n"
+        "  return b + c;\n"
+        "}\n"
+        "let asyncOut = 0;\n"
+        "computeAsync(4).then(v => { asyncOut = v; order.push('done'); });\n"
+        "js_drain_check = 1;\n"
+        "\n"
+        "/* 5. Web Globals: URL, URLSearchParams, localStorage, atob/btoa, encodeURI, Headers */\n"
+        "const u = new URL('/path/page?foo=1&bar=two#sec', 'https://example.com:8443/base/');\n"
+        "u.searchParams.append('baz', '3');\n"
+        "localStorage.setItem('theme', 'dark');\n"
+        "localStorage.user = 'alice';\n"
+        "const b64 = btoa('TinyBrowser!');\n"
+        "const unb64 = atob(b64);\n"
+        "const hdrs = new Headers({'X-Custom': 'val1', 'Content-Type': 'text/plain'});\n"
+        "hdrs.append('X-Custom', 'val2');\n"
+        "const r_web = `${u.origin}|${u.pathname}|${u.searchParams.get('bar')}|${u.searchParams.toString()}|${localStorage.getItem('theme')}:${localStorage.user}:${localStorage.length}|${unb64}|${hdrs.get('x-custom')}`;\n"
+        "\n"
+        "JSON.stringify({ r_class, r_coll, r_intr, r_web, asyncOut, order: order.join(',') });";
+
+    JsVal mres = js_undefined();
+    bool mok = js_eval(vm, modern_js, strlen(modern_js), &mres);
+    ASSERT_TRUE(mok && mres.type == JS_OBJECT && mres.u.obj->obj_type == OBJ_STRING,
+                "Modern ES6+ & Web APIs suite evaluates without error");
+    if (mok && mres.type == JS_OBJECT && mres.u.obj->obj_type == OBJ_STRING) {
+        const char *got = ((JsStr *)mres.u.obj)->data;
+        const char *exp =
+            "{\"r_class\":\"Shape:rect=48|rect|true|true\","
+            "\"r_coll\":\"60|3:1,2,3|10:20,30,40|77:p,q|84\","
+            "\"r_intr\":\"123|v2|true|true:false|1,10,2,20,3,30|123|hello:e:7\","
+            "\"r_web\":\"https://example.com:8443|/path/page|two|foo=1&bar=two&baz=3|dark:alice:2|TinyBrowser!|val1, val2\","
+            "\"asyncOut\":20,\"order\":\"mt,done\"}";
+        ASSERT_STR_EQ(got, exp, "Exact modern ES6+ & Web APIs output verification");
+    }
+
     js_vm_free(vm);
 }
 

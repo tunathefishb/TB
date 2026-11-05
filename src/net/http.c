@@ -121,15 +121,194 @@ void tb_net_cleanup(void) {
         g_ssl.handle = NULL;
     }
     g_ssl.tried = false;
+    tb_cookies_clear();
 }
 
 #else /* Default: Built-in Zero-Dependency TLS 1.3 + X.509 */
 
 void tb_net_cleanup(void) {
     /* Stateless in-tree TLS 1.3 keeps 0 KB persistent global state */
+    tb_cookies_clear();
 }
 
 #endif
+
+/* ============================================================================
+ * Session Cookie Jar (RFC 6265 subset)
+ * ============================================================================ */
+
+#define TB_MAX_COOKIES 64
+
+typedef struct {
+    char name[64];
+    char value[256];
+    char domain[128];
+    char path[128];
+    bool secure;
+    bool http_only;
+    bool host_only;
+} TbCookie;
+
+static TbCookie g_cookies[TB_MAX_COOKIES];
+static int      g_cookie_count = 0;
+
+void tb_cookies_clear(void) {
+    g_cookie_count = 0;
+}
+
+static bool cookie_domain_matches(const char *req_host, const char *cookie_domain, bool host_only) {
+    if (!req_host || !cookie_domain || !*req_host || !*cookie_domain) return false;
+    if (tb_strcasecmp(req_host, cookie_domain) == 0) return true;
+    if (host_only) return false;
+    size_t hlen = strlen(req_host);
+    size_t dlen = strlen(cookie_domain);
+    if (hlen > dlen && req_host[hlen - dlen - 1] == '.' &&
+        tb_strcasecmp(req_host + hlen - dlen, cookie_domain) == 0) {
+        return true;
+    }
+    return false;
+}
+
+static bool cookie_path_matches(const char *req_path, const char *cookie_path) {
+    if (!cookie_path || !*cookie_path || strcmp(cookie_path, "/") == 0) return true;
+    if (!req_path || !*req_path) req_path = "/";
+    /* Strip query string from req_path before comparing */
+    const char *q = strchr(req_path, '?');
+    size_t rlen = q ? (size_t)(q - req_path) : strlen(req_path);
+    size_t clen = strlen(cookie_path);
+    if (rlen < clen) return false;
+    if (strncmp(req_path, cookie_path, clen) != 0) return false;
+    if (rlen == clen) return true;
+    if (cookie_path[clen - 1] == '/') return true;
+    if (req_path[clen] == '/') return true;
+    return false;
+}
+
+void tb_cookie_set_from_header(const TbUrl *req_url, const char *set_cookie_val, bool from_js) {
+    if (!req_url || !set_cookie_val || !*set_cookie_val) return;
+    const char *host = req_url->host[0] ? req_url->host : "localhost";
+
+    const char *p = set_cookie_val;
+    while (*p && tb_isspace(*p)) p++;
+    const char *semi = strchr(p, ';');
+    size_t pair_len = semi ? (size_t)(semi - p) : strlen(p);
+    const char *eq = memchr(p, '=', pair_len);
+    if (!eq || eq == p) return;
+
+    size_t nlen = (size_t)(eq - p);
+    while (nlen > 0 && tb_isspace(p[nlen - 1])) nlen--;
+    if (nlen == 0 || nlen >= sizeof(g_cookies[0].name)) return;
+
+    const char *vstart = eq + 1;
+    size_t vlen = pair_len - (size_t)(vstart - p);
+    while (vlen > 0 && tb_isspace(*vstart)) { vstart++; vlen--; }
+    while (vlen > 0 && tb_isspace(vstart[vlen - 1])) vlen--;
+    if (vlen >= sizeof(g_cookies[0].value)) vlen = sizeof(g_cookies[0].value) - 1;
+
+    TbCookie c;
+    memset(&c, 0, sizeof(c));
+    memcpy(c.name, p, nlen);
+    c.name[nlen] = '\0';
+    memcpy(c.value, vstart, vlen);
+    c.value[vlen] = '\0';
+    snprintf(c.domain, sizeof(c.domain), "%s", host);
+    strcpy(c.path, "/");
+    c.host_only = true;
+    bool delete_cookie = false;
+
+    const char *attr_p = semi ? semi + 1 : NULL;
+    while (attr_p && *attr_p) {
+        while (*attr_p && tb_isspace(*attr_p)) attr_p++;
+        if (!*attr_p) break;
+        const char *next_semi = strchr(attr_p, ';');
+        size_t alen = next_semi ? (size_t)(next_semi - attr_p) : strlen(attr_p);
+        const char *aeq = memchr(attr_p, '=', alen);
+        if (aeq) {
+            size_t aklen = (size_t)(aeq - attr_p);
+            while (aklen > 0 && tb_isspace(attr_p[aklen - 1])) aklen--;
+            const char *av = aeq + 1;
+            size_t avlen = alen - (size_t)(av - attr_p);
+            while (avlen > 0 && tb_isspace(*av)) { av++; avlen--; }
+            while (avlen > 0 && tb_isspace(av[avlen - 1])) avlen--;
+
+            if (aklen == 4 && tb_strncasecmp(attr_p, "Path", 4) == 0 && avlen > 0 && avlen < sizeof(c.path)) {
+                memcpy(c.path, av, avlen);
+                c.path[avlen] = '\0';
+            } else if (aklen == 6 && tb_strncasecmp(attr_p, "Domain", 6) == 0 && avlen > 0) {
+                if (*av == '.') { av++; avlen--; }
+                if (avlen > 0 && avlen < sizeof(c.domain)) {
+                    memcpy(c.domain, av, avlen);
+                    c.domain[avlen] = '\0';
+                    c.host_only = false;
+                }
+            } else if (aklen == 7 && tb_strncasecmp(attr_p, "Max-Age", 7) == 0 && avlen > 0) {
+                char mbuf[32];
+                size_t ml = avlen < sizeof(mbuf) - 1 ? avlen : sizeof(mbuf) - 1;
+                memcpy(mbuf, av, ml);
+                mbuf[ml] = '\0';
+                long ma = strtol(mbuf, NULL, 10);
+                if (ma <= 0) delete_cookie = true;
+            }
+        } else {
+            size_t aklen = alen;
+            while (aklen > 0 && tb_isspace(attr_p[aklen - 1])) aklen--;
+            if (aklen == 6 && tb_strncasecmp(attr_p, "Secure", 6) == 0) {
+                c.secure = true;
+            } else if (aklen == 8 && tb_strncasecmp(attr_p, "HttpOnly", 8) == 0) {
+                c.http_only = true;
+            }
+        }
+        attr_p = next_semi ? next_semi + 1 : NULL;
+    }
+
+    if (from_js && c.http_only) return;
+
+    /* Find existing cookie with same name, domain, path */
+    for (int i = 0; i < g_cookie_count; i++) {
+        if (strcmp(g_cookies[i].name, c.name) == 0 &&
+            tb_strcasecmp(g_cookies[i].domain, c.domain) == 0 &&
+            strcmp(g_cookies[i].path, c.path) == 0) {
+            if (from_js && g_cookies[i].http_only) return;
+            if (delete_cookie) {
+                for (int j = i; j + 1 < g_cookie_count; j++) g_cookies[j] = g_cookies[j + 1];
+                g_cookie_count--;
+            } else {
+                g_cookies[i] = c;
+            }
+            return;
+        }
+    }
+
+    if (delete_cookie) return;
+    if (g_cookie_count >= TB_MAX_COOKIES) {
+        for (int j = 0; j + 1 < TB_MAX_COOKIES; j++) g_cookies[j] = g_cookies[j + 1];
+        g_cookie_count = TB_MAX_COOKIES - 1;
+    }
+    g_cookies[g_cookie_count++] = c;
+}
+
+void tb_cookie_get_for_url(const TbUrl *req_url, bool for_js, char *out, size_t cap) {
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!req_url) return;
+    const char *host = req_url->host[0] ? req_url->host : "localhost";
+    const char *path = req_url->path[0] ? req_url->path : "/";
+    bool is_https = (strcmp(req_url->scheme, "https") == 0);
+
+    size_t pos = 0;
+    for (int i = 0; i < g_cookie_count; i++) {
+        const TbCookie *c = &g_cookies[i];
+        if (for_js && c->http_only) continue;
+        if (c->secure && !is_https) continue;
+        if (!cookie_domain_matches(host, c->domain, c->host_only)) continue;
+        if (!cookie_path_matches(path, c->path)) continue;
+
+        int n = snprintf(out + pos, cap - pos, "%s%s=%s",
+                         pos > 0 ? "; " : "", c->name, c->value);
+        if (n < 0 || (size_t)n >= cap - pos) break;
+        pos += (size_t)n;
+    }
+}
 
 void tb_response_free(TbResponse *resp) {
     if (!resp) return;
@@ -202,7 +381,7 @@ static bool decode_chunked(const char *in, size_t in_len, char **out, size_t *ou
 
 static void build_http_request(TbBuf *req, const TbUrl *u, bool is_https,
                                const char *method, const char *post_body,
-                               const char *post_ctype) {
+                               const char *post_ctype, const char *extra_headers) {
     tb_buf_init(req);
     bool is_v6 = (strchr(u->host, ':') != NULL);
     const char *lb = is_v6 ? "[" : "";
@@ -216,16 +395,31 @@ static void build_http_request(TbBuf *req, const TbUrl *u, bool is_https,
                        "Accept: text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.8\r\n"
                        "Accept-Encoding: gzip, deflate\r\n"
                        "Connection: close\r\n");
+    char cookie_hdr[1024];
+    tb_cookie_get_for_url(u, false, cookie_hdr, sizeof(cookie_hdr));
+    if (cookie_hdr[0] != '\0') {
+        tb_buf_printf(req, "Cookie: %s\r\n", cookie_hdr);
+    }
+    if (extra_headers && *extra_headers) {
+        tb_buf_append_cstr(req, extra_headers);
+        size_t elen = strlen(extra_headers);
+        if (elen < 2 || extra_headers[elen - 1] != '\n') {
+            tb_buf_append_cstr(req, "\r\n");
+        }
+    }
     size_t blen = post_body ? strlen(post_body) : 0;
     if (blen > 0 || strcmp(method, "POST") == 0) {
-        tb_buf_printf(req, "Content-Type: %s\r\nContent-Length: %zu\r\n",
-                      post_ctype ? post_ctype : "application/x-www-form-urlencoded", blen);
+        if (!extra_headers || !strstr(extra_headers, "Content-Type:")) {
+            tb_buf_printf(req, "Content-Type: %s\r\n",
+                          post_ctype ? post_ctype : "application/x-www-form-urlencoded");
+        }
+        tb_buf_printf(req, "Content-Length: %zu\r\n", blen);
     }
     tb_buf_append_cstr(req, "\r\n");
     if (blen > 0) tb_buf_append(req, post_body, blen);
 }
 
-static void parse_http_headers(const char *hdr_data, size_t hdr_len,
+static void parse_http_headers(const TbUrl *req_url, const char *hdr_data, size_t hdr_len,
                                TbResponse *resp, char *location, size_t loc_cap,
                                char *encoding, size_t enc_cap, bool *out_chunked) {
     int status = 0;
@@ -262,6 +456,12 @@ static void parse_http_headers(const char *hdr_data, size_t hdr_len,
                 snprintf(encoding, enc_cap, "%.*s", (int)vlen, val);
             } else if (klen == 17 && tb_strncasecmp(line, "Transfer-Encoding", 17) == 0) {
                 if (vlen >= 7 && tb_strncasecmp(val, "chunked", 7) == 0) *out_chunked = true;
+            } else if (klen == 10 && tb_strncasecmp(line, "Set-Cookie", 10) == 0) {
+                char scbuf[512];
+                size_t sclen = vlen < sizeof(scbuf) - 1 ? vlen : sizeof(scbuf) - 1;
+                memcpy(scbuf, val, sclen);
+                scbuf[sclen] = '\0';
+                tb_cookie_set_from_header(req_url, scbuf, false);
             }
         }
         hpos = nl ? (size_t)(nl - hdr_data) + 1 : hdr_len;
@@ -270,6 +470,12 @@ static void parse_http_headers(const char *hdr_data, size_t hdr_len,
 
 bool tb_fetch(const char *url, const char *method, const char *post_body,
               const char *post_ctype, bool insecure_tls, TbResponse *resp) {
+    return tb_fetch_ex(url, method, post_body, post_ctype, NULL, insecure_tls, resp);
+}
+
+bool tb_fetch_ex(const char *url, const char *method, const char *post_body,
+                 const char *post_ctype, const char *extra_headers,
+                 bool insecure_tls, TbResponse *resp) {
     if (!resp) return false;
     memset(resp, 0, sizeof(*resp));
     if (!url || !*url) {
@@ -349,7 +555,7 @@ bool tb_fetch(const char *url, const char *method, const char *post_body,
 #endif
 
         TbBuf req;
-        build_http_request(&req, &u, is_https, method, post_body, post_ctype);
+        build_http_request(&req, &u, is_https, method, post_body, post_ctype, extra_headers);
 
         bool write_ok = true;
 #if defined(TB_TLS_OPENSSL) && TB_TLS_OPENSSL
@@ -448,7 +654,7 @@ bool tb_fetch(const char *url, const char *method, const char *post_body,
         char location[1024];
         char encoding[64];
         bool chunked = false;
-        parse_http_headers(raw.data, hdr_len, resp,
+        parse_http_headers(&u, raw.data, hdr_len, resp,
                            location, sizeof(location),
                            encoding, sizeof(encoding), &chunked);
 

@@ -13,7 +13,8 @@ typedef enum {
     DOM_NODE_DOCUMENT = 0,
     DOM_NODE_ELEMENT,
     DOM_NODE_TEXT,
-    DOM_NODE_COMMENT
+    DOM_NODE_COMMENT,
+    DOM_NODE_FRAGMENT
 } DomNodeType;
 
 typedef enum {
@@ -53,6 +54,10 @@ typedef struct DomNode {
     uint16_t        attr_count;
     uint16_t        attr_cap;
 
+    DomAttr        *css_vars;     /* Custom CSS properties (--*) on this node */
+    uint16_t        css_var_count;
+    uint16_t        css_var_cap;
+
     struct DomDocument *owner_doc;
     struct DomNode     *parent;
     struct DomNode     *first_child;
@@ -61,6 +66,12 @@ typedef struct DomNode {
     struct DomNode     *next_sibling;
 
     CssStyle        style;
+
+    /* Cached layout box geometry (updated by layout_build) */
+    int16_t         box_x;
+    int16_t         box_y;
+    int16_t         box_w;
+    int16_t         box_h;
 
     /* Live form control state */
     char           *form_value;
@@ -104,6 +115,7 @@ DomDocument *dom_parse_html(const char *html, size_t len);
 
 DomNode *dom_create_element(DomDocument *doc, const char *tag_name);
 DomNode *dom_create_text(DomDocument *doc, const char *text);
+DomNode *dom_create_fragment(DomDocument *doc);
 void     dom_node_free(DomNode *node);
 
 bool     dom_append_child(DomNode *parent, DomNode *child);
@@ -118,10 +130,17 @@ bool        dom_has_attr(const DomNode *node, const char *name);
 void        dom_set_attr(DomNode *node, const char *name, const char *value);
 void        dom_remove_attr(DomNode *node, const char *name);
 
+const char *dom_get_css_var(const DomNode *node, const char *name);
+void        dom_set_css_var(DomNode *node, const char *name, const char *value);
+void        dom_clear_css_vars(DomNode *node);
+
 char *dom_get_text_content(const DomNode *node);
 void  dom_set_text_content(DomNode *node, const char *text);
 char *dom_get_inner_html(const DomNode *node);
 void  dom_set_inner_html(DomNode *node, const char *html);
+char *dom_get_outer_html(const DomNode *node);
+void  dom_set_outer_html(DomNode *node, const char *html);
+void  dom_insert_adjacent_html(DomNode *node, const char *position, const char *html);
 char *dom_decode_entities(const char *src, size_t len);
 
 /* Class list helpers */

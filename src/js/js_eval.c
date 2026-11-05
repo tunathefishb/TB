@@ -42,6 +42,44 @@ static JsStr *chunk_js_str(JsVm *vm, const JsChunk *ch, uint32_t str_id) {
 static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx);
 static EvalRes eval_stmt(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx);
 
+static void hoist_pattern_rec(JsVm *vm, JsChunk *ch, JsEnv *func_env, uint32_t pat) {
+    if (!pat) return;
+    const AstNode *pn = &ch->nodes[pat];
+    if (pn->kind == AST_IDENT) {
+        JsStr *nm = chunk_js_str(vm, ch, pn->a);
+        bool exists = false;
+        for (uint16_t i = 0; i < func_env->count; i++) {
+            if (func_env->vars[i].name->len == nm->len &&
+                memcmp(func_env->vars[i].name->data, nm->data, nm->len) == 0) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) js_env_define(vm, func_env, nm, js_undefined(), DECL_VAR);
+    } else if (pn->kind == AST_DESTRUCT_ARR) {
+        for (uint32_t cur = pn->a; cur != 0; cur = ch->nodes[cur].next) {
+            const AstNode *it = &ch->nodes[cur];
+            if (it->kind == AST_EMPTY) continue;
+            if (it->flags & DESTRUCT_FLAG_NESTED) {
+                hoist_pattern_rec(vm, ch, func_env, it->a);
+            } else {
+                JsStr *nm = chunk_js_str(vm, ch, it->a);
+                js_env_define(vm, func_env, nm, js_undefined(), DECL_VAR);
+            }
+        }
+    } else if (pn->kind == AST_DESTRUCT_OBJ) {
+        for (uint32_t cur = pn->a; cur != 0; cur = ch->nodes[cur].next) {
+            const AstNode *it = &ch->nodes[cur];
+            if (it->flags & DESTRUCT_FLAG_NESTED) {
+                hoist_pattern_rec(vm, ch, func_env, it->b);
+            } else {
+                JsStr *nm = chunk_js_str(vm, ch, it->b);
+                js_env_define(vm, func_env, nm, js_undefined(), DECL_VAR);
+            }
+        }
+    }
+}
+
 /* Pre-bind `var` declarations to `undefined` across nested control-flow blocks */
 static void hoist_vars_rec(JsVm *vm, JsChunk *ch, JsEnv *func_env, uint32_t stmt_idx) {
     for (uint32_t cur = stmt_idx; cur != 0; cur = ch->nodes[cur].next) {
@@ -50,19 +88,7 @@ static void hoist_vars_rec(JsVm *vm, JsChunk *ch, JsEnv *func_env, uint32_t stmt
             case AST_VAR_DECL:
                 if (n->flags == DECL_VAR) {
                     for (uint32_t d = n->a; d != 0; d = ch->nodes[d].next) {
-                        uint32_t pat = ch->nodes[d].a;
-                        if (pat && ch->nodes[pat].kind == AST_IDENT) {
-                            JsStr *nm = chunk_js_str(vm, ch, ch->nodes[pat].a);
-                            bool exists = false;
-                            for (uint16_t i = 0; i < func_env->count; i++) {
-                                if (func_env->vars[i].name->len == nm->len &&
-                                    memcmp(func_env->vars[i].name->data, nm->data, nm->len) == 0) {
-                                    exists = true;
-                                    break;
-                                }
-                            }
-                            if (!exists) js_env_define(vm, func_env, nm, js_undefined(), DECL_VAR);
-                        }
+                        hoist_pattern_rec(vm, ch, func_env, ch->nodes[d].a);
                     }
                 }
                 break;
@@ -86,9 +112,8 @@ static void hoist_vars_rec(JsVm *vm, JsChunk *ch, JsEnv *func_env, uint32_t stmt
             }
             case AST_FOR_IN:
             case AST_FOR_OF:
-                if (n->flags == DECL_VAR && n->a && ch->nodes[n->a].kind == AST_IDENT) {
-                    JsStr *nm = chunk_js_str(vm, ch, ch->nodes[n->a].a);
-                    js_env_define(vm, func_env, nm, js_undefined(), DECL_VAR);
+                if (n->flags == DECL_VAR && n->a) {
+                    hoist_pattern_rec(vm, ch, func_env, n->a);
                 }
                 hoist_vars_rec(vm, ch, func_env, n->c);
                 break;
@@ -117,6 +142,7 @@ static void hoist_functions(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t first_st
             if (fn_node->a != UINT32_MAX) {
                 JsStr *nm  = chunk_js_str(vm, ch, fn_node->a);
                 JsObj *fno = js_func_new(vm, ch, n->a, env, false);
+                if (fno) ((JsFuncObj *)fno)->is_async = (fn_node->flags & FUNC_FLAG_ASYNC) != 0;
                 if (nm && fno) {
                     js_env_define(vm, env, nm, js_obj_val(fno), decl_kind);
                 }
@@ -202,6 +228,7 @@ static JsVal apply_binop(JsVm *vm, AstOp op, JsVal lv, JsVal rv) {
             if (lv.u.obj->obj_type == OBJ_OBJECT) cur = ((JsMapObj *)lv.u.obj)->proto;
             else if (lv.u.obj->obj_type == OBJ_ARRAY) cur = ((JsArrObj *)lv.u.obj)->proto;
             else if (lv.u.obj->obj_type == OBJ_FUNC) cur = ((JsFuncObj *)lv.u.obj)->proto;
+            else if (lv.u.obj->obj_type == OBJ_NATIVE_FN) cur = ((JsNativeFnObj *)lv.u.obj)->proto;
             else if (lv.u.obj->obj_type == OBJ_REGEX) cur = ((JsRegexObj *)lv.u.obj)->proto;
             int guard = 0;
             while (cur && guard++ < 16) {
@@ -232,25 +259,88 @@ static EvalRes bind_pattern(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t pat_idx,
     int sp = vm->temp_sp;
     js_temp_push(vm, val);
     if (pn->kind == AST_DESTRUCT_ARR) {
+        JsVal src_arr = val;
+        if (!(val.type == JS_OBJECT && val.u.obj && val.u.obj->obj_type == OBJ_ARRAY)) {
+            JsObj *conv = js_iterable_to_array(vm, val);
+            if (conv) {
+                src_arr = js_obj_val(conv);
+                js_temp_push(vm, src_arr);
+            }
+        }
         uint32_t idx = 0;
         for (uint32_t cur = pn->a; cur != 0; cur = ch->nodes[cur].next, idx++) {
             const AstNode *it = &ch->nodes[cur];
             if (it->kind == AST_EMPTY) continue;
-            JsVal elem = js_get_index(vm, val, idx);
+            if (it->flags & DESTRUCT_FLAG_REST) {
+                uint32_t len = (src_arr.type == JS_OBJECT && src_arr.u.obj &&
+                                src_arr.u.obj->obj_type == OBJ_ARRAY)
+                                   ? ((JsArrObj *)src_arr.u.obj)->len : 0;
+                JsObj *rest = js_arr_new(vm, len > idx ? len - idx : 0);
+                js_temp_push(vm, js_obj_val(rest));
+                for (uint32_t ri = idx; ri < len; ri++) {
+                    js_arr_push(vm, rest, js_get_index(vm, src_arr, ri));
+                }
+                if (it->flags & DESTRUCT_FLAG_NESTED) {
+                    EvalRes nr = bind_pattern(vm, ch, env, it->a, js_obj_val(rest), decl_kind, is_assign);
+                    if (nr.flow != FLOW_NONE) { vm->temp_sp = sp; return nr; }
+                } else {
+                    JsStr *nm = chunk_js_str(vm, ch, it->a);
+                    if (is_assign) js_env_assign(vm, env, nm, js_obj_val(rest));
+                    else js_env_define(vm, env, nm, js_obj_val(rest), decl_kind);
+                    if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+                }
+                break;
+            }
+            JsVal elem = js_get_index(vm, src_arr, idx);
             if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
             if (elem.type == JS_UNDEFINED && it->b) {
                 EvalRes dr = eval_expr(vm, ch, env, it->b);
                 if (dr.flow != FLOW_NONE) { vm->temp_sp = sp; return dr; }
                 elem = dr.val;
             }
-            JsStr *nm = chunk_js_str(vm, ch, it->a);
-            if (is_assign) js_env_assign(vm, env, nm, elem);
-            else js_env_define(vm, env, nm, elem, decl_kind);
-            if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+            if (it->flags & DESTRUCT_FLAG_NESTED) {
+                EvalRes nr = bind_pattern(vm, ch, env, it->a, elem, decl_kind, is_assign);
+                if (nr.flow != FLOW_NONE) { vm->temp_sp = sp; return nr; }
+            } else {
+                JsStr *nm = chunk_js_str(vm, ch, it->a);
+                if (is_assign) js_env_assign(vm, env, nm, elem);
+                else js_env_define(vm, env, nm, elem, decl_kind);
+                if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+            }
         }
     } else if (pn->kind == AST_DESTRUCT_OBJ) {
         for (uint32_t cur = pn->a; cur != 0; cur = ch->nodes[cur].next) {
             const AstNode *it = &ch->nodes[cur];
+            if (it->flags & DESTRUCT_FLAG_REST) {
+                JsObj *rest = js_map_new(vm, vm->object_proto);
+                js_temp_push(vm, js_obj_val(rest));
+                if (val.type == JS_OBJECT && val.u.obj && val.u.obj->obj_type == OBJ_OBJECT) {
+                    JsMapObj *m = (JsMapObj *)val.u.obj;
+                    for (uint32_t i = 0; i < m->count; i++) {
+                        JsStr *k = m->props[i].key;
+                        if (k->len > 0 && k->data[0] == '\x01') continue;
+                        if (m->native_tag != 0 && k->len > 0 && k->data[0] == '_') continue;
+                        bool taken = false;
+                        for (uint32_t prev = pn->a; prev != cur && prev != 0; prev = ch->nodes[prev].next) {
+                            const AstNode *pit = &ch->nodes[prev];
+                            if (pit->flags & DESTRUCT_FLAG_REST) continue;
+                            JsStr *pk = chunk_js_str(vm, ch, pit->a);
+                            if (pk && pk->len == k->len && memcmp(pk->data, k->data, k->len) == 0) {
+                                taken = true;
+                                break;
+                            }
+                        }
+                        if (!taken) {
+                            js_set_prop_str(vm, js_obj_val(rest), k, m->props[i].val);
+                        }
+                    }
+                }
+                JsStr *dst_nm = chunk_js_str(vm, ch, it->b);
+                if (is_assign) js_env_assign(vm, env, dst_nm, js_obj_val(rest));
+                else js_env_define(vm, env, dst_nm, js_obj_val(rest), decl_kind);
+                if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+                break;
+            }
             JsStr *key_nm = chunk_js_str(vm, ch, it->a);
             JsVal prop    = js_get_prop_str(vm, val, key_nm);
             if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
@@ -259,10 +349,15 @@ static EvalRes bind_pattern(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t pat_idx,
                 if (dr.flow != FLOW_NONE) { vm->temp_sp = sp; return dr; }
                 prop = dr.val;
             }
-            JsStr *dst_nm = chunk_js_str(vm, ch, it->b);
-            if (is_assign) js_env_assign(vm, env, dst_nm, prop);
-            else js_env_define(vm, env, dst_nm, prop, decl_kind);
-            if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+            if (it->flags & DESTRUCT_FLAG_NESTED) {
+                EvalRes nr = bind_pattern(vm, ch, env, it->b, prop, decl_kind, is_assign);
+                if (nr.flow != FLOW_NONE) { vm->temp_sp = sp; return nr; }
+            } else {
+                JsStr *dst_nm = chunk_js_str(vm, ch, it->b);
+                if (is_assign) js_env_assign(vm, env, dst_nm, prop);
+                else js_env_define(vm, env, dst_nm, prop, decl_kind);
+                if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+            }
         }
     }
     vm->temp_sp = sp;
@@ -277,8 +372,11 @@ static EvalRes eval_arg_list_onto_roots(JsVm *vm, JsChunk *ch, JsEnv *env,
         if (an->kind == AST_SPREAD) {
             EvalRes sr = eval_expr(vm, ch, env, an->a);
             if (sr.flow != FLOW_NONE) return sr;
-            if (sr.val.type == JS_OBJECT && sr.val.u.obj && sr.val.u.obj->obj_type == OBJ_ARRAY) {
-                JsArrObj *arr = (JsArrObj *)sr.val.u.obj;
+            JsObj *arr_obj = (sr.val.type == JS_OBJECT && sr.val.u.obj && sr.val.u.obj->obj_type == OBJ_ARRAY)
+                                 ? sr.val.u.obj
+                                 : js_iterable_to_array(vm, sr.val);
+            if (arr_obj && arr_obj->obj_type == OBJ_ARRAY) {
+                JsArrObj *arr = (JsArrObj *)arr_obj;
                 for (uint32_t i = 0; i < arr->len; i++) {
                     if (!js_temp_push(vm, arr->items[i])) break;
                     argc++;
@@ -293,6 +391,180 @@ static EvalRes eval_arg_list_onto_roots(JsVm *vm, JsChunk *ch, JsEnv *env,
     }
     *out_argc = argc;
     return res_ok(js_undefined());
+}
+
+static EvalRes init_class_instance_fields(JsVm *vm, JsFuncObj *ctor, JsVal inst_v) {
+    if (!ctor || !ctor->chunk || ctor->field_init_idx == 0) return res_ok(inst_v);
+    if (inst_v.type != JS_OBJECT || !inst_v.u.obj) return res_ok(inst_v);
+    JsChunk *ch = ctor->chunk;
+    int env_mark = vm->env_sp;
+    int sp = vm->temp_sp;
+    js_temp_push(vm, inst_v);
+    JsEnv *fenv = js_env_new(vm, ctor->closure ? ctor->closure : vm->global_env,
+                             true, true, inst_v);
+    if (!fenv || !push_env(vm, fenv)) {
+        vm->temp_sp = sp;
+        return absorb_vm_throw(vm);
+    }
+    fenv->callee_fn = (JsObj *)ctor;
+    for (uint32_t p = ctor->field_init_idx; p != 0; p = ch->nodes[p].next) {
+        const AstNode *pn = &ch->nodes[p];
+        if (!(pn->flags & PROP_FLAG_FIELD) || (pn->flags & PROP_FLAG_STATIC)) continue;
+        int psp = vm->temp_sp;
+        JsStr *ks = NULL;
+        if (pn->flags & PROP_FLAG_COMPUTED) {
+            EvalRes kr = eval_expr(vm, ch, fenv, pn->a);
+            if (kr.flow != FLOW_NONE) { vm->env_sp = env_mark; vm->temp_sp = sp; return kr; }
+            ks = js_to_str(vm, kr.val);
+        } else {
+            ks = chunk_js_str(vm, ch, pn->a);
+        }
+        if (ks) js_temp_push(vm, js_obj_val((JsObj *)ks));
+        JsVal fval = js_undefined();
+        if (pn->b) {
+            EvalRes vr = eval_expr(vm, ch, fenv, pn->b);
+            if (vr.flow != FLOW_NONE) { vm->env_sp = env_mark; vm->temp_sp = sp; return vr; }
+            fval = vr.val;
+        }
+        if (ks) js_set_prop_str(vm, inst_v, ks, fval);
+        vm->temp_sp = psp;
+        if (vm->has_thrown) { vm->env_sp = env_mark; vm->temp_sp = sp; return absorb_vm_throw(vm); }
+    }
+    vm->env_sp = env_mark;
+    vm->temp_sp = sp;
+    return res_ok(inst_v);
+}
+
+static JsObj *resolve_super_proto(JsVm *vm, JsEnv *tenv, bool *out_is_static) {
+    if (out_is_static) *out_is_static = false;
+    if (!tenv || !tenv->callee_fn || tenv->callee_fn->obj_type != OBJ_FUNC) return vm->object_proto;
+    JsFuncObj *cfn = (JsFuncObj *)tenv->callee_fn;
+    if (cfn->home_proto) {
+        if (cfn->home_proto->obj_type == OBJ_OBJECT) {
+            return ((JsMapObj *)cfn->home_proto)->proto;
+        }
+        if (cfn->home_proto->obj_type == OBJ_FUNC) {
+            if (out_is_static) *out_is_static = true;
+            return ((JsFuncObj *)cfn->home_proto)->super_ctor
+                       ? ((JsFuncObj *)cfn->home_proto)->super_ctor
+                       : vm->function_proto;
+        }
+    }
+    if (cfn->super_ctor) {
+        JsVal sp = js_get_prop(vm, js_obj_val(cfn->super_ctor), "prototype");
+        if (sp.type == JS_OBJECT && sp.u.obj) return sp.u.obj;
+    }
+    return vm->object_proto;
+}
+
+static EvalRes eval_class(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
+    const AstNode *n = &ch->nodes[idx];
+    int sp = vm->temp_sp;
+
+    JsObj *super_ctor  = NULL;
+    JsObj *super_proto = vm->object_proto;
+    if (n->b != 0) {
+        EvalRes sr = eval_expr(vm, ch, env, n->b);
+        if (sr.flow != FLOW_NONE) return sr;
+        js_temp_push(vm, sr.val);
+        if (sr.val.type == JS_NULL) {
+            super_proto = NULL;
+        } else if (sr.val.type == JS_OBJECT && sr.val.u.obj) {
+            super_ctor = sr.val.u.obj;
+            JsVal spv = js_get_prop(vm, sr.val, "prototype");
+            super_proto = (spv.type == JS_OBJECT) ? spv.u.obj : vm->object_proto;
+        }
+    }
+
+    JsObj *proto_obj = js_map_new(vm, super_proto);
+    js_temp_push(vm, js_obj_val(proto_obj));
+
+    /* Locate explicit constructor if any */
+    uint32_t ctor_fn_idx = 0;
+    for (uint32_t p = n->c; p != 0; p = ch->nodes[p].next) {
+        const AstNode *pn = &ch->nodes[p];
+        if (!(pn->flags & (PROP_FLAG_STATIC | PROP_FLAG_COMPUTED | PROP_FLAG_FIELD |
+                           PROP_FLAG_GETTER | PROP_FLAG_SETTER)) &&
+            pn->a < ch->str_count && strcmp(ch->strs[pn->a], "constructor") == 0) {
+            ctor_fn_idx = pn->b;
+            break;
+        }
+    }
+
+    /* Create constructor function (uses AST_CLASS node idx if default constructor) */
+    JsObj *ctor = js_func_new(vm, ch, ctor_fn_idx ? ctor_fn_idx : idx, env, false);
+    if (!ctor) { vm->temp_sp = sp; return res_ok(js_undefined()); }
+    js_temp_push(vm, js_obj_val(ctor));
+
+    JsFuncObj *cfn      = (JsFuncObj *)ctor;
+    cfn->super_ctor     = super_ctor;
+    cfn->home_proto     = proto_obj;
+    cfn->field_init_idx = n->c;
+
+    js_set_prop(vm, js_obj_val(ctor), "prototype", js_obj_val(proto_obj));
+    js_set_prop(vm, js_obj_val(proto_obj), "constructor", js_obj_val(ctor));
+
+    /* Define methods, accessors, and static fields */
+    for (uint32_t p = n->c; p != 0; p = ch->nodes[p].next) {
+        const AstNode *pn = &ch->nodes[p];
+        if (!(pn->flags & (PROP_FLAG_STATIC | PROP_FLAG_COMPUTED | PROP_FLAG_FIELD |
+                           PROP_FLAG_GETTER | PROP_FLAG_SETTER)) &&
+            pn->a < ch->str_count && strcmp(ch->strs[pn->a], "constructor") == 0) {
+            continue;
+        }
+        /* Instance fields are evaluated per instance in constructor */
+        if ((pn->flags & PROP_FLAG_FIELD) && !(pn->flags & PROP_FLAG_STATIC)) {
+            continue;
+        }
+
+        int psp = vm->temp_sp;
+        JsStr *ks = NULL;
+        if (pn->flags & PROP_FLAG_COMPUTED) {
+            EvalRes kr = eval_expr(vm, ch, env, pn->a);
+            if (kr.flow != FLOW_NONE) { vm->temp_sp = sp; return kr; }
+            ks = js_to_str(vm, kr.val);
+        } else {
+            ks = chunk_js_str(vm, ch, pn->a);
+        }
+        if (ks) js_temp_push(vm, js_obj_val((JsObj *)ks));
+
+        JsVal mval = js_undefined();
+        if (pn->b != 0) {
+            EvalRes vr = eval_expr(vm, ch, env, pn->b);
+            if (vr.flow != FLOW_NONE) { vm->temp_sp = sp; return vr; }
+            mval = vr.val;
+        }
+        if (mval.type == JS_OBJECT && mval.u.obj && mval.u.obj->obj_type == OBJ_FUNC) {
+            ((JsFuncObj *)mval.u.obj)->home_proto = (pn->flags & PROP_FLAG_STATIC) ? ctor : proto_obj;
+        }
+
+        if (ks) {
+            if (pn->flags & (PROP_FLAG_GETTER | PROP_FLAG_SETTER)) {
+                bool is_set = (pn->flags & PROP_FLAG_SETTER) != 0;
+                JsObj *fn_obj = (mval.type == JS_OBJECT) ? mval.u.obj : NULL;
+                if (pn->flags & PROP_FLAG_STATIC) {
+                    if (!cfn->props_obj) cfn->props_obj = js_map_new(vm, vm->func_proto);
+                    js_define_accessor(vm, cfn->props_obj, ks, is_set ? NULL : fn_obj, is_set ? fn_obj : NULL);
+                } else {
+                    js_define_accessor(vm, proto_obj, ks, is_set ? NULL : fn_obj, is_set ? fn_obj : NULL);
+                }
+            } else if (pn->flags & PROP_FLAG_STATIC) {
+                js_set_prop_str(vm, js_obj_val(ctor), ks, mval);
+            } else {
+                js_set_prop_str(vm, js_obj_val(proto_obj), ks, mval);
+            }
+        }
+        vm->temp_sp = psp;
+        if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+    }
+
+    if (n->a != UINT32_MAX && (n->flags & 1)) {
+        JsStr *cnm = chunk_js_str(vm, ch, n->a);
+        js_env_define(vm, env, cnm, js_obj_val(ctor), DECL_LET);
+    }
+
+    vm->temp_sp = sp;
+    return res_ok(js_obj_val(ctor));
 }
 
 static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
@@ -334,10 +606,54 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             if (vm->has_thrown) return absorb_vm_throw(vm);
             return res_ok(out);
         }
+
         case AST_FUNC: {
             bool is_arrow = (n->flags & FUNC_FLAG_ARROW) != 0;
             JsObj *fn = js_func_new(vm, ch, idx, env, is_arrow);
+            if (fn) ((JsFuncObj *)fn)->is_async = (n->flags & FUNC_FLAG_ASYNC) != 0;
             return res_ok(js_obj_val(fn));
+        }
+        case AST_CLASS:
+            return eval_class(vm, ch, env, idx);
+        case AST_AWAIT: {
+            int sp = vm->temp_sp;
+            EvalRes r = eval_expr(vm, ch, env, n->a);
+            if (r.flow != FLOW_NONE) return r;
+            js_temp_push(vm, r.val);
+            js_drain_microtasks(vm);
+            if (r.val.type == JS_OBJECT && r.val.u.obj && r.val.u.obj->obj_type == OBJ_OBJECT) {
+                JsMapObj *m = (JsMapObj *)r.val.u.obj;
+                if (m->native_tag == NATIVE_TAG_PROMISE) {
+                    JsVal st = js_get_prop(vm, r.val, "_state");
+                    if ((int)js_to_num(vm, st) == 0) {
+                        js_drain_microtasks(vm);
+                        st = js_get_prop(vm, r.val, "_state");
+                    }
+                    int state = (int)js_to_num(vm, st);
+                    JsVal pv  = js_get_prop(vm, r.val, "_val");
+                    vm->temp_sp = sp;
+                    if (state == 2) return res_throw(pv);
+                    if (state == 1) return res_ok(pv);
+                    return res_ok(js_undefined());
+                }
+                /* Generic thenable */
+                JsVal then_fn = js_get_prop(vm, r.val, "then");
+                if (then_fn.type == JS_OBJECT && then_fn.u.obj &&
+                    (then_fn.u.obj->obj_type == OBJ_FUNC || then_fn.u.obj->obj_type == OBJ_NATIVE_FN)) {
+                    JsObj *p = js_promise_new(vm, 0, js_undefined());
+                    js_temp_push(vm, js_obj_val(p));
+                    js_promise_settle(vm, p, true, r.val);
+                    js_drain_microtasks(vm);
+                    int state = (int)js_to_num(vm, js_get_prop(vm, js_obj_val(p), "_state"));
+                    JsVal pv  = js_get_prop(vm, js_obj_val(p), "_val");
+                    vm->temp_sp = sp;
+                    if (state == 2) return res_throw(pv);
+                    if (state == 1) return res_ok(pv);
+                    return res_ok(js_undefined());
+                }
+            }
+            vm->temp_sp = sp;
+            return res_ok(r.val);
         }
         case AST_TEMPLATE: {
             int sp = vm->temp_sp;
@@ -367,9 +683,12 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                 if (en->kind == AST_SPREAD) {
                     EvalRes sr = eval_expr(vm, ch, env, en->a);
                     if (sr.flow != FLOW_NONE) { vm->temp_sp = sp; return sr; }
-                    if (sr.val.type == JS_OBJECT && sr.val.u.obj &&
-                        sr.val.u.obj->obj_type == OBJ_ARRAY) {
-                        JsArrObj *sa = (JsArrObj *)sr.val.u.obj;
+                    JsObj *sa_obj = (sr.val.type == JS_OBJECT && sr.val.u.obj &&
+                                     sr.val.u.obj->obj_type == OBJ_ARRAY)
+                                        ? sr.val.u.obj
+                                        : js_iterable_to_array(vm, sr.val);
+                    if (sa_obj && sa_obj->obj_type == OBJ_ARRAY) {
+                        JsArrObj *sa = (JsArrObj *)sa_obj;
                         for (uint32_t i = 0; i < sa->len; i++) js_arr_push(vm, arr, sa->items[i]);
                     }
                 } else {
@@ -394,7 +713,10 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                         sr.val.u.obj->obj_type == OBJ_OBJECT) {
                         JsMapObj *sm = (JsMapObj *)sr.val.u.obj;
                         for (uint32_t i = 0; i < sm->count; i++) {
-                            js_set_prop_str(vm, js_obj_val(obj), sm->props[i].key, sm->props[i].val);
+                            JsStr *k = sm->props[i].key;
+                            if (k->len > 0 && k->data[0] == '\x01') continue;
+                            if (sm->hdr.native_tag != 0 && k->len > 0 && k->data[0] == '_') continue;
+                            js_set_prop_str(vm, js_obj_val(obj), k, sm->props[i].val);
                         }
                     }
                     continue;
@@ -411,8 +733,21 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                 if (ks) js_temp_push(vm, js_obj_val((JsObj *)ks));
                 EvalRes vr = eval_expr(vm, ch, env, pn->b);
                 if (vr.flow != FLOW_NONE) { vm->temp_sp = sp; return vr; }
-                if (ks) js_set_prop_str(vm, js_obj_val(obj), ks, vr.val);
+                if (vr.val.type == JS_OBJECT && vr.val.u.obj && vr.val.u.obj->obj_type == OBJ_FUNC &&
+                    (pn->flags & (PROP_FLAG_METHOD | PROP_FLAG_GETTER | PROP_FLAG_SETTER))) {
+                    ((JsFuncObj *)vr.val.u.obj)->home_proto = obj;
+                }
+                if (ks) {
+                    if (pn->flags & (PROP_FLAG_GETTER | PROP_FLAG_SETTER)) {
+                        bool is_set = (pn->flags & PROP_FLAG_SETTER) != 0;
+                        JsObj *fn_obj = (vr.val.type == JS_OBJECT) ? vr.val.u.obj : NULL;
+                        js_define_accessor(vm, obj, ks, is_set ? NULL : fn_obj, is_set ? fn_obj : NULL);
+                    } else {
+                        js_set_prop_str(vm, js_obj_val(obj), ks, vr.val);
+                    }
+                }
                 vm->temp_sp = psp;
+                if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
             }
             vm->temp_sp = sp;
             return res_ok(js_obj_val(obj));
@@ -601,9 +936,16 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             }
             if (t->kind == AST_MEMBER || t->kind == AST_INDEX) {
                 int sp = vm->temp_sp;
-                EvalRes or = eval_expr(vm, ch, env, t->a);
-                if (or.flow != FLOW_NONE) return or;
-                js_temp_push(vm, or.val);
+                JsVal target_obj = js_undefined();
+                if (ch->nodes[t->a].kind == AST_SUPER) {
+                    JsEnv *tenv = js_env_find_this_env(env);
+                    target_obj = tenv ? tenv->this_val : js_undefined();
+                } else {
+                    EvalRes or = eval_expr(vm, ch, env, t->a);
+                    if (or.flow != FLOW_NONE) return or;
+                    target_obj = or.val;
+                }
+                js_temp_push(vm, target_obj);
                 JsStr *ks = NULL;
                 if (t->kind == AST_MEMBER) {
                     ks = chunk_js_str(vm, ch, t->b);
@@ -620,7 +962,7 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                     if (rr.flow != FLOW_NONE) { vm->temp_sp = sp; return rr; }
                     newv = rr.val;
                 } else {
-                    JsVal oldv = js_get_prop_str(vm, or.val, ks);
+                    JsVal oldv = js_get_prop_str(vm, target_obj, ks);
                     if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
                     if ((n->op == OP_AND && !js_to_bool(oldv)) ||
                         (n->op == OP_OR && js_to_bool(oldv)) ||
@@ -635,7 +977,7 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                                ? rr.val
                                : apply_binop(vm, (AstOp)n->op, oldv, rr.val);
                 }
-                js_set_prop_str(vm, or.val, ks, newv);
+                js_set_prop_str(vm, target_obj, ks, newv);
                 vm->temp_sp = sp;
                 if (vm->has_thrown) return absorb_vm_throw(vm);
                 return res_ok(newv);
@@ -644,6 +986,15 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             return absorb_vm_throw(vm);
         }
         case AST_MEMBER: {
+            if (ch->nodes[n->a].kind == AST_SUPER) {
+                JsEnv *tenv = js_env_find_this_env(env);
+                JsVal recv  = tenv ? tenv->this_val : js_undefined();
+                JsObj *sp_proto = resolve_super_proto(vm, tenv, NULL);
+                JsStr *ks   = chunk_js_str(vm, ch, n->b);
+                JsVal out   = js_get_prop_proto(vm, recv, sp_proto, ks);
+                if (vm->has_thrown) return absorb_vm_throw(vm);
+                return res_ok(out);
+            }
             int sp = vm->temp_sp;
             EvalRes or = eval_expr(vm, ch, env, n->a);
             if (or.flow != FLOW_NONE) return or;
@@ -660,6 +1011,18 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
         }
         case AST_INDEX: {
             int sp = vm->temp_sp;
+            if (ch->nodes[n->a].kind == AST_SUPER) {
+                JsEnv *tenv = js_env_find_this_env(env);
+                JsVal recv  = tenv ? tenv->this_val : js_undefined();
+                JsObj *sp_proto = resolve_super_proto(vm, tenv, NULL);
+                EvalRes kr = eval_expr(vm, ch, env, n->b);
+                if (kr.flow != FLOW_NONE) return kr;
+                JsStr *ks = js_to_str(vm, kr.val);
+                JsVal out = js_get_prop_proto(vm, recv, sp_proto, ks);
+                vm->temp_sp = sp;
+                if (vm->has_thrown) return absorb_vm_throw(vm);
+                return res_ok(out);
+            }
             EvalRes or = eval_expr(vm, ch, env, n->a);
             if (or.flow != FLOW_NONE) return or;
             if ((n->flags & OPT_CHAIN_FLAG) &&
@@ -686,8 +1049,35 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             JsVal this_arg = js_undefined();
             JsVal callee   = js_undefined();
             const AstNode *cn = &ch->nodes[n->a];
+            bool is_super_ctor_call = false;
+            JsEnv *super_tenv = NULL;
 
-            if (cn->kind == AST_MEMBER || cn->kind == AST_INDEX) {
+            if (cn->kind == AST_SUPER) {
+                is_super_ctor_call = true;
+                super_tenv = js_env_find_this_env(env);
+                this_arg   = super_tenv ? super_tenv->this_val : js_undefined();
+                JsFuncObj *cfn = (super_tenv && super_tenv->callee_fn &&
+                                  super_tenv->callee_fn->obj_type == OBJ_FUNC)
+                                     ? (JsFuncObj *)super_tenv->callee_fn : NULL;
+                callee = (cfn && cfn->super_ctor) ? js_obj_val(cfn->super_ctor) : js_undefined();
+                js_temp_push(vm, this_arg);
+            } else if ((cn->kind == AST_MEMBER || cn->kind == AST_INDEX) &&
+                       ch->nodes[cn->a].kind == AST_SUPER) {
+                JsEnv *tenv = js_env_find_this_env(env);
+                this_arg = tenv ? tenv->this_val : js_undefined();
+                js_temp_push(vm, this_arg);
+                JsObj *sp_proto = resolve_super_proto(vm, tenv, NULL);
+                JsStr *ks = NULL;
+                if (cn->kind == AST_MEMBER) {
+                    ks = chunk_js_str(vm, ch, cn->b);
+                } else {
+                    EvalRes kr = eval_expr(vm, ch, env, cn->b);
+                    if (kr.flow != FLOW_NONE) { vm->temp_sp = sp; return kr; }
+                    ks = js_to_str(vm, kr.val);
+                }
+                callee = js_get_prop_proto(vm, this_arg, sp_proto, ks);
+                if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+            } else if (cn->kind == AST_MEMBER || cn->kind == AST_INDEX) {
                 EvalRes or = eval_expr(vm, ch, env, cn->a);
                 if (or.flow != FLOW_NONE) { vm->temp_sp = sp; return or; }
                 if (((cn->flags | n->flags) & OPT_CHAIN_FLAG) &&
@@ -727,8 +1117,26 @@ static EvalRes eval_expr(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             if (ar.flow != FLOW_NONE) { vm->temp_sp = sp; return ar; }
 
             JsVal out = js_call(vm, callee, this_arg, argc, &vm->temp_roots[arg_base]);
+            if (vm->has_thrown) { vm->temp_sp = sp; return absorb_vm_throw(vm); }
+            if (is_super_ctor_call) {
+                if (out.type == JS_OBJECT && out.u.obj && out.u.obj->obj_type != OBJ_STRING) {
+                    if (out.u.obj->obj_type == OBJ_OBJECT && super_tenv && super_tenv->callee_fn &&
+                        super_tenv->callee_fn->obj_type == OBJ_FUNC) {
+                        JsObj *hp = ((JsFuncObj *)super_tenv->callee_fn)->home_proto;
+                        if (hp && hp->obj_type == OBJ_OBJECT) ((JsMapObj *)out.u.obj)->proto = hp;
+                    }
+                    this_arg = out;
+                    if (super_tenv) super_tenv->this_val = out;
+                }
+                if (super_tenv && super_tenv->callee_fn &&
+                    super_tenv->callee_fn->obj_type == OBJ_FUNC) {
+                    EvalRes fr = init_class_instance_fields(vm, (JsFuncObj *)super_tenv->callee_fn, this_arg);
+                    if (fr.flow != FLOW_NONE) { vm->temp_sp = sp; return fr; }
+                }
+                vm->temp_sp = sp;
+                return res_ok(this_arg);
+            }
             vm->temp_sp = sp;
-            if (vm->has_thrown) return absorb_vm_throw(vm);
             return res_ok(out);
         }
         case AST_NEW: {
@@ -800,6 +1208,8 @@ static EvalRes eval_stmt(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
         case AST_EMPTY:
         case AST_FUNC_DECL: /* Already hoisted on scope entry */
             return res_ok(js_undefined());
+        case AST_CLASS:
+            return eval_class(vm, ch, env, idx);
         case AST_EXPR_STMT:
             return eval_expr(vm, ch, env, n->a);
         case AST_BLOCK: {
@@ -894,14 +1304,19 @@ static EvalRes eval_stmt(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
             js_temp_push(vm, rr.val);
 
             /* Snapshot keys / items into a rooted temporary array */
-            JsObj *items = js_arr_new(vm, 8);
-            js_temp_push(vm, js_obj_val(items));
+            JsObj *items = NULL;
             if (n->kind == AST_FOR_IN) {
+                items = js_arr_new(vm, 8);
+                js_temp_push(vm, js_obj_val(items));
                 if (rr.val.type == JS_OBJECT && rr.val.u.obj) {
                     if (rr.val.u.obj->obj_type == OBJ_OBJECT) {
                         JsMapObj *m = (JsMapObj *)rr.val.u.obj;
-                        for (uint32_t i = 0; i < m->count; i++)
-                            js_arr_push(vm, items, js_obj_val((JsObj *)m->props[i].key));
+                        for (uint32_t i = 0; i < m->count; i++) {
+                            JsStr *k = m->props[i].key;
+                            if (k->len > 0 && k->data[0] == '\x01') continue;
+                            if (m->native_tag != 0 && k->len > 0 && k->data[0] == '_') continue;
+                            js_arr_push(vm, items, js_obj_val((JsObj *)k));
+                        }
                     } else if (rr.val.u.obj->obj_type == OBJ_ARRAY) {
                         JsArrObj *a = (JsArrObj *)rr.val.u.obj;
                         for (uint32_t i = 0; i < a->len; i++) {
@@ -912,16 +1327,9 @@ static EvalRes eval_stmt(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t idx) {
                     }
                 }
             } else { /* AST_FOR_OF */
-                if (rr.val.type == JS_OBJECT && rr.val.u.obj) {
-                    if (rr.val.u.obj->obj_type == OBJ_ARRAY) {
-                        JsArrObj *a = (JsArrObj *)rr.val.u.obj;
-                        for (uint32_t i = 0; i < a->len; i++) js_arr_push(vm, items, a->items[i]);
-                    } else if (rr.val.u.obj->obj_type == OBJ_STRING) {
-                        JsStr *s = (JsStr *)rr.val.u.obj;
-                        for (uint32_t i = 0; i < s->len; i++)
-                            js_arr_push(vm, items, js_obj_val((JsObj *)js_str_new(vm, s->data + i, 1)));
-                    }
-                }
+                items = js_iterable_to_array(vm, rr.val);
+                if (!items) items = js_arr_new(vm, 0);
+                js_temp_push(vm, js_obj_val(items));
             }
 
             JsArrObj *ia = (JsArrObj *)items;
@@ -1043,8 +1451,9 @@ JsVal js_call(JsVm *vm, JsVal callee, JsVal this_val, int argc, const JsVal *arg
     JsObj *o = callee.u.obj;
     if (o->obj_type == OBJ_NATIVE_FN) {
         JsNativeFnObj *nf = (JsNativeFnObj *)o;
+        JsVal eff_nt = (this_val.type == JS_UNDEFINED && nf->props_obj) ? callee : this_val;
         vm->call_depth++;
-        JsVal res = nf->fn(vm, this_val, argc, argv, nf->magic);
+        JsVal res = nf->fn(vm, eff_nt, argc, argv, nf->magic);
         vm->call_depth--;
         return res;
     }
@@ -1065,6 +1474,7 @@ JsVal js_call(JsVm *vm, JsVal callee, JsVal this_val, int argc, const JsVal *arg
     int env_mark = vm->env_sp;
     int sp_mark  = vm->temp_sp;
     js_temp_push(vm, callee);
+    js_temp_push(vm, eff_this);
 
     JsEnv *fenv = js_env_new(vm, fn->closure ? fn->closure : vm->global_env,
                              true, !fn->is_arrow, eff_this);
@@ -1072,11 +1482,61 @@ JsVal js_call(JsVm *vm, JsVal callee, JsVal this_val, int argc, const JsVal *arg
         vm->temp_sp = sp_mark;
         return js_undefined();
     }
+    fenv->callee_fn = o;
 
     ch->pinned++;
     vm->call_depth++;
 
     const AstNode *fnode = &ch->nodes[fn->ast_idx];
+
+    /* Synthesized default class constructor (`ast_idx` points to AST_CLASS) */
+    if (fnode->kind == AST_CLASS) {
+        if (fn->super_ctor) {
+            JsVal sret = js_call(vm, js_obj_val(fn->super_ctor), eff_this, argc, argv);
+            if (vm->has_thrown) {
+                vm->call_depth--;
+                ch->pinned--;
+                vm->env_sp  = env_mark;
+                vm->temp_sp = sp_mark;
+                return js_undefined();
+            }
+            if (sret.type == JS_OBJECT && sret.u.obj && sret.u.obj->obj_type != OBJ_STRING) {
+                if (sret.u.obj->obj_type == OBJ_OBJECT && fn->home_proto &&
+                    fn->home_proto->obj_type == OBJ_OBJECT) {
+                    ((JsMapObj *)sret.u.obj)->proto = fn->home_proto;
+                }
+                eff_this = sret;
+                fenv->this_val = sret;
+            }
+        }
+        EvalRes fr = init_class_instance_fields(vm, fn, eff_this);
+        vm->call_depth--;
+        ch->pinned--;
+        vm->env_sp  = env_mark;
+        vm->temp_sp = sp_mark;
+        if (fr.flow == FLOW_THROW) {
+            vm->has_thrown = true;
+            vm->thrown_val = fr.val;
+            return js_undefined();
+        }
+        return eff_this;
+    }
+
+    /* Base class with explicit constructor: initialize instance fields before body */
+    if (fn->field_init_idx != 0 && !fn->super_ctor && eff_this.type == JS_OBJECT &&
+        eff_this.u.obj && eff_this.u.obj != vm->global_obj) {
+        EvalRes fr = init_class_instance_fields(vm, fn, eff_this);
+        if (fr.flow == FLOW_THROW) {
+            vm->has_thrown = true;
+            vm->thrown_val = fr.val;
+            vm->call_depth--;
+            ch->pinned--;
+            vm->env_sp  = env_mark;
+            vm->temp_sp = sp_mark;
+            return js_undefined();
+        }
+    }
+
     /* Bind named function expression inside its own scope */
     if (fnode->a != UINT32_MAX) {
         JsStr *fnm = chunk_js_str(vm, ch, fnode->a);
@@ -1105,12 +1565,17 @@ JsVal js_call(JsVm *vm, JsVal callee, JsVal this_val, int argc, const JsVal *arg
         if (pv.type == JS_UNDEFINED && pn->b) {
             EvalRes dr = eval_expr(vm, ch, fenv, pn->b);
             if (dr.flow == FLOW_THROW) {
-                vm->has_thrown = true;
-                vm->thrown_val = dr.val;
                 vm->call_depth--;
                 ch->pinned--;
                 vm->env_sp  = env_mark;
                 vm->temp_sp = sp_mark;
+                if (fn->is_async) {
+                    vm->has_thrown = false;
+                    vm->thrown_val = js_undefined();
+                    return js_obj_val(js_promise_new(vm, 2, dr.val));
+                }
+                vm->has_thrown = true;
+                vm->thrown_val = dr.val;
                 return js_undefined();
             }
             pv = dr.val;
@@ -1118,12 +1583,17 @@ JsVal js_call(JsVm *vm, JsVal callee, JsVal this_val, int argc, const JsVal *arg
         if (pn->flags & JS_PARAM_DESTRUCT) {
             EvalRes br = bind_pattern(vm, ch, fenv, pn->c, pv, DECL_VAR, false);
             if (br.flow == FLOW_THROW) {
-                vm->has_thrown = true;
-                vm->thrown_val = br.val;
                 vm->call_depth--;
                 ch->pinned--;
                 vm->env_sp  = env_mark;
                 vm->temp_sp = sp_mark;
+                if (fn->is_async) {
+                    vm->has_thrown = false;
+                    vm->thrown_val = js_undefined();
+                    return js_obj_val(js_promise_new(vm, 2, br.val));
+                }
+                vm->has_thrown = true;
+                vm->thrown_val = br.val;
                 return js_undefined();
             }
         } else {
@@ -1143,17 +1613,40 @@ JsVal js_call(JsVm *vm, JsVal callee, JsVal this_val, int argc, const JsVal *arg
         res = eval_stmt_list(vm, ch, fenv, blk->a);
     }
 
+    JsVal updated_this = fenv->this_val;
     vm->call_depth--;
     ch->pinned--;
     vm->env_sp  = env_mark;
     vm->temp_sp = sp_mark;
+
+    if (fn->is_async) {
+        if (res.flow == FLOW_THROW) {
+            vm->has_thrown = false;
+            vm->thrown_val = js_undefined();
+            return js_obj_val(js_promise_new(vm, 2, res.val));
+        }
+        JsVal ret_v = (res.flow == FLOW_RETURN) ? res.val : js_undefined();
+        int asp = vm->temp_sp;
+        js_temp_push(vm, ret_v);
+        JsObj *p = js_promise_new(vm, 0, js_undefined());
+        js_temp_push(vm, js_obj_val(p));
+        js_promise_settle(vm, p, true, ret_v);
+        vm->temp_sp = asp;
+        return js_obj_val(p);
+    }
 
     if (res.flow == FLOW_THROW) {
         vm->has_thrown = true;
         vm->thrown_val = res.val;
         return js_undefined();
     }
-    return (res.flow == FLOW_RETURN) ? res.val : js_undefined();
+    if (res.flow == FLOW_RETURN) return res.val;
+    /* Derived constructor where `super()` replaced `this_val` (e.g. extending native Event) */
+    if (fn->super_ctor && updated_this.type == JS_OBJECT && updated_this.u.obj &&
+        updated_this.u.obj != eff_this.u.obj) {
+        return updated_this;
+    }
+    return js_undefined();
 }
 
 JsVal js_eval_chunk(JsVm *vm, JsChunk *ch, JsEnv *env) {
@@ -1177,6 +1670,10 @@ JsVal js_eval_chunk(JsVm *vm, JsChunk *ch, JsEnv *env) {
         vm->thrown_val = res.val;
         return js_undefined();
     }
+    int sp = vm->temp_sp;
+    js_temp_push(vm, res.val);
+    js_drain_microtasks(vm);
+    vm->temp_sp = sp;
     return res.val;
 }
 

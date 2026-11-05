@@ -12,7 +12,9 @@ typedef enum {
     TOK_IF, TOK_ELSE, TOK_WHILE, TOK_DO, TOK_FOR, TOK_IN, TOK_OF,
     TOK_SWITCH, TOK_CASE, TOK_DEFAULT, TOK_BREAK, TOK_CONTINUE,
     TOK_TRY, TOK_CATCH, TOK_FINALLY, TOK_THROW,
-    TOK_NEW, TOK_THIS, TOK_TYPEOF, TOK_VOID, TOK_DELETE, TOK_INSTANCEOF,
+    TOK_NEW, TOK_THIS, TOK_SUPER, TOK_CLASS, TOK_EXTENDS, TOK_STATIC,
+    TOK_ASYNC, TOK_AWAIT,
+    TOK_TYPEOF, TOK_VOID, TOK_DELETE, TOK_INSTANCEOF,
     TOK_TRUE, TOK_FALSE, TOK_NULL, TOK_UNDEFINED,
     /* Punctuation & Operators */
     TOK_LPAREN, TOK_RPAREN, TOK_LBRACK, TOK_RBRACK, TOK_LBRACE, TOK_RBRACE,
@@ -162,6 +164,8 @@ static TokKind keyword_lookup(const char *s, size_t len) {
         {"break", TOK_BREAK}, {"continue", TOK_CONTINUE},
         {"try", TOK_TRY}, {"catch", TOK_CATCH}, {"finally", TOK_FINALLY},
         {"throw", TOK_THROW}, {"new", TOK_NEW}, {"this", TOK_THIS},
+        {"super", TOK_SUPER}, {"class", TOK_CLASS}, {"extends", TOK_EXTENDS},
+        {"static", TOK_STATIC}, {"async", TOK_ASYNC}, {"await", TOK_AWAIT},
         {"typeof", TOK_TYPEOF}, {"void", TOK_VOID}, {"delete", TOK_DELETE},
         {"instanceof", TOK_INSTANCEOF}, {"true", TOK_TRUE}, {"false", TOK_FALSE},
         {"null", TOK_NULL}, {"undefined", TOK_UNDEFINED}
@@ -178,7 +182,7 @@ static bool tok_can_end_expr(TokKind k) {
     switch (k) {
         case TOK_NUM: case TOK_STR: case TOK_REGEX: case TOK_IDENT:
         case TOK_TRUE: case TOK_FALSE: case TOK_NULL: case TOK_UNDEFINED:
-        case TOK_THIS: case TOK_RPAREN: case TOK_RBRACK: case TOK_RBRACE:
+        case TOK_THIS: case TOK_SUPER: case TOK_RPAREN: case TOK_RBRACK: case TOK_RBRACE:
         case TOK_INC: case TOK_DEC:
             return true;
         default:
@@ -690,6 +694,24 @@ static uint32_t parse_arg_list(Parser *p) {
     return head;
 }
 
+static TokKind peek_next_tok_kind(Parser *p, bool *out_had_nl) {
+    Lexer saved_lx  = p->lx;
+    Token saved_cur = p->cur;
+    bool  saved_err = p->has_err;
+    next_token(p);
+    TokKind nk = p->cur.kind;
+    if (out_had_nl) *out_had_nl = p->cur.had_newline;
+    p->lx      = saved_lx;
+    p->cur     = saved_cur;
+    p->has_err = saved_err;
+    return nk;
+}
+
+static bool can_start_prop_name(TokKind k) {
+    return k == TOK_LBRACK || k == TOK_STR || k == TOK_NUM ||
+           (k >= TOK_IDENT && k <= TOK_UNDEFINED);
+}
+
 static uint32_t parse_object_literal(Parser *p) {
     uint32_t head = 0, tail = 0;
     while (!p->has_err && p->cur.kind != TOK_RBRACE && p->cur.kind != TOK_EOF) {
@@ -704,6 +726,26 @@ static uint32_t parse_object_literal(Parser *p) {
         }
 
         uint16_t flags = 0;
+        uint16_t func_flags = 0;
+        bool nl = false;
+        if (p->cur.kind == TOK_ASYNC) {
+            TokKind nk = peek_next_tok_kind(p, &nl);
+            if (!nl && can_start_prop_name(nk)) {
+                func_flags |= FUNC_FLAG_ASYNC;
+                next_token(p);
+            }
+        } else if (p->cur.kind == TOK_IDENT &&
+                   (strcmp(p->chunk->strs[p->cur.str_id], "get") == 0 ||
+                    strcmp(p->chunk->strs[p->cur.str_id], "set") == 0)) {
+            TokKind nk = peek_next_tok_kind(p, &nl);
+            if (can_start_prop_name(nk)) {
+                flags |= (strcmp(p->chunk->strs[p->cur.str_id], "get") == 0)
+                             ? PROP_FLAG_GETTER
+                             : PROP_FLAG_SETTER;
+                next_token(p);
+            }
+        }
+
         uint32_t key_a = 0;
         bool was_ident = false;
         if (match_tok(p, TOK_LBRACK)) {
@@ -720,7 +762,7 @@ static uint32_t parse_object_literal(Parser *p) {
             next_token(p);
         } else if (p->cur.kind >= TOK_IDENT && p->cur.kind <= TOK_UNDEFINED) {
             key_a     = p->cur.str_id;
-            was_ident = (p->cur.kind == TOK_IDENT);
+            was_ident = (p->cur.kind == TOK_IDENT || (p->cur.kind >= TOK_VAR && p->cur.kind <= TOK_UNDEFINED));
             next_token(p);
         } else {
             set_parse_err(p, "Expected property name in object literal");
@@ -731,11 +773,12 @@ static uint32_t parse_object_literal(Parser *p) {
         if (match_tok(p, TOK_COLON)) {
             val_b = parse_assign(p, true);
         } else if (match_tok(p, TOK_LPAREN)) {
-            /* Concise method syntax `{ foo(a, b) { ... } }` */
+            /* Concise method or getter/setter syntax `{ foo(a, b) { ... } }` */
+            flags |= PROP_FLAG_METHOD;
             uint32_t params = parse_param_list(p);
             uint32_t body   = parse_block(p);
-            val_b = emit_node(p, AST_FUNC, OP_NONE, 0, UINT32_MAX, params, body);
-        } else if (was_ident && !(flags & PROP_FLAG_COMPUTED)) {
+            val_b = emit_node(p, AST_FUNC, OP_NONE, func_flags, UINT32_MAX, params, body);
+        } else if (was_ident && !(flags & (PROP_FLAG_COMPUTED | PROP_FLAG_GETTER | PROP_FLAG_SETTER)) && !func_flags) {
             /* Shorthand `{ x }` -> `{ x: x }` */
             val_b = emit_node(p, AST_IDENT, OP_NONE, 0, key_a, 0, 0);
         } else {
@@ -751,6 +794,96 @@ static uint32_t parse_object_literal(Parser *p) {
     }
     expect_tok(p, TOK_RBRACE, "Expected '}' after object literal");
     return emit_node(p, AST_OBJECT, OP_NONE, 0, head, 0, 0);
+}
+
+static uint32_t parse_class(Parser *p, bool is_stmt) {
+    uint32_t name_id = UINT32_MAX;
+    if (p->cur.kind >= TOK_IDENT && p->cur.kind <= TOK_UNDEFINED && p->cur.kind != TOK_EXTENDS) {
+        name_id = p->cur.str_id;
+        next_token(p);
+    }
+    uint32_t super_expr = 0;
+    if (match_tok(p, TOK_EXTENDS)) {
+        super_expr = parse_lhs_expr(p, true);
+    }
+    if (!expect_tok(p, TOK_LBRACE, "Expected '{' in class")) return 0;
+
+    uint32_t head = 0, tail = 0;
+    while (!p->has_err && p->cur.kind != TOK_RBRACE && p->cur.kind != TOK_EOF) {
+        if (match_tok(p, TOK_SEMI)) continue;
+
+        uint16_t prop_flags = 0;
+        uint16_t func_flags = 0;
+        bool nl = false;
+
+        if (p->cur.kind == TOK_STATIC) {
+            TokKind nk = peek_next_tok_kind(p, &nl);
+            if (can_start_prop_name(nk)) {
+                prop_flags |= PROP_FLAG_STATIC;
+                next_token(p);
+            }
+        }
+        if (p->cur.kind == TOK_ASYNC) {
+            TokKind nk = peek_next_tok_kind(p, &nl);
+            if (!nl && can_start_prop_name(nk)) {
+                func_flags |= FUNC_FLAG_ASYNC;
+                next_token(p);
+            }
+        } else if (p->cur.kind == TOK_IDENT &&
+                   (strcmp(p->chunk->strs[p->cur.str_id], "get") == 0 ||
+                    strcmp(p->chunk->strs[p->cur.str_id], "set") == 0)) {
+            TokKind nk = peek_next_tok_kind(p, &nl);
+            if (can_start_prop_name(nk)) {
+                prop_flags |= (strcmp(p->chunk->strs[p->cur.str_id], "get") == 0)
+                                  ? PROP_FLAG_GETTER
+                                  : PROP_FLAG_SETTER;
+                next_token(p);
+            }
+        }
+
+        uint32_t key_a = 0;
+        if (match_tok(p, TOK_LBRACK)) {
+            prop_flags |= PROP_FLAG_COMPUTED;
+            key_a = parse_assign(p, true);
+            expect_tok(p, TOK_RBRACK, "Expected ']' in computed class member");
+        } else if (p->cur.kind == TOK_STR) {
+            key_a = p->cur.str_id;
+            next_token(p);
+        } else if (p->cur.kind == TOK_NUM) {
+            char nbuf[64];
+            snprintf(nbuf, sizeof(nbuf), "%.15g", p->cur.num);
+            key_a = chunk_intern_str(p, nbuf, strlen(nbuf));
+            next_token(p);
+        } else if (p->cur.kind >= TOK_IDENT && p->cur.kind <= TOK_UNDEFINED) {
+            key_a = p->cur.str_id;
+            next_token(p);
+        } else {
+            set_parse_err(p, "Expected class member name");
+            break;
+        }
+
+        uint32_t val_b = 0;
+        if (match_tok(p, TOK_LPAREN)) {
+            prop_flags |= PROP_FLAG_METHOD;
+            uint32_t params = parse_param_list(p);
+            uint32_t body   = parse_block(p);
+            val_b = emit_node(p, AST_FUNC, OP_NONE, func_flags, UINT32_MAX, params, body);
+        } else {
+            if (match_tok(p, TOK_ASSIGN)) {
+                val_b = parse_assign(p, true);
+            } else {
+                val_b = emit_node(p, AST_UNDEFINED, OP_NONE, 0, 0, 0, 0);
+            }
+            if (p->cur.kind == TOK_SEMI) next_token(p);
+        }
+
+        uint32_t pn = emit_node(p, AST_PROP, OP_NONE, prop_flags, key_a, val_b, 0);
+        if (!head) head = pn;
+        else p->chunk->nodes[tail].next = pn;
+        tail = pn;
+    }
+    expect_tok(p, TOK_RBRACE, "Expected '}' after class body");
+    return emit_node(p, AST_CLASS, OP_NONE, is_stmt ? 1 : 0, name_id, super_expr, head);
 }
 
 static uint32_t parse_primary(Parser *p) {
@@ -790,9 +923,82 @@ static uint32_t parse_primary(Parser *p) {
         next_token(p);
         return emit_node(p, AST_THIS, OP_NONE, 0, 0, 0, 0);
     }
+    if (k == TOK_SUPER) {
+        next_token(p);
+        return emit_node(p, AST_SUPER, OP_NONE, 0, 0, 0, 0);
+    }
+    if (k == TOK_CLASS) {
+        next_token(p);
+        return parse_class(p, false);
+    }
     if (k == TOK_FUNCTION) {
         next_token(p);
         return parse_function_common(p, false);
+    }
+    if (k == TOK_ASYNC) {
+        uint32_t async_sid = p->cur.str_id;
+        next_token(p);
+        if (!p->cur.had_newline && p->cur.kind == TOK_FUNCTION) {
+            next_token(p);
+            uint32_t fn = parse_function_common(p, false);
+            if (fn) p->chunk->nodes[fn].flags |= FUNC_FLAG_ASYNC;
+            return fn;
+        }
+        if (!p->cur.had_newline && p->cur.kind == TOK_LPAREN) {
+            Lexer saved_lx  = p->lx;
+            Token saved_cur = p->cur;
+            bool  saved_err = p->has_err;
+            next_token(p);
+            if (is_arrow_after_lparen(p)) {
+                uint32_t params = parse_param_list(p);
+                expect_tok(p, TOK_ARROW, "Expected '=>'");
+                uint16_t fflags = FUNC_FLAG_ARROW | FUNC_FLAG_ASYNC;
+                uint32_t body   = 0;
+                if (p->cur.kind == TOK_LBRACE) {
+                    body = parse_block(p);
+                } else {
+                    fflags |= FUNC_FLAG_EXPR_BODY;
+                    body = parse_assign(p, true);
+                }
+                return emit_node(p, AST_FUNC, OP_NONE, fflags, UINT32_MAX, params, body);
+            }
+            p->lx      = saved_lx;
+            p->cur     = saved_cur;
+            p->has_err = saved_err;
+        }
+        if (!p->cur.had_newline && p->cur.kind == TOK_IDENT) {
+            bool nl = false;
+            TokKind nk = peek_next_tok_kind(p, &nl);
+            if (!nl && nk == TOK_ARROW) {
+                uint32_t param_sid = p->cur.str_id;
+                next_token(p); /* param */
+                next_token(p); /* => */
+                uint32_t param = emit_node(p, AST_PARAM, OP_NONE, 0, param_sid, 0, 0);
+                uint16_t fflags = FUNC_FLAG_ARROW | FUNC_FLAG_ASYNC;
+                uint32_t body   = 0;
+                if (p->cur.kind == TOK_LBRACE) {
+                    body = parse_block(p);
+                } else {
+                    fflags |= FUNC_FLAG_EXPR_BODY;
+                    body = parse_assign(p, true);
+                }
+                return emit_node(p, AST_FUNC, OP_NONE, fflags, UINT32_MAX, param, body);
+            }
+        }
+        if (p->cur.kind == TOK_ARROW && !p->cur.had_newline) {
+            next_token(p);
+            uint32_t param = emit_node(p, AST_PARAM, OP_NONE, 0, async_sid, 0, 0);
+            uint16_t fflags = FUNC_FLAG_ARROW;
+            uint32_t body   = 0;
+            if (p->cur.kind == TOK_LBRACE) {
+                body = parse_block(p);
+            } else {
+                fflags |= FUNC_FLAG_EXPR_BODY;
+                body = parse_assign(p, true);
+            }
+            return emit_node(p, AST_FUNC, OP_NONE, fflags, UINT32_MAX, param, body);
+        }
+        return emit_node(p, AST_IDENT, OP_NONE, 0, async_sid, 0, 0);
     }
     if (k == TOK_IDENT) {
         uint32_t sid = p->cur.str_id;
@@ -927,6 +1133,10 @@ static uint32_t parse_postfix(Parser *p) {
 }
 
 static uint32_t parse_unary(Parser *p) {
+    if (match_tok(p, TOK_AWAIT)) {
+        uint32_t operand = parse_unary(p);
+        return emit_node(p, AST_AWAIT, OP_NONE, 0, operand, 0, 0);
+    }
     if (p->cur.kind == TOK_INC || p->cur.kind == TOK_DEC) {
         AstOp op = (p->cur.kind == TOK_INC) ? OP_INC : OP_DEC;
         next_token(p);
@@ -1070,6 +1280,14 @@ static uint32_t parse_binding_target(Parser *p) {
             uint32_t item = 0;
             if (p->cur.kind == TOK_COMMA) {
                 item = emit_node(p, AST_EMPTY, OP_NONE, 0, 0, 0, 0);
+            } else if (match_tok(p, TOK_SPREAD)) {
+                uint32_t sid = p->cur.str_id;
+                if (!expect_tok(p, TOK_IDENT, "Expected identifier after '...' in array destructuring")) break;
+                item = emit_node(p, AST_PARAM, OP_NONE, DESTRUCT_FLAG_REST, sid, 0, 0);
+            } else if (p->cur.kind == TOK_LBRACK || p->cur.kind == TOK_LBRACE) {
+                uint32_t sub = parse_binding_target(p);
+                uint32_t def = match_tok(p, TOK_ASSIGN) ? parse_assign(p, true) : 0;
+                item = emit_node(p, AST_PARAM, OP_NONE, DESTRUCT_FLAG_NESTED, 0, def, sub);
             } else {
                 uint32_t sid = p->cur.str_id;
                 if (!expect_tok(p, TOK_IDENT, "Expected identifier in array destructuring")) break;
@@ -1087,15 +1305,38 @@ static uint32_t parse_binding_target(Parser *p) {
     if (match_tok(p, TOK_LBRACE)) {
         uint32_t head = 0, tail = 0;
         while (!p->has_err && p->cur.kind != TOK_RBRACE && p->cur.kind != TOK_EOF) {
+            if (match_tok(p, TOK_SPREAD)) {
+                uint32_t sid = p->cur.str_id;
+                if (!expect_tok(p, TOK_IDENT, "Expected identifier after '...' in object destructuring")) break;
+                uint32_t item = emit_node(p, AST_PROP, OP_NONE, DESTRUCT_FLAG_REST, sid, sid, 0);
+                if (!head) head = item;
+                else p->chunk->nodes[tail].next = item;
+                tail = item;
+                if (!match_tok(p, TOK_COMMA)) break;
+                continue;
+            }
             uint32_t key_sid = p->cur.str_id;
-            if (!expect_tok(p, TOK_IDENT, "Expected property in object destructuring")) break;
-            uint32_t target_sid = key_sid;
+            if (p->cur.kind >= TOK_IDENT && p->cur.kind <= TOK_UNDEFINED) {
+                next_token(p);
+            } else if (p->cur.kind == TOK_STR) {
+                next_token(p);
+            } else {
+                set_parse_err(p, "Expected property in object destructuring");
+                break;
+            }
+            uint16_t pflags = 0;
+            uint32_t target_b = key_sid;
             if (match_tok(p, TOK_COLON)) {
-                target_sid = p->cur.str_id;
-                expect_tok(p, TOK_IDENT, "Expected target identifier");
+                if (p->cur.kind == TOK_LBRACK || p->cur.kind == TOK_LBRACE) {
+                    pflags |= DESTRUCT_FLAG_NESTED;
+                    target_b = parse_binding_target(p);
+                } else {
+                    target_b = p->cur.str_id;
+                    expect_tok(p, TOK_IDENT, "Expected target identifier");
+                }
             }
             uint32_t def = match_tok(p, TOK_ASSIGN) ? parse_assign(p, true) : 0;
-            uint32_t item = emit_node(p, AST_PROP, OP_NONE, 0, key_sid, target_sid, def);
+            uint32_t item = emit_node(p, AST_PROP, OP_NONE, pflags, key_sid, target_b, def);
             if (!head) head = item;
             else p->chunk->nodes[tail].next = item;
             tail = item;
@@ -1158,6 +1399,23 @@ static uint32_t parse_stmt(Parser *p) {
         case TOK_CONST:
             next_token(p);
             return parse_var_decl(p, DECL_CONST, true, true);
+        case TOK_CLASS:
+            next_token(p);
+            return parse_class(p, true);
+        case TOK_ASYNC: {
+            bool nl = false;
+            TokKind nk = peek_next_tok_kind(p, &nl);
+            if (!nl && nk == TOK_FUNCTION) {
+                next_token(p); /* async */
+                next_token(p); /* function */
+                uint32_t fn = parse_function_common(p, true);
+                if (fn) p->chunk->nodes[fn].flags |= FUNC_FLAG_ASYNC;
+                return emit_node(p, AST_FUNC_DECL, OP_NONE, 0, fn, 0, 0);
+            }
+            uint32_t e = parse_expr(p, true);
+            consume_asi(p);
+            return emit_node(p, AST_EXPR_STMT, OP_NONE, 0, e, 0, 0);
+        }
         case TOK_FUNCTION: {
             next_token(p);
             uint32_t fn = parse_function_common(p, true);

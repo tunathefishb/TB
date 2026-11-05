@@ -25,6 +25,25 @@ void test_url_subsystem(void) {
 
     tb_url_normalize_input("news.ycombinator.com", resolved, sizeof(resolved));
     ASSERT_STR_EQ(resolved, "https://news.ycombinator.com", "Normalize bare domain to https://");
+
+    /* Phase 4: Session Cookie Jar (Set-Cookie parsing, Domain/Path matching, overwrite, Max-Age=0 deletion) */
+    tb_cookies_clear();
+    tb_cookie_set_from_header("https://sub.example.com/app/login", "session=abc123; Path=/app; Secure; HttpOnly");
+    tb_cookie_set_from_header("https://sub.example.com/app/login", "theme=nord; Domain=example.com; Path=/");
+    char *c1 = tb_cookie_get_for_url("https://sub.example.com/app/dashboard");
+    ASSERT_STR_EQ(c1, "session=abc123; theme=nord", "Cookie jar matches path prefix and parent domain");
+    tb_free(c1);
+
+    char *c2 = tb_cookie_get_for_url("http://sub.example.com/app/dashboard");
+    ASSERT_STR_EQ(c2, "theme=nord", "Secure cookie omitted over plain HTTP");
+    tb_free(c2);
+
+    /* Expire session cookie via Max-Age=0 */
+    tb_cookie_set_from_header("https://sub.example.com/app/logout", "session=deleted; Path=/app; Max-Age=0");
+    char *c3 = tb_cookie_get_for_url("https://sub.example.com/app/dashboard");
+    ASSERT_STR_EQ(c3, "theme=nord", "Max-Age=0 deletes matching cookie from jar");
+    tb_free(c3);
+    tb_cookies_clear();
 }
 
 /* ── Test 8: Ephemeral Loopback HTTP/1.1 Server (302 + Chunked Gzip + External JS + fetch + POST) ── */

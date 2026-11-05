@@ -47,6 +47,7 @@ const char *dom_tag_name(DomTag tag) {
 const char *dom_node_tag_name(const DomNode *node) {
     if (!node) return "";
     if (node->type == DOM_NODE_DOCUMENT) return "#document";
+    if (node->type == DOM_NODE_FRAGMENT) return "#document-fragment";
     if (node->type == DOM_NODE_TEXT) return "#text";
     if (node->type == DOM_NODE_COMMENT) return "#comment";
     if (node->tag != TAG_UNKNOWN) return TAG_NAMES[node->tag];
@@ -120,6 +121,69 @@ DomDocument *dom_doc_new(void) {
     return doc;
 }
 
+void dom_clear_css_vars(DomNode *node) {
+    if (!node) return;
+    for (uint16_t i = 0; i < node->css_var_count; i++) {
+        tb_free(node->css_vars[i].name);
+        tb_free(node->css_vars[i].value);
+    }
+    tb_free(node->css_vars);
+    node->css_vars      = NULL;
+    node->css_var_count = 0;
+    node->css_var_cap   = 0;
+}
+
+void dom_set_css_var(DomNode *node, const char *name, const char *value) {
+    if (!node || !name || name[0] != '-' || name[1] != '-') return;
+    if (!value) value = "";
+    for (uint16_t i = 0; i < node->css_var_count; i++) {
+        if (strcmp(node->css_vars[i].name, name) == 0) {
+            char *nv = tb_strdup(value);
+            if (!nv) return;
+            tb_free(node->css_vars[i].value);
+            node->css_vars[i].value = nv;
+            return;
+        }
+    }
+    if (node->css_var_count >= node->css_var_cap) {
+        uint16_t ncap = node->css_var_cap ? (uint16_t)(node->css_var_cap * 2) : 4;
+        DomAttr *na   = (DomAttr *)tb_realloc(node->css_vars, ncap * sizeof(DomAttr));
+        if (!na) return;
+        node->css_vars    = na;
+        node->css_var_cap = ncap;
+    }
+    char *nn = tb_strdup(name);
+    char *nv = tb_strdup(value);
+    if (!nn || !nv) {
+        tb_free(nn);
+        tb_free(nv);
+        return;
+    }
+    node->css_vars[node->css_var_count].name  = nn;
+    node->css_vars[node->css_var_count].value = nv;
+    node->css_var_count++;
+}
+
+const char *dom_get_css_var(const DomNode *node, const char *name) {
+    if (!node || !name) return NULL;
+    for (const DomNode *cur = node; cur; cur = cur->parent) {
+        for (uint16_t i = 0; i < cur->css_var_count; i++) {
+            if (strcmp(cur->css_vars[i].name, name) == 0) {
+                return cur->css_vars[i].value;
+            }
+        }
+    }
+    if (node->owner_doc && node->owner_doc->html) {
+        const DomNode *h = node->owner_doc->html;
+        for (uint16_t i = 0; i < h->css_var_count; i++) {
+            if (strcmp(h->css_vars[i].name, name) == 0) {
+                return h->css_vars[i].value;
+            }
+        }
+    }
+    return NULL;
+}
+
 void dom_node_free(DomNode *node) {
     if (!node) return;
     if (node->owner_doc) {
@@ -141,6 +205,7 @@ void dom_node_free(DomNode *node) {
         tb_free(node->attrs[i].value);
     }
     tb_free(node->attrs);
+    dom_clear_css_vars(node);
     tb_free(node->tag_name);
     tb_free(node->text);
     tb_free(node->form_value);
@@ -188,6 +253,10 @@ DomNode *dom_create_text(DomDocument *doc, const char *text) {
     return n;
 }
 
+DomNode *dom_create_fragment(DomDocument *doc) {
+    return alloc_node(doc, DOM_NODE_FRAGMENT);
+}
+
 static bool is_ancestor_or_self(const DomNode *anc, const DomNode *node) {
     for (const DomNode *cur = node; cur; cur = cur->parent) {
         if (cur == anc) return true;
@@ -209,6 +278,12 @@ static void detach_node(DomNode *child) {
 
 bool dom_append_child(DomNode *parent, DomNode *child) {
     if (!parent || !child || is_ancestor_or_self(child, parent)) return false;
+    if (child->type == DOM_NODE_FRAGMENT) {
+        while (child->first_child) {
+            if (!dom_append_child(parent, child->first_child)) break;
+        }
+        return true;
+    }
     detach_node(child);
     child->owner_doc = parent->owner_doc;
     child->parent    = parent;
@@ -229,6 +304,12 @@ bool dom_insert_before(DomNode *parent, DomNode *new_node, DomNode *ref_node) {
     if (!ref_node) return dom_append_child(parent, new_node);
     if (ref_node->parent != parent || is_ancestor_or_self(new_node, parent)) return false;
     if (new_node == ref_node) return true;
+    if (new_node->type == DOM_NODE_FRAGMENT) {
+        while (new_node->first_child) {
+            if (!dom_insert_before(parent, new_node->first_child, ref_node)) break;
+        }
+        return true;
+    }
     detach_node(new_node);
     new_node->owner_doc    = parent->owner_doc;
     new_node->parent       = parent;
@@ -494,6 +575,12 @@ static void serialize_node_rec(const DomNode *n, TbBuf *b) {
         tb_buf_append_cstr(b, "-->");
         return;
     }
+    if (n->type == DOM_NODE_FRAGMENT || n->type == DOM_NODE_DOCUMENT) {
+        for (const DomNode *ch = n->first_child; ch; ch = ch->next_sibling) {
+            serialize_node_rec(ch, b);
+        }
+        return;
+    }
     if (n->type == DOM_NODE_ELEMENT) {
         const char *tname = dom_node_tag_name(n);
         tb_buf_append_char(b, '<');
@@ -523,6 +610,15 @@ char *dom_get_inner_html(const DomNode *node) {
         for (const DomNode *ch = node->first_child; ch; ch = ch->next_sibling) {
             serialize_node_rec(ch, &b);
         }
+    }
+    return tb_buf_detach(&b, NULL);
+}
+
+char *dom_get_outer_html(const DomNode *node) {
+    TbBuf b;
+    tb_buf_init(&b);
+    if (node) {
+        serialize_node_rec(node, &b);
     }
     return tb_buf_detach(&b, NULL);
 }
@@ -805,12 +901,40 @@ DomDocument *dom_parse_html(const char *html, size_t len) {
 }
 
 void dom_set_inner_html(DomNode *node, const char *html) {
-    if (!node || node->type != DOM_NODE_ELEMENT) return;
+    if (!node || (node->type != DOM_NODE_ELEMENT && node->type != DOM_NODE_FRAGMENT)) return;
     dom_clear_children(node);
     if (html && *html) {
         parse_into_container(node->owner_doc, node, html, strlen(html), true);
     }
     mark_doc_dirty(node, true);
+}
+
+void dom_insert_adjacent_html(DomNode *node, const char *position, const char *html) {
+    if (!node || !position || !html || !*html) return;
+    DomDocument *doc = node->owner_doc;
+    DomNode *frag = dom_create_fragment(doc);
+    if (!frag) return;
+    parse_into_container(doc, frag, html, strlen(html), true);
+    if (tb_strcasecmp(position, "beforebegin") == 0) {
+        if (node->parent) dom_insert_before(node->parent, frag, node);
+    } else if (tb_strcasecmp(position, "afterbegin") == 0) {
+        dom_insert_before(node, frag, node->first_child);
+    } else if (tb_strcasecmp(position, "beforeend") == 0) {
+        dom_append_child(node, frag);
+    } else if (tb_strcasecmp(position, "afterend") == 0) {
+        if (node->parent) dom_insert_before(node->parent, frag, node->next_sibling);
+    }
+    dom_node_free(frag);
+}
+
+void dom_set_outer_html(DomNode *node, const char *html) {
+    if (!node || !node->parent) return;
+    DomNode *parent = node->parent;
+    if (html && *html) {
+        dom_insert_adjacent_html(node, "beforebegin", html);
+    }
+    dom_remove_child(parent, node);
+    dom_node_free(node);
 }
 
 /* ClassList helpers */
@@ -986,9 +1110,56 @@ DomNode *dom_get_element_by_id(const DomNode *root, const char *id) {
     return NULL;
 }
 
+static bool match_nth_child(const DomNode *node, const char *expr, size_t elen) {
+    /* Compute 1-based index among element siblings */
+    int idx = 1;
+    for (const DomNode *p = node->prev_sibling; p; p = p->prev_sibling) {
+        if (p->type == DOM_NODE_ELEMENT) idx++;
+    }
+    while (elen > 0 && tb_isspace(*expr)) { expr++; elen--; }
+    while (elen > 0 && tb_isspace(expr[elen - 1])) elen--;
+    if (elen == 3 && tb_strncasecmp(expr, "odd", 3) == 0) return (idx % 2) == 1;
+    if (elen == 4 && tb_strncasecmp(expr, "even", 4) == 0) return (idx % 2) == 0;
+
+    char buf[64];
+    if (elen == 0 || elen >= sizeof(buf)) return false;
+    /* Strip internal whitespace */
+    size_t w = 0;
+    for (size_t i = 0; i < elen; i++) {
+        if (!tb_isspace(expr[i])) buf[w++] = tb_tolower(expr[i]);
+    }
+    buf[w] = '\0';
+
+    const char *n_pos = strchr(buf, 'n');
+    if (!n_pos) {
+        char *endp = NULL;
+        long b = strtol(buf, &endp, 10);
+        return (endp && *endp == '\0' && idx == (int)b);
+    }
+    int a = 1;
+    if (n_pos == buf) {
+        a = 1;
+    } else if (n_pos == buf + 1 && buf[0] == '+') {
+        a = 1;
+    } else if (n_pos == buf + 1 && buf[0] == '-') {
+        a = -1;
+    } else {
+        a = (int)strtol(buf, NULL, 10);
+    }
+    int b = 0;
+    if (n_pos[1] != '\0') {
+        b = (int)strtol(n_pos + 1, NULL, 10);
+    }
+    if (a == 0) return idx == b;
+    int diff = idx - b;
+    if ((a > 0 && diff < 0) || (a < 0 && diff > 0)) return false;
+    return (diff % a) == 0;
+}
+
 /* CSS Selector matching: supports comma lists, descendant ' ', child '>',
- * tag, *, #id, .class, [attr], [attr=v], [attr^=v], [attr$=v], [attr*=v],
- * :first-child, :last-child, :checked, :disabled */
+ * adjacent sibling '+', general sibling '~', tag, *, #id, .class,
+ * [attr], [attr=v], [attr^=v], [attr$=v], [attr*=v],
+ * :first-child, :last-child, :nth-child(), :not(), :empty, :root, :checked, :disabled, :enabled */
 static bool match_compound(const DomNode *node, const char *s, size_t len) {
     if (!node || node->type != DOM_NODE_ELEMENT || len == 0) return false;
     size_t i = 0;
@@ -1069,9 +1240,16 @@ static bool match_compound(const DomNode *node, const char *s, size_t len) {
             size_t pstart = i;
             while (i < len && s[i] != '#' && s[i] != '.' && s[i] != '[' && s[i] != ':') {
                 if (s[i] == '(') {
-                    while (i < len && s[i] != ')') i++;
+                    int depth = 1;
+                    i++;
+                    while (i < len && depth > 0) {
+                        if (s[i] == '(') depth++;
+                        else if (s[i] == ')') depth--;
+                        i++;
+                    }
+                    break;
                 }
-                if (i < len) i++;
+                i++;
             }
             size_t plen = i - pstart;
             if (plen == 11 && tb_strncasecmp(s + pstart, "first-child", 11) == 0) {
@@ -1084,6 +1262,24 @@ static bool match_compound(const DomNode *node, const char *s, size_t len) {
                 if (!dom_input_get_checked((DomNode *)node)) return false;
             } else if (plen == 8 && tb_strncasecmp(s + pstart, "disabled", 8) == 0) {
                 if (!dom_has_attr(node, "disabled")) return false;
+            } else if (plen == 7 && tb_strncasecmp(s + pstart, "enabled", 7) == 0) {
+                if (dom_has_attr(node, "disabled")) return false;
+            } else if (plen == 4 && tb_strncasecmp(s + pstart, "root", 4) == 0) {
+                if (node->tag != TAG_HTML && !(node->owner_doc && node->owner_doc->html == node)) return false;
+            } else if (plen == 5 && tb_strncasecmp(s + pstart, "empty", 5) == 0) {
+                for (const DomNode *ch = node->first_child; ch; ch = ch->next_sibling) {
+                    if (ch->type == DOM_NODE_ELEMENT) return false;
+                    if (ch->type == DOM_NODE_TEXT && ch->text && ch->text[0] != '\0') return false;
+                }
+            } else if (plen > 5 && tb_strncasecmp(s + pstart, "not(", 4) == 0 && s[pstart + plen - 1] == ')') {
+                char inner[128];
+                size_t ilen = plen - 5;
+                if (ilen >= sizeof(inner)) return false;
+                memcpy(inner, s + pstart + 4, ilen);
+                inner[ilen] = '\0';
+                if (dom_matches_selector(node, inner)) return false;
+            } else if (plen > 11 && tb_strncasecmp(s + pstart, "nth-child(", 10) == 0 && s[pstart + plen - 1] == ')') {
+                if (!match_nth_child(node, s + pstart + 10, plen - 11)) return false;
             } else {
                 /* Unknown pseudo-class (e.g. :hover in non-hovered state) does not match */
                 return false;
@@ -1102,7 +1298,7 @@ static bool match_compound(const DomNode *node, const char *s, size_t len) {
 typedef struct {
     const char *ptr;
     size_t      len;
-    char        comb_to_next; /* ' ' descendant, '>' direct child, 0 rightmost */
+    char        comb_to_next; /* ' ' descendant, '>' child, '+' adjacent sibling, '~' general sibling, 0 rightmost */
 } SelPart;
 
 static bool match_single_chain(const DomNode *node, const char *sel, size_t len) {
@@ -1114,9 +1310,17 @@ static bool match_single_chain(const DomNode *node, const char *sel, size_t len)
         while (i < len && tb_isspace(sel[i])) i++;
         if (i >= len) break;
         size_t start = i;
-        while (i < len && !tb_isspace(sel[i]) && sel[i] != '>') {
+        while (i < len && !tb_isspace(sel[i]) && sel[i] != '>' && sel[i] != '+' && sel[i] != '~') {
             if (sel[i] == '[') {
                 while (i < len && sel[i] != ']') i++;
+            } else if (sel[i] == '(') {
+                int depth = 1;
+                i++;
+                while (i < len && depth > 0) {
+                    if (sel[i] == '(') depth++;
+                    else if (sel[i] == ')') depth--;
+                    if (depth > 0) i++;
+                }
             }
             if (i < len) i++;
         }
@@ -1125,8 +1329,8 @@ static bool match_single_chain(const DomNode *node, const char *sel, size_t len)
         char comb = 0;
         size_t j = i;
         while (j < len && tb_isspace(sel[j])) j++;
-        if (j < len && sel[j] == '>') {
-            comb = '>';
+        if (j < len && (sel[j] == '>' || sel[j] == '+' || sel[j] == '~')) {
+            comb = sel[j];
             j++;
             while (j < len && tb_isspace(sel[j])) j++;
             i = j;
@@ -1149,6 +1353,23 @@ static bool match_single_chain(const DomNode *node, const char *sel, size_t len)
             cur = cur->parent;
             if (!cur || cur->type != DOM_NODE_ELEMENT) return false;
             if (!match_compound(cur, parts[p].ptr, parts[p].len)) return false;
+        } else if (comb == '+') {
+            const DomNode *prev = cur->prev_sibling;
+            while (prev && prev->type != DOM_NODE_ELEMENT) prev = prev->prev_sibling;
+            if (!prev || !match_compound(prev, parts[p].ptr, parts[p].len)) return false;
+            cur = prev;
+        } else if (comb == '~') {
+            const DomNode *prev = cur->prev_sibling;
+            bool found = false;
+            while (prev) {
+                if (prev->type == DOM_NODE_ELEMENT && match_compound(prev, parts[p].ptr, parts[p].len)) {
+                    found = true;
+                    cur = prev;
+                    break;
+                }
+                prev = prev->prev_sibling;
+            }
+            if (!found) return false;
         } else {
             cur = cur->parent;
             bool found = false;
@@ -1171,9 +1392,12 @@ bool dom_matches_selector(const DomNode *node, const char *selector) {
     while (*p) {
         const char *start = p;
         int bracket = 0;
-        while (*p && !(*p == ',' && bracket == 0)) {
+        int paren   = 0;
+        while (*p && !(*p == ',' && bracket == 0 && paren == 0)) {
             if (*p == '[') bracket++;
             else if (*p == ']' && bracket > 0) bracket--;
+            else if (*p == '(') paren++;
+            else if (*p == ')' && paren > 0) paren--;
             p++;
         }
         if (match_single_chain(node, start, (size_t)(p - start))) return true;
