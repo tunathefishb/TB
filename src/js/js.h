@@ -58,8 +58,20 @@ typedef enum {
     NATIVE_TAG_CLASSLIST,
     NATIVE_TAG_DATASET,
     NATIVE_TAG_PERF,
-    NATIVE_TAG_LOCATION
+    NATIVE_TAG_LOCATION,
+    NATIVE_TAG_HISTORY,
+    NATIVE_TAG_STORAGE,
+    NATIVE_TAG_URL,
+    NATIVE_TAG_URL_PARAMS,
+    NATIVE_TAG_MAP,
+    NATIVE_TAG_SET,
+    NATIVE_TAG_PROMISE,
+    NATIVE_TAG_HEADERS,
+    NATIVE_TAG_COMPUTED_STYLE
 } JsNativeTag;
+
+#define OBJ_FLAG_HAS_ACCESSORS 0x01
+#define OBJ_FLAG_BIND_CALLEE   0x02
 
 struct JsObj {
     JsObj    *gc_next;
@@ -105,12 +117,17 @@ typedef struct {
     JsObj    hdr;
     JsObj   *proto;
     JsObj   *func_prototype; /* .prototype object used by `new` */
+    JsObj   *props_obj;      /* Own static/custom properties on function */
+    JsObj   *super_ctor;     /* Base constructor for `class extends` */
+    JsObj   *home_proto;     /* Home object for `super.prop` lookup */
     JsChunk *chunk;
     uint32_t ast_idx;
+    uint32_t field_init_idx; /* Class instance fields AST list */
     JsEnv   *closure;
     JsVal    bound_this;
     bool     is_arrow;
     bool     has_bound_this;
+    bool     is_async;
 } JsFuncObj;
 
 typedef JsVal (*JsNativeFn)(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic);
@@ -144,6 +161,7 @@ struct JsEnv {
     JsEnv    *parent;
     JsEnvVar *vars;
     JsVal     this_val;
+    JsObj    *callee_fn;
     uint16_t  count;
     uint16_t  cap;
     bool      is_func_scope;
@@ -161,13 +179,16 @@ typedef enum {
     AST_REGEX,
     AST_IDENT,
     AST_THIS,
+    AST_SUPER,
     AST_ARRAY,
     AST_OBJECT,
     AST_PROP,
     AST_TEMPLATE,
     AST_FUNC,
+    AST_CLASS,
     AST_PARAM,
     AST_SPREAD,
+    AST_AWAIT,
     AST_UNARY,
     AST_UPDATE,
     AST_BINARY,
@@ -225,9 +246,18 @@ typedef enum {
 
 #define FUNC_FLAG_ARROW      0x01
 #define FUNC_FLAG_EXPR_BODY  0x02
+#define FUNC_FLAG_ASYNC      0x04
 
 #define PROP_FLAG_COMPUTED   0x01
 #define PROP_FLAG_SPREAD     0x02
+#define PROP_FLAG_GETTER     0x04
+#define PROP_FLAG_SETTER     0x08
+#define PROP_FLAG_STATIC     0x10
+#define PROP_FLAG_METHOD     0x20
+#define PROP_FLAG_FIELD      0x40
+
+#define DESTRUCT_FLAG_REST   0x01
+#define DESTRUCT_FLAG_NESTED 0x02
 
 #define OPT_CHAIN_FLAG       0x01
 
@@ -276,16 +306,29 @@ typedef void (*JsAlertCb)(void *userdata, const char *msg);
 typedef bool (*JsFetchCb)(void *userdata, const char *url, const char *method,
                           const char *body, int *out_status, char **out_text);
 
+#define JS_MAX_TIMER_ARGS 4
+
 typedef struct {
     int      id;
     bool     active;
     bool     repeat;
+    bool     is_raf;
     int64_t  interval_ms;
     int64_t  due_ms;
     JsObj   *fn_obj;
+    int      argc;
+    JsVal    args[JS_MAX_TIMER_ARGS];
 } JsTimer;
 
-#define JS_MAX_TIMERS 64
+#define JS_MAX_TIMERS     64
+#define JS_MAX_MICROTASKS 64
+
+typedef struct {
+    JsVal fn;
+    JsVal this_val;
+    int   argc;
+    JsVal args[2];
+} JsMicrotask;
 
 struct JsVm {
     /* GC state */
@@ -308,7 +351,16 @@ struct JsVm {
     JsObj   *func_proto;
     JsObj   *regex_proto;
     JsObj   *elem_proto;
+    JsObj   *promise_proto;
+    JsObj   *map_proto;
+    JsObj   *set_proto;
+    JsObj   *url_proto;
+    JsObj   *url_params_proto;
+    JsObj   *headers_proto;
     JsObj   *doc_obj;
+    JsObj   *local_storage_obj;
+    JsObj   *session_storage_obj;
+    JsObj   *history_obj;
 
     /* Active execution stacks (traced by GC) */
     JsEnv   *env_stack[JS_MAX_CALL_DEPTH * 4];
@@ -316,6 +368,12 @@ struct JsVm {
     JsVal    temp_roots[JS_MAX_TEMP_ROOTS];
     int      temp_sp;
     int      call_depth;
+
+    /* Microtask queue (traced by GC) */
+    JsMicrotask microtasks[JS_MAX_MICROTASKS];
+    int         microtask_head;
+    int         microtask_count;
+    bool        draining_microtasks;
 
     /* Step limit & exception state */
     uint32_t steps;
@@ -332,6 +390,9 @@ struct JsVm {
     /* Bound DOM & Browser callbacks */
     DomDocument *doc;
     const char  *current_url;
+    char         pushed_url[1536];
+    const char  *fetch_extra_headers;
+    const char  *fetch_content_type;
     int          viewport_w;
     int          viewport_h;
     int          scroll_y;
@@ -386,19 +447,32 @@ bool   js_env_define(JsVm *vm, JsEnv *env, JsStr *name, JsVal val, uint16_t decl
 bool   js_env_lookup(JsVm *vm, JsEnv *env, JsStr *name, JsVal *out);
 bool   js_env_assign(JsVm *vm, JsEnv *env, JsStr *name, JsVal val);
 JsVal  js_env_resolve_this(JsVm *vm, JsEnv *env);
+JsEnv *js_env_find_this_env(JsEnv *env);
 
 JsVal  js_get_prop(JsVm *vm, JsVal target, const char *key);
 JsVal  js_get_prop_str(JsVm *vm, JsVal target, JsStr *key);
+JsVal  js_get_prop_proto(JsVm *vm, JsVal receiver, JsObj *proto_start, JsStr *key);
 JsVal  js_get_index(JsVm *vm, JsVal target, uint32_t idx);
 bool   js_set_prop(JsVm *vm, JsVal target, const char *key, JsVal val);
 bool   js_set_prop_str(JsVm *vm, JsVal target, JsStr *key, JsVal val);
 bool   js_set_index(JsVm *vm, JsVal target, uint32_t idx, JsVal val);
 bool   js_del_prop_str(JsVm *vm, JsVal target, JsStr *key);
 bool   js_has_prop_str(JsVm *vm, JsVal target, JsStr *key);
+bool   js_define_accessor(JsVm *vm, JsObj *target, JsStr *key, JsObj *getter, JsObj *setter);
+bool   js_remove_accessor(JsVm *vm, JsObj *target, JsStr *key, bool rem_get, bool rem_set);
+bool   js_define_data_prop(JsVm *vm, JsObj *target, JsStr *key, JsVal val);
 void   js_arr_push(JsVm *vm, JsObj *arr_obj, JsVal val);
 void   js_define_native(JsVm *vm, JsObj *target, const char *name, JsNativeFn fn, int magic);
 
+/* Promises & Microtasks */
+void   js_enqueue_microtask(JsVm *vm, JsVal fn, JsVal this_val, int argc, const JsVal *argv);
+void   js_drain_microtasks(JsVm *vm);
+JsObj *js_promise_new(JsVm *vm, int state, JsVal val);
+void   js_promise_settle(JsVm *vm, JsObj *p, bool fulfilled, JsVal val);
+bool   js_iterable_to_array(JsVm *vm, JsVal src, JsObj *out_arr);
+
 bool   js_strict_eq(JsVal a, JsVal b);
+bool   js_same_value_zero(JsVal a, JsVal b);
 bool   js_loose_eq(JsVm *vm, JsVal a, JsVal b);
 bool   js_to_bool(JsVal v);
 double js_to_num(JsVm *vm, JsVal v);
@@ -424,6 +498,8 @@ static inline bool js_temp_push(JsVm *vm, JsVal v) {
 }
 
 /* DOM Bindings & Events (js_dom.c) */
+void  js_dom_init_timers(JsVm *vm);
+bool  js_step_next_timer(JsVm *vm);
 void  js_bind_document(JsVm *vm, DomDocument *doc, const char *url);
 JsVal js_wrap_dom_node(JsVm *vm, DomNode *node);
 bool  js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out);

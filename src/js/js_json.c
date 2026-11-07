@@ -184,6 +184,7 @@ static bool json_stringify_rec(JsVm *vm, JsVal v, TbBuf *out, int depth) {
                 tb_buf_append_char(out, '{');
                 bool first = true;
                 for (uint32_t i = 0; i < m->count; i++) {
+                    if (m->props[i].key->len > 0 && m->props[i].key->data[0] == '\x01') continue;
                     JsVal pv = m->props[i].val;
                     if (pv.type == JS_UNDEFINED ||
                         (pv.type == JS_OBJECT && pv.u.obj &&

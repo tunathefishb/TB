@@ -710,6 +710,75 @@ static void layout_form_control(LayoutCtx *ctx, DomNode *node, PenStyle parent_p
     tb_buf_free(&b);
 }
 
+static void layout_flex_item_inline(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen) {
+    if (!node) return;
+    if (node->type == DOM_NODE_TEXT) {
+        emit_inline_text(ctx, node->text, node->text ? strlen(node->text) : 0, parent_pen, false);
+        return;
+    }
+    if (node->type != DOM_NODE_ELEMENT || node->style.display == CSS_DISP_NONE) return;
+    if (node->tag == TAG_BUTTON || node->tag == TAG_INPUT ||
+        node->tag == TAG_SELECT || node->tag == TAG_TEXTAREA) {
+        int sx = ctx->at_line_start ? ctx->left_margin : ctx->cur_col;
+        int sy = ctx->cur_line;
+        layout_form_control(ctx, node, parent_pen);
+        node->box_x = (int16_t)sx;
+        node->box_y = (int16_t)sy;
+        node->box_w = (int16_t)(ctx->cur_col - sx > 0 ? ctx->cur_col - sx : 1);
+        node->box_h = 1;
+        return;
+    }
+    int hit_idx = parent_pen.hit_index;
+    if (node->tag == TAG_A && dom_has_attr(node, "href")) {
+        hit_idx = add_hit(ctx->ld, -1, 0, 0, HIT_LINK, node);
+    } else if (node_has_click_handler(node)) {
+        hit_idx = add_hit(ctx->ld, -1, 0, 0, HIT_CLICKABLE, node);
+    }
+    PenStyle my_pen = pen_from_node(node, parent_pen, hit_idx);
+    if (node->style.bg_set && node->style.bg.mode == CSS_COLOR_RGB) {
+        my_pen.bg = node->style.bg;
+    }
+    int pad_l = node->style.margin_left + node->style.padding_left;
+    int pad_r = node->style.margin_right + node->style.padding_right;
+    if (pad_l > 0) {
+        start_content_on_line(ctx);
+        ctx->cur_col += pad_l;
+    }
+    start_content_on_line(ctx);
+    int item_start_col = ctx->cur_col;
+    int item_start_line = ctx->cur_line;
+    for (DomNode *ch = node->first_child; ch; ch = ch->next_sibling) {
+        layout_flex_item_inline(ctx, ch, my_pen);
+    }
+    if (node->style.width_cols > 0 && ctx->cur_col - item_start_col < node->style.width_cols) {
+        ctx->cur_col = item_start_col + node->style.width_cols;
+    }
+    if (pad_r > 0) {
+        ctx->cur_col += pad_r;
+    }
+    node->box_x = (int16_t)item_start_col;
+    node->box_y = (int16_t)item_start_line;
+    node->box_w = (int16_t)(ctx->cur_col - item_start_col > 0 ? ctx->cur_col - item_start_col : 1);
+    node->box_h = (int16_t)(ctx->cur_line - item_start_line + 1);
+}
+
+static void shift_spans_in_range(LayoutDoc *ld, int line_idx, int col_min, int col_max, int shift) {
+    if (shift <= 0 || line_idx < 0 || line_idx >= ld->line_count) return;
+    LayoutLine *ln = &ld->lines[line_idx];
+    for (LayoutSpan *sp = ln->first_span; sp; sp = sp->next) {
+        if (sp->col >= col_min && sp->col < col_max) {
+            sp->col += shift;
+            if (sp->hit_index >= 0 && sp->hit_index < ld->hit_count) {
+                HitBox *hb = &ld->hits[sp->hit_index];
+                if (hb->line_y == line_idx) {
+                    hb->col_start += shift;
+                    hb->col_end   += shift;
+                }
+            }
+        }
+    }
+}
+
 static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int list_ord) {
     if (!node) return;
 
@@ -719,8 +788,10 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
         return;
     }
     if (node->type == DOM_NODE_COMMENT) return;
-    if (node->type == DOM_NODE_DOCUMENT) {
-        DomNode *start = node->owner_doc && node->owner_doc->html ? node->owner_doc->html : node->first_child;
+    if (node->type == DOM_NODE_DOCUMENT || node->type == DOM_NODE_FRAGMENT) {
+        DomNode *start = (node->type == DOM_NODE_DOCUMENT && node->owner_doc && node->owner_doc->html)
+                             ? node->owner_doc->html
+                             : node->first_child;
         for (DomNode *ch = start; ch; ch = ch->next_sibling) {
             layout_node(ctx, ch, parent_pen, 0);
         }
@@ -729,7 +800,13 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
 
     /* Element Node */
     const CssStyle *st = &node->style;
-    if (st->display == CSS_DISP_NONE) return;
+    if (st->display == CSS_DISP_NONE) {
+        node->box_x = 0;
+        node->box_y = 0;
+        node->box_w = 0;
+        node->box_h = 0;
+        return;
+    }
 
     if (node->tag == TAG_BR) {
         if (ctx->at_line_start) start_content_on_line(ctx);
@@ -737,6 +814,10 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
         return;
     }
     if (node->tag == TAG_HR) {
+        node->box_x = (int16_t)ctx->left_margin;
+        node->box_y = (int16_t)ctx->cur_line;
+        node->box_w = (int16_t)(ctx->right_limit - ctx->left_margin);
+        node->box_h = 1;
         draw_horiz_border(ctx, ctx->left_margin, ctx->right_limit - 1, "─", "─",
                           css_rgb(71, 85, 105), (CssColor){0});
         return;
@@ -749,18 +830,35 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
             tb_buf_printf(&b, "[🖼 %s]", alt);
             PenStyle ip = parent_pen;
             ip.fg = css_rgb(148, 163, 184);
+            int sx = ctx->at_line_start ? ctx->left_margin : ctx->cur_col;
+            int sy = ctx->cur_line;
             emit_inline_text(ctx, b.data, b.len, ip, false);
+            node->box_x = (int16_t)sx;
+            node->box_y = (int16_t)sy;
+            node->box_w = (int16_t)utf8_display_width(b.data, b.len);
+            node->box_h = 1;
             tb_buf_free(&b);
         }
         return;
     }
     if (node->tag == TAG_BUTTON || node->tag == TAG_INPUT ||
         node->tag == TAG_SELECT || node->tag == TAG_TEXTAREA) {
+        int sx = ctx->at_line_start ? ctx->left_margin : ctx->cur_col;
+        int sy = ctx->cur_line;
         layout_form_control(ctx, node, parent_pen);
+        node->box_x = (int16_t)sx;
+        node->box_y = (int16_t)sy;
+        node->box_w = (int16_t)(ctx->cur_col - sx > 0 ? ctx->cur_col - sx : 1);
+        node->box_h = 1;
         return;
     }
     if (st->display == CSS_DISP_TABLE || node->tag == TAG_TABLE) {
+        int sy = ctx->cur_line;
+        node->box_x = (int16_t)ctx->left_margin;
         layout_table(ctx, node, parent_pen);
+        node->box_y = (int16_t)sy;
+        node->box_w = (int16_t)(ctx->right_limit - ctx->left_margin);
+        node->box_h = (int16_t)(ctx->cur_line - sy > 0 ? ctx->cur_line - sy : 1);
         return;
     }
 
@@ -774,13 +872,19 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
     PenStyle my_pen = pen_from_node(node, parent_pen, hit_idx);
 
     if (st->display == CSS_DISP_INLINE) {
+        int sx = ctx->at_line_start ? ctx->left_margin : ctx->cur_col;
+        int sy = ctx->cur_line;
         for (DomNode *ch = node->first_child; ch; ch = ch->next_sibling) {
             layout_node(ctx, ch, my_pen, 0);
         }
+        node->box_x = (int16_t)sx;
+        node->box_y = (int16_t)sy;
+        node->box_w = (int16_t)(ctx->cur_line == sy && ctx->cur_col > sx ? ctx->cur_col - sx : (ctx->right_limit - sx));
+        node->box_h = (int16_t)(ctx->cur_line - sy + 1);
         return;
     }
 
-    /* Block or List-Item Container */
+    /* Block, Flex, or List-Item Container */
     newline(ctx);
     if (st->margin_top > ctx->pending_blank_lines) {
         ctx->pending_blank_lines = st->margin_top;
@@ -797,18 +901,20 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
     } else if (st->width_cols < 0) {
         int pct = -st->width_cols;
         int w   = ((ctx->right_limit - ctx->left_margin) * pct) / 100;
-        if (w >= 10) ctx->right_limit = ctx->left_margin + w;
+        if (w >= 4) ctx->right_limit = ctx->left_margin + w;
     }
-    if (ctx->right_limit - ctx->left_margin < 8) {
-        ctx->right_limit = ctx->left_margin + 8;
+    if (ctx->right_limit - ctx->left_margin < 4) {
+        ctx->right_limit = ctx->left_margin + 4;
     }
 
     int box_left  = ctx->left_margin;
     int box_right = ctx->right_limit - 1;
+    int box_start_line = ctx->cur_line + ctx->pending_blank_lines;
     bool pushed_decor = false;
 
     if (st->border || node->tag == TAG_BLOCKQUOTE || (st->bg_set && st->bg.mode == CSS_COLOR_RGB)) {
         flush_pending_blanks(ctx);
+        box_start_line = ctx->cur_line;
         if (st->border) {
             draw_horiz_border(ctx, box_left, box_right, "┌", "┐",
                               st->border_color, st->bg_set ? st->bg : (CssColor){0});
@@ -846,28 +952,87 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
         ctx->pending_blank_lines = 0;
     }
 
-    if (st->display == CSS_DISP_LIST_ITEM) {
+    if (st->display == CSS_DISP_FLEX) {
+        /* Horizontal row layout for flex items with gap & justify-content */
         start_content_on_line(ctx);
-        PenStyle bp = parent_pen;
-        bp.fg        = css_rgb(56, 189, 248);
-        bp.bold      = 1;
-        bp.hit_index = -1;
-        char marker[24];
-        if (list_ord > 0) snprintf(marker, sizeof(marker), "%d. ", list_ord);
-        else snprintf(marker, sizeof(marker), " • ");
-        int mw = utf8_display_width(marker, strlen(marker));
-        append_span_raw(ctx->ld, ctx->cur_line, ctx->cur_col, marker, strlen(marker), mw, bp);
-        ctx->cur_col     += mw;
-        ctx->left_margin += mw;
-    }
+        int flex_line = ctx->cur_line;
+        int flex_left = ctx->left_margin;
+        int gap = st->gap > 0 ? st->gap : 1;
 
-    int child_ord = (node->tag == TAG_OL) ? 1 : 0;
-    for (DomNode *ch = node->first_child; ch; ch = ch->next_sibling) {
-        int pass_ord = 0;
-        if (ch->type == DOM_NODE_ELEMENT && ch->style.display == CSS_DISP_LIST_ITEM) {
-            pass_ord = (node->tag == TAG_OL) ? child_ord++ : 0;
+        DomNode *items[64];
+        int item_c0[64], item_c1[64];
+        int n_items = 0;
+
+        for (DomNode *ch = node->first_child; ch && n_items < 64; ch = ch->next_sibling) {
+            if (ch->type == DOM_NODE_COMMENT) continue;
+            if (ch->type == DOM_NODE_ELEMENT && ch->style.display == CSS_DISP_NONE) continue;
+            if (ch->type == DOM_NODE_TEXT) {
+                const char *t = ch->text ? ch->text : "";
+                while (*t && tb_isspace(*t)) t++;
+                if (!*t) continue;
+            }
+            if (n_items > 0 && ctx->cur_line == flex_line) {
+                ctx->cur_col += gap;
+            }
+            int c0 = ctx->cur_col;
+            layout_flex_item_inline(ctx, ch, my_pen);
+            int c1 = ctx->cur_col;
+            items[n_items]   = ch;
+            item_c0[n_items] = c0;
+            item_c1[n_items] = c1;
+            n_items++;
         }
-        layout_node(ctx, ch, my_pen, pass_ord);
+
+        if (n_items > 0 && ctx->cur_line == flex_line) {
+            int avail = ctx->right_limit - flex_left;
+            int used  = ctx->cur_col - flex_left;
+            int extra = avail - used;
+            if (extra > 0) {
+                if (st->justify_content == CSS_JUSTIFY_CENTER ||
+                    st->justify_content == CSS_JUSTIFY_END) {
+                    int sh = (st->justify_content == CSS_JUSTIFY_CENTER) ? (extra / 2) : extra;
+                    shift_spans_in_range(ctx->ld, flex_line, flex_left, ctx->right_limit, sh);
+                    for (int k = 0; k < n_items; k++) items[k]->box_x += (int16_t)sh;
+                } else if (st->justify_content == CSS_JUSTIFY_SPACE_BETWEEN && n_items > 1) {
+                    /* Shift from rightmost item to leftmost so ranges never collide */
+                    for (int k = n_items - 1; k >= 1; k--) {
+                        int sh = (extra * k) / (n_items - 1);
+                        shift_spans_in_range(ctx->ld, flex_line, item_c0[k], item_c1[k], sh);
+                        items[k]->box_x += (int16_t)sh;
+                    }
+                } else if (st->justify_content == CSS_JUSTIFY_SPACE_AROUND && n_items >= 1) {
+                    for (int k = n_items - 1; k >= 0; k--) {
+                        int sh = (extra * (2 * k + 1)) / (2 * n_items);
+                        shift_spans_in_range(ctx->ld, flex_line, item_c0[k], item_c1[k], sh);
+                        items[k]->box_x += (int16_t)sh;
+                    }
+                }
+            }
+        }
+    } else {
+        if (st->display == CSS_DISP_LIST_ITEM) {
+            start_content_on_line(ctx);
+            PenStyle bp = parent_pen;
+            bp.fg        = css_rgb(56, 189, 248);
+            bp.bold      = 1;
+            bp.hit_index = -1;
+            char marker[24];
+            if (list_ord > 0) snprintf(marker, sizeof(marker), "%d. ", list_ord);
+            else snprintf(marker, sizeof(marker), " • ");
+            int mw = utf8_display_width(marker, strlen(marker));
+            append_span_raw(ctx->ld, ctx->cur_line, ctx->cur_col, marker, strlen(marker), mw, bp);
+            ctx->cur_col     += mw;
+            ctx->left_margin += mw;
+        }
+
+        int child_ord = (node->tag == TAG_OL) ? 1 : 0;
+        for (DomNode *ch = node->first_child; ch; ch = ch->next_sibling) {
+            int pass_ord = 0;
+            if (ch->type == DOM_NODE_ELEMENT && ch->style.display == CSS_DISP_LIST_ITEM) {
+                pass_ord = (node->tag == TAG_OL) ? child_ord++ : 0;
+            }
+            layout_node(ctx, ch, my_pen, pass_ord);
+        }
     }
 
     newline(ctx);
@@ -887,6 +1052,12 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
                               st->border_color, st->bg_set ? st->bg : (CssColor){0});
         }
     }
+
+    int box_end_line = ctx->cur_line;
+    node->box_x = (int16_t)box_left;
+    node->box_y = (int16_t)box_start_line;
+    node->box_w = (int16_t)(box_right - box_left + 1);
+    node->box_h = (int16_t)(box_end_line > box_start_line ? box_end_line - box_start_line : 1);
 
     ctx->left_margin = saved_left;
     ctx->right_limit = saved_right;
@@ -911,7 +1082,7 @@ void layout_build(LayoutDoc *ld, DomDocument *doc, int viewport_w,
     ld->viewport_w = viewport_w;
 
     if (!doc || !doc->root) return;
-    if (doc->dirty_style) css_compute_document(doc, NULL);
+    if (doc->dirty_style) css_compute_document_ex(doc, NULL, viewport_w);
 
     LayoutCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -929,8 +1100,16 @@ void layout_build(LayoutDoc *ld, DomDocument *doc, int viewport_w,
     root_pen.fg        = css_rgb(226, 232, 240);
     root_pen.hit_index = -1;
 
+    if (doc->html) {
+        doc->html->box_x = 0;
+        doc->html->box_y = 0;
+        doc->html->box_w = (int16_t)viewport_w;
+    }
     layout_node(&ctx, doc->body ? doc->body : doc->root, root_pen, 0);
     newline(&ctx);
+    if (doc->html) {
+        doc->html->box_h = (int16_t)(ld->line_count > 0 ? ld->line_count : 1);
+    }
 
     /* Materialize compact plain-text line cache for fast `/` search */
     TbBuf pb;

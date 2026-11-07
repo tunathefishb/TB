@@ -25,6 +25,39 @@ void test_url_subsystem(void) {
 
     tb_url_normalize_input("news.ycombinator.com", resolved, sizeof(resolved));
     ASSERT_STR_EQ(resolved, "https://news.ycombinator.com", "Normalize bare domain to https://");
+
+    /* Phase 4: Session Cookie Jar (Set-Cookie parsing, Domain/Path matching, overwrite, Max-Age=0 deletion) */
+    tb_cookies_clear();
+    TbUrl cu_login, cu_dash_https, cu_dash_http, cu_logout;
+    tb_url_parse("https://sub.example.com/app/login", &cu_login);
+    tb_url_parse("https://sub.example.com/app/dashboard", &cu_dash_https);
+    tb_url_parse("http://sub.example.com/app/dashboard", &cu_dash_http);
+    tb_url_parse("https://sub.example.com/app/logout", &cu_logout);
+
+    tb_cookie_set_from_header(&cu_login, "session=abc123; Path=/app; Secure; HttpOnly", false);
+    tb_cookie_set_from_header(&cu_login, "theme=nord; Domain=example.com; Path=/", false);
+    char c1[256] = "";
+    tb_cookie_get_for_url(&cu_dash_https, false, c1, sizeof(c1));
+    ASSERT_STR_EQ(c1, "session=abc123; theme=nord", "Cookie jar matches path prefix and parent domain");
+
+    char c2[256] = "";
+    tb_cookie_get_for_url(&cu_dash_http, false, c2, sizeof(c2));
+    ASSERT_STR_EQ(c2, "theme=nord", "Secure cookie omitted over plain HTTP");
+
+    /* Expire session cookie via Max-Age=0 */
+    tb_cookie_set_from_header(&cu_logout, "session=deleted; Path=/app; Max-Age=0", false);
+    char c3[256] = "";
+    tb_cookie_get_for_url(&cu_dash_https, false, c3, sizeof(c3));
+    ASSERT_STR_EQ(c3, "theme=nord", "Max-Age=0 deletes matching cookie from jar");
+
+    /* Reject cross-domain cookie tossing (Domain=other.org from sub.example.com) */
+    TbUrl cu_other;
+    tb_url_parse("https://other.org/", &cu_other);
+    tb_cookie_set_from_header(&cu_login, "evil=1; Domain=other.org; Path=/", false);
+    char c4[256] = "";
+    tb_cookie_get_for_url(&cu_other, false, c4, sizeof(c4));
+    ASSERT_STR_EQ(c4, "", "Cross-domain Domain= attribute rejected");
+    tb_cookies_clear();
 }
 
 /* ── Test 8: Ephemeral Loopback HTTP/1.1 Server (302 + Chunked Gzip + External JS + fetch + POST) ── */

@@ -72,15 +72,19 @@ static bool cb_fetch(void *ud, const char *url, const char *method,
                      const char *body, int *out_status, char **out_text) {
     TbBrowser *b = (TbBrowser *)ud;
     char resolved[1536];
+    const char *base_str = (b->vm && b->vm->current_url) ? b->vm->current_url : b->current_url;
     TbUrl base;
-    if (tb_url_parse(b->current_url, &base)) {
+    if (tb_url_parse(base_str, &base)) {
         tb_url_resolve(&base, url, resolved, sizeof(resolved));
     } else {
         tb_url_normalize_input(url, resolved, sizeof(resolved));
     }
 
+    const char *ct    = (b->vm && b->vm->fetch_content_type) ? b->vm->fetch_content_type : "application/json";
+    const char *extra = (b->vm && b->vm->fetch_extra_headers) ? b->vm->fetch_extra_headers : NULL;
+
     TbResponse resp;
-    if (!tb_fetch(resolved, method, body, "application/json", b->insecure_tls, &resp)) {
+    if (!tb_fetch_ex(resolved, method, body, ct, extra, b->insecure_tls, &resp)) {
         *out_status = 0;
         *out_text   = tb_strdup(resp.error);
         tb_response_free(&resp);
@@ -128,6 +132,66 @@ void tb_browser_free(TbBrowser *b) {
     clear_console_logs(b);
     tb_net_cleanup();
     tb_mem_trim();
+}
+
+static void collect_links_rec(DomNode *n, DomNodeList *out) {
+    if (!n) return;
+    if (n->type == DOM_NODE_ELEMENT && n->tag == TAG_LINK) {
+        dom_nodelist_push(out, n);
+        return;
+    }
+    for (DomNode *ch = n->first_child; ch; ch = ch->next_sibling) {
+        collect_links_rec(ch, out);
+    }
+}
+
+static void load_external_stylesheets(TbBrowser *b) {
+    if (!b || !b->doc || !b->doc->root) return;
+    DomNodeList links;
+    dom_nodelist_init(&links);
+    collect_links_rec(b->doc->root, &links);
+
+    int ext_loaded = 0;
+    TbUrl base_url;
+    bool has_base = tb_url_parse(b->current_url, &base_url);
+
+    for (size_t i = 0; i < links.count && ext_loaded < 8; i++) {
+        DomNode *ln = links.items[i];
+        const char *rel  = dom_get_attr(ln, "rel");
+        const char *href = dom_get_attr(ln, "href");
+        if (!rel || !href || !*href) continue;
+        /* Match rel="stylesheet" (case-insensitive token) */
+        bool is_ss = false;
+        const char *p = rel;
+        while (*p) {
+            while (*p && tb_isspace(*p)) p++;
+            const char *s = p;
+            while (*p && !tb_isspace(*p)) p++;
+            if ((size_t)(p - s) == 10 && tb_strncasecmp(s, "stylesheet", 10) == 0) {
+                is_ss = true;
+                break;
+            }
+        }
+        if (!is_ss) continue;
+
+        char css_url[1536];
+        if (has_base) tb_url_resolve(&base_url, href, css_url, sizeof(css_url));
+        else tb_url_normalize_input(href, css_url, sizeof(css_url));
+
+        TbResponse cresp;
+        if (tb_fetch(css_url, "GET", NULL, NULL, b->insecure_tls, &cresp) &&
+            cresp.status >= 200 && cresp.status < 400 && cresp.body) {
+            ext_loaded++;
+            /* Convert in-DOM <link> into <style> node in-place to preserve cascade order */
+            ln->tag = TAG_STYLE;
+            tb_free(ln->tag_name);
+            ln->tag_name = NULL;
+            dom_set_text_content(ln, cresp.body);
+            b->doc->dirty_style = true;
+        }
+        tb_response_free(&cresp);
+    }
+    dom_nodelist_free(&links);
 }
 
 static void collect_scripts_rec(DomNode *n, DomNodeList *out) {
@@ -299,6 +363,8 @@ static bool navigate_with_method(TbBrowser *b, const char *raw_url, const char *
     /* Free raw HTML buffer immediately now that DOM is constructed */
     tb_response_free(&resp);
 
+    load_external_stylesheets(b);
+
     b->scroll_y = 0;
     b->vm       = js_vm_new();
     if (b->vm && b->doc) {
@@ -314,6 +380,10 @@ static bool navigate_with_method(TbBrowser *b, const char *raw_url, const char *
 
         js_bind_document(b->vm, b->doc, b->current_url);
         execute_page_scripts(b);
+        if (b->vm->pushed_url[0]) {
+            snprintf(b->current_url, sizeof(b->current_url), "%s", b->vm->pushed_url);
+            b->vm->current_url = b->current_url;
+        }
         js_gc_collect(b->vm);
     }
 

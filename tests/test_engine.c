@@ -5,6 +5,7 @@
 #include "js.h"
 #include "layout.h"
 #include "mem.h"
+#include "net.h"
 
 /* ── Test 4: HTML5 Parser, Entities, CSS Specificity Cascade, & Selectors ── */
 void test_dom_and_css(void) {
@@ -42,6 +43,176 @@ void test_dom_and_css(void) {
     DomNode *li = dom_query_selector(doc->root, "div.card > ul li.active[data-role^='js']:first-child");
     ASSERT_TRUE(li != NULL, "Complex combinator + attribute + :first-child selector");
     dom_doc_free(doc);
+
+    /* Phase 1 & Phase 3: CSS Custom Properties (--* / var()), !important, @media,
+     * + / ~ / :not() / :nth-child() / :empty / :root selectors, #rgba & hsl() colors,
+     * display:flex row layout with gap & justify-content, getComputedStyle,
+     * getBoundingClientRect, CustomEvent, history.pushState, and modern DOM convenience APIs */
+    const char *modern_html =
+        "<!DOCTYPE html><html><head><style>"
+        "  :root { --brand: #102030; --accent: hsl(120, 100%, 50%); }"
+        "  .box { color: var(--brand); width: 20px; }"
+        "  .first { color: #998877 !important; }"
+        "  .override-try { color: #111111; }"
+        "  .first + .second { color: var(--accent); }"
+        "  .first ~ .third:not(.skip):nth-child(3) { font-weight: bold; }"
+        "  .empty-el:empty { display: none; }"
+        "  @media (min-width: 40px) { .row { display: flex; gap: 16px; justify-content: space-between; } }"
+        "  @media print { .row { display: none !important; } }"
+        "</style></head><body>"
+        "<div id='flex-row' class='row'>"
+        "  <div id='item1' class='box first'>One</div>"
+        "  <div id='item2' class='box second'>Two</div>"
+        "  <div id='item3' class='box third'>Three</div>"
+        "</div>"
+        "<div id='empty1' class='empty-el'></div>"
+        "<div id='dom-play'><span id='anchor'>Mid</span></div>"
+        "</body></html>";
+
+    DomDocument *mdoc = dom_parse_html(modern_html, strlen(modern_html));
+    ASSERT_TRUE(mdoc != NULL, "Parse modern CSS & flex HTML");
+
+    LayoutDoc ldoc;
+    layout_init(&ldoc);
+    layout_build(&ldoc, mdoc, 80, NULL, 0);
+
+    DomNode *item1 = dom_get_element_by_id(mdoc->root, "item1");
+    DomNode *item2 = dom_get_element_by_id(mdoc->root, "item2");
+    DomNode *item3 = dom_get_element_by_id(mdoc->root, "item3");
+    DomNode *empty1 = dom_get_element_by_id(mdoc->root, "empty1");
+
+    ASSERT_TRUE(item1 && item1->style.fg.r == 0x99 && item1->style.fg.g == 0x88 && item1->style.fg.b == 0x77,
+                "!important color overrides var(--brand)");
+    ASSERT_TRUE(item2 && item2->style.fg.r == 0x00 && item2->style.fg.g == 0xff && item2->style.fg.b == 0x00,
+                "Adjacent sibling (.first + .second) + var(--accent) + hsl(120,100%,50%) resolved to pure green");
+    ASSERT_TRUE(item3 && item3->style.bold == 1,
+                "General sibling (.first ~ .third:not(.skip):nth-child(3)) matched");
+    ASSERT_TRUE(empty1 && empty1->style.display == CSS_DISP_NONE,
+                ":empty pseudo-class hid empty element");
+    ASSERT_TRUE(item1 && item2 && item3 && item1->box_y == item2->box_y && item2->box_y == item3->box_y &&
+                item2->box_x > item1->box_x && item3->box_x > item2->box_x,
+                "display:flex positioned child items horizontally on the same row with space-between");
+
+    JsVm *vm = js_vm_new();
+    vm->viewport_w = 80;
+    vm->viewport_h = 24;
+    js_bind_document(vm, mdoc, "https://example.com:8080/app/index.html?tab=1#top");
+
+    const char *dom_api_js =
+        "const play = document.getElementById('dom-play');\n"
+        "const anchor = document.getElementById('anchor');\n"
+        "const pre = document.createElement('b'); pre.textContent = 'Pre';\n"
+        "const post = document.createElement('i'); post.textContent = 'Post';\n"
+        "anchor.before(pre);\n"
+        "anchor.after(post);\n"
+        "play.insertAdjacentHTML('beforeend', '<u id=\"adj\">Adj</u>');\n"
+        "const frag = document.createDocumentFragment();\n"
+        "const f1 = document.createElement('em'); f1.textContent = 'Frag';\n"
+        "frag.append(f1);\n"
+        "play.append(frag);\n"
+        "const cs = getComputedStyle(document.getElementById('flex-row'));\n"
+        "const rect = document.getElementById('item2').getBoundingClientRect();\n"
+        "let evDetail = '';\n"
+        "play.addEventListener('custom-ping', e => { evDetail = e.detail.msg; });\n"
+        "anchor.dispatchEvent(new CustomEvent('custom-ping', { bubbles: true, detail: { msg: 'pong!' } }));\n"
+        "history.pushState({ page: 2 }, '', '/app/next?tab=2#sec');\n"
+        "document.cookie = 'sid=xyz987; Path=/';\n"
+        "JSON.stringify({\n"
+        "  text: play.textContent,\n"
+        "  containsAdj: play.contains(document.getElementById('adj')),\n"
+        "  display: cs.display,\n"
+        "  justify: cs.justifyContent,\n"
+        "  item2LeftPos: rect.left > 0,\n"
+        "  evDetail,\n"
+        "  locPath: location.pathname,\n"
+        "  locSearch: location.search,\n"
+        "  locHash: location.hash,\n"
+        "  histLen: history.length,\n"
+        "  cookie: document.cookie\n"
+        "});";
+
+    JsVal dres = js_undefined();
+    bool dok = js_eval(vm, dom_api_js, strlen(dom_api_js), &dres);
+    ASSERT_TRUE(dok && dres.type == JS_OBJECT && dres.u.obj->obj_type == OBJ_STRING,
+                "DOM convenience APIs, getComputedStyle, getBoundingClientRect, CustomEvent, history/location & cookie script succeeds");
+    if (dok && dres.type == JS_OBJECT && dres.u.obj->obj_type == OBJ_STRING) {
+        const char *got = ((JsStr *)dres.u.obj)->data;
+        const char *exp =
+            "{\"text\":\"PreMidPostAdjFrag\",\"containsAdj\":true,"
+            "\"display\":\"flex\",\"justify\":\"space-between\",\"item2LeftPos\":true,"
+            "\"evDetail\":\"pong!\",\"locPath\":\"/app/next\",\"locSearch\":\"?tab=2\","
+            "\"locHash\":\"#sec\",\"histLen\":2,\"cookie\":\"sid=xyz987\"}";
+        ASSERT_STR_EQ(got, exp, "Exact DOM convenience, geometry, event, history/location & cookie verification");
+    }
+
+    const char *edge_dom_js =
+        "const styleEl = document.createElement('style');\n"
+        "styleEl.textContent = '#var-test { display: none; display: var(--undef-var); color: #123456; }';\n"
+        "document.head.appendChild(styleEl);\n"
+        "const vt = document.createElement('div'); vt.id = 'var-test';\n"
+        "document.body.appendChild(vt);\n"
+        "const dispBefore = getComputedStyle(vt).display;\n"
+        "vt.style.display = 'block';\n"
+        "const dispInline = getComputedStyle(vt).display;\n"
+        "vt.style.display = '';\n"
+        "const dispAfterClear = getComputedStyle(vt).display;\n"
+        "vt.style.setProperty('--undef-var', 'flex');\n"
+        "const dispWithCustom = getComputedStyle(vt).display;\n"
+        "vt.style.removeProperty('--undef-var');\n"
+        "const dispAfterRemove = getComputedStyle(vt).display;\n"
+        "const tree = document.createElement('div');\n"
+        "tree.innerHTML = '<div class=\"outer\"><div class=\"mid\"><div class=\"mid\"><span id=\"bt-leaf\" class=\"leaf\">L</span></div></div></div>'\n"
+        "               + '<div class=\"sbox\"><b class=\"sa\"></b><i class=\"sb\"></i><i class=\"sb\"><u id=\"bt-sib\">S</u></i></div>';\n"
+        "document.body.appendChild(tree);\n"
+        "const m1 = tree.querySelector('.outer > .mid .leaf');\n"
+        "const m2 = tree.querySelector('.sa ~ .sb + .sb > #bt-sib');\n"
+        "const victim = document.createElement('span'); victim.id = 'victim';\n"
+        "victim.innerHTML = '<b id=\"victim-child\">old</b>';\n"
+        "tree.appendChild(victim);\n"
+        "const victimChild = document.getElementById('victim-child');\n"
+        "victim.outerHTML = '<strong id=\"survivor\">new</strong>';\n"
+        "const byId = document.getElementById.bind(document);\n"
+        "const surv = byId('survivor');\n"
+        "let timerResolved = false;\n"
+        "new Promise(resolve => setTimeout(resolve, 0)).then(() => { timerResolved = true; });\n";
+    JsVal eres = js_undefined();
+    bool eok = js_eval(vm, edge_dom_js, strlen(edge_dom_js), &eres);
+    js_run_timers(vm);
+    js_gc_collect(vm);
+    const char *edge_dom_verify =
+        "JSON.stringify({\n"
+        "  dispBefore,\n"
+        "  dispInline,\n"
+        "  dispAfterClear,\n"
+        "  dispWithCustom,\n"
+        "  dispAfterRemove,\n"
+        "  btLeaf: m1 ? m1.id : null,\n"
+        "  btSib: m2 ? m2.id : null,\n"
+        "  victimTag: victimChild.parentNode ? victimChild.parentNode.tagName : null,\n"
+        "  victimParent: victimChild.parentNode ? victimChild.parentNode.parentNode : 'detached',\n"
+        "  survText: surv ? surv.textContent : null,\n"
+        "  timerResolved\n"
+        "});";
+    eok = eok && js_eval(vm, edge_dom_verify, strlen(edge_dom_verify), &eres);
+    ASSERT_TRUE(eok && eres.type == JS_OBJECT && eres.u.obj->obj_type == OBJ_STRING,
+                "DOM/CSS edge-case regression script succeeds");
+    if (eok && eres.type == JS_OBJECT && eres.u.obj->obj_type == OBJ_STRING) {
+        const char *got = ((JsStr *)eres.u.obj)->data;
+        const char *exp =
+            "{\"dispBefore\":\"none\",\"dispInline\":\"block\",\"dispAfterClear\":\"none\","
+            "\"dispWithCustom\":\"flex\",\"dispAfterRemove\":\"none\",\"btLeaf\":\"bt-leaf\",\"btSib\":\"bt-sib\","
+            "\"victimTag\":\"SPAN\",\"victimParent\":null,\"survText\":\"new\",\"timerResolved\":true}";
+        ASSERT_STR_EQ(got, exp, "CSS var(--undef) & dynamic custom prop set/remove, selector backtracking, outerHTML descendant wrapper safety, bound native DOM method, and setTimeout(resolve)");
+    }
+
+    tb_cookies_clear();
+    js_vm_free(vm);
+    layout_free(&ldoc);
+    dom_doc_free(mdoc);
+    TbMemStats mst;
+    tb_mem_stats(&mst);
+    ASSERT_TRUE(mst.heap_live == 0,
+                "Zero leaked bytes on custom slab allocator after DOM/JS teardown (including detached outerHTML subtrees)");
 }
 
 /* ── Test 7: Full Browser Controller, Interactive Widgets, History, & Demos ── */
