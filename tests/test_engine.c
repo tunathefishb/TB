@@ -145,10 +145,74 @@ void test_dom_and_css(void) {
         ASSERT_STR_EQ(got, exp, "Exact DOM convenience, geometry, event, history/location & cookie verification");
     }
 
+    const char *edge_dom_js =
+        "const styleEl = document.createElement('style');\n"
+        "styleEl.textContent = '#var-test { display: none; display: var(--undef-var); color: #123456; }';\n"
+        "document.head.appendChild(styleEl);\n"
+        "const vt = document.createElement('div'); vt.id = 'var-test';\n"
+        "document.body.appendChild(vt);\n"
+        "const dispBefore = getComputedStyle(vt).display;\n"
+        "vt.style.display = 'block';\n"
+        "const dispInline = getComputedStyle(vt).display;\n"
+        "vt.style.display = '';\n"
+        "const dispAfterClear = getComputedStyle(vt).display;\n"
+        "vt.style.setProperty('--undef-var', 'flex');\n"
+        "const dispWithCustom = getComputedStyle(vt).display;\n"
+        "vt.style.removeProperty('--undef-var');\n"
+        "const dispAfterRemove = getComputedStyle(vt).display;\n"
+        "const tree = document.createElement('div');\n"
+        "tree.innerHTML = '<div class=\"outer\"><div class=\"mid\"><div class=\"mid\"><span id=\"bt-leaf\" class=\"leaf\">L</span></div></div></div>'\n"
+        "               + '<div class=\"sbox\"><b class=\"sa\"></b><i class=\"sb\"></i><i class=\"sb\"><u id=\"bt-sib\">S</u></i></div>';\n"
+        "document.body.appendChild(tree);\n"
+        "const m1 = tree.querySelector('.outer > .mid .leaf');\n"
+        "const m2 = tree.querySelector('.sa ~ .sb + .sb > #bt-sib');\n"
+        "const victim = document.createElement('span'); victim.id = 'victim';\n"
+        "victim.innerHTML = '<b id=\"victim-child\">old</b>';\n"
+        "tree.appendChild(victim);\n"
+        "const victimChild = document.getElementById('victim-child');\n"
+        "victim.outerHTML = '<strong id=\"survivor\">new</strong>';\n"
+        "const byId = document.getElementById.bind(document);\n"
+        "const surv = byId('survivor');\n"
+        "let timerResolved = false;\n"
+        "new Promise(resolve => setTimeout(resolve, 0)).then(() => { timerResolved = true; });\n";
+    JsVal eres = js_undefined();
+    bool eok = js_eval(vm, edge_dom_js, strlen(edge_dom_js), &eres);
+    js_run_timers(vm);
+    js_gc_collect(vm);
+    const char *edge_dom_verify =
+        "JSON.stringify({\n"
+        "  dispBefore,\n"
+        "  dispInline,\n"
+        "  dispAfterClear,\n"
+        "  dispWithCustom,\n"
+        "  dispAfterRemove,\n"
+        "  btLeaf: m1 ? m1.id : null,\n"
+        "  btSib: m2 ? m2.id : null,\n"
+        "  victimTag: victimChild.parentNode ? victimChild.parentNode.tagName : null,\n"
+        "  victimParent: victimChild.parentNode ? victimChild.parentNode.parentNode : 'detached',\n"
+        "  survText: surv ? surv.textContent : null,\n"
+        "  timerResolved\n"
+        "});";
+    eok = eok && js_eval(vm, edge_dom_verify, strlen(edge_dom_verify), &eres);
+    ASSERT_TRUE(eok && eres.type == JS_OBJECT && eres.u.obj->obj_type == OBJ_STRING,
+                "DOM/CSS edge-case regression script succeeds");
+    if (eok && eres.type == JS_OBJECT && eres.u.obj->obj_type == OBJ_STRING) {
+        const char *got = ((JsStr *)eres.u.obj)->data;
+        const char *exp =
+            "{\"dispBefore\":\"none\",\"dispInline\":\"block\",\"dispAfterClear\":\"none\","
+            "\"dispWithCustom\":\"flex\",\"dispAfterRemove\":\"none\",\"btLeaf\":\"bt-leaf\",\"btSib\":\"bt-sib\","
+            "\"victimTag\":\"SPAN\",\"victimParent\":null,\"survText\":\"new\",\"timerResolved\":true}";
+        ASSERT_STR_EQ(got, exp, "CSS var(--undef) & dynamic custom prop set/remove, selector backtracking, outerHTML descendant wrapper safety, bound native DOM method, and setTimeout(resolve)");
+    }
+
     tb_cookies_clear();
     js_vm_free(vm);
     layout_free(&ldoc);
     dom_doc_free(mdoc);
+    TbMemStats mst;
+    tb_mem_stats(&mst);
+    ASSERT_TRUE(mst.heap_live == 0,
+                "Zero leaked bytes on custom slab allocator after DOM/JS teardown (including detached outerHTML subtrees)");
 }
 
 /* ── Test 7: Full Browser Controller, Interactive Widgets, History, & Demos ── */

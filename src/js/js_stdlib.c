@@ -394,10 +394,34 @@ static JsVal fn_num_proto(JsVm *vm, JsVal this_val, int argc, const JsVal *argv,
 typedef enum {
     FN_CALL = 0,
     FN_APPLY,
-    FN_BIND
+    FN_BIND,
+    FN_BOUND_CALL
 } JsFuncProtoMagic;
 
 static JsVal fn_func_proto(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
+    if (magic == FN_BOUND_CALL) {
+        if (this_val.type != JS_OBJECT || !this_val.u.obj) return js_undefined();
+        JsVal target = js_get_prop(vm, this_val, "_target");
+        JsVal bthis  = js_get_prop(vm, this_val, "_this");
+        JsVal bargs  = js_get_prop(vm, this_val, "_args");
+        if (bargs.type == JS_OBJECT && bargs.u.obj && bargs.u.obj->obj_type == OBJ_ARRAY) {
+            JsArrObj *ba = (JsArrObj *)bargs.u.obj;
+            int total = (int)ba->len + argc;
+            int sp = vm->temp_sp;
+            int pushed = 0;
+            for (uint32_t i = 0; i < ba->len; i++) {
+                if (js_temp_push(vm, ba->items[i])) pushed++;
+            }
+            for (int i = 0; i < argc; i++) {
+                if (js_temp_push(vm, argv[i])) pushed++;
+            }
+            JsVal r = js_call(vm, target, bthis, pushed < total ? pushed : total, &vm->temp_roots[sp]);
+            vm->temp_sp = sp;
+            return r;
+        }
+        return js_call(vm, target, bthis, argc, argv);
+    }
+
     JsVal bound_this = argc > 0 ? argv[0] : js_undefined();
     if (magic == FN_CALL) {
         return js_call(vm, this_val, bound_this, argc > 1 ? argc - 1 : 0, argc > 1 ? argv + 1 : NULL);
@@ -411,13 +435,39 @@ static JsVal fn_func_proto(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
         return js_call(vm, this_val, bound_this, 0, NULL);
     }
     /* FN_BIND */
-    if (this_val.type == JS_OBJECT && this_val.u.obj && this_val.u.obj->obj_type == OBJ_FUNC) {
-        JsFuncObj *orig = (JsFuncObj *)this_val.u.obj;
-        JsFuncObj *copy = (JsFuncObj *)js_func_new(vm, orig->chunk, orig->ast_idx, orig->closure, orig->is_arrow);
-        if (copy) {
-            copy->bound_this     = bound_this;
-            copy->has_bound_this = true;
-            return js_obj_val((JsObj *)copy);
+    if (this_val.type == JS_OBJECT && this_val.u.obj) {
+        if (argc <= 1 && this_val.u.obj->obj_type == OBJ_FUNC) {
+            JsFuncObj *orig = (JsFuncObj *)this_val.u.obj;
+            JsFuncObj *copy = (JsFuncObj *)js_func_new(vm, orig->chunk, orig->ast_idx, orig->closure, orig->is_arrow);
+            if (copy) {
+                copy->bound_this     = orig->has_bound_this ? orig->bound_this : bound_this;
+                copy->has_bound_this = true;
+                copy->is_async       = orig->is_async;
+                copy->home_proto     = orig->home_proto;
+                copy->super_ctor     = orig->super_ctor;
+                copy->field_init_idx = orig->field_init_idx;
+                return js_obj_val((JsObj *)copy);
+            }
+        } else if (this_val.u.obj->obj_type == OBJ_FUNC || this_val.u.obj->obj_type == OBJ_NATIVE_FN) {
+            int sp = vm->temp_sp;
+            JsObj *bf = js_native_fn_new(vm, "bound", fn_func_proto, FN_BOUND_CALL);
+            if (bf) {
+                bf->pad |= OBJ_FLAG_BIND_CALLEE;
+                js_temp_push(vm, js_obj_val(bf));
+                js_set_prop(vm, js_obj_val(bf), "_target", this_val);
+                js_set_prop(vm, js_obj_val(bf), "_this", bound_this);
+                if (argc > 1) {
+                    JsObj *ba = js_arr_new(vm, (uint32_t)(argc - 1));
+                    if (ba) {
+                        js_temp_push(vm, js_obj_val(ba));
+                        for (int i = 1; i < argc; i++) js_arr_push(vm, ba, argv[i]);
+                        js_set_prop(vm, js_obj_val(bf), "_args", js_obj_val(ba));
+                    }
+                }
+                vm->temp_sp = sp;
+                return js_obj_val(bf);
+            }
+            vm->temp_sp = sp;
         }
     }
     return this_val;
@@ -466,21 +516,33 @@ static void apply_prop_descriptor(JsVm *vm, JsVal target, JsStr *k, JsVal desc) 
         JsFuncObj *fn = (JsFuncObj *)tobj;
         if (!fn->props_obj) fn->props_obj = js_map_new(vm, NULL);
         tobj = fn->props_obj;
+    } else if (tobj->obj_type == OBJ_NATIVE_FN) {
+        JsNativeFnObj *nf = (JsNativeFnObj *)tobj;
+        if (!nf->props_obj) nf->props_obj = js_map_new(vm, NULL);
+        tobj = nf->props_obj;
     }
     if (!tobj || tobj->obj_type != OBJ_OBJECT) return;
-    JsVal getter = js_get_prop(vm, desc, "get");
-    JsVal setter = js_get_prop(vm, desc, "set");
+    JsMapObj *dm = (desc.u.obj->obj_type == OBJ_OBJECT) ? (JsMapObj *)desc.u.obj : NULL;
+    JsStr *gk = js_str_cstr(vm, "get");
+    JsStr *sk = js_str_cstr(vm, "set");
+    JsStr *vk = js_str_cstr(vm, "value");
+    bool desc_has_get = dm && gk && map_has_own_prop(dm, gk);
+    bool desc_has_set = dm && sk && map_has_own_prop(dm, sk);
+    bool desc_has_val = dm && vk && map_has_own_prop(dm, vk);
+    JsVal getter = desc_has_get ? js_get_prop_str(vm, desc, gk) : js_undefined();
+    JsVal setter = desc_has_set ? js_get_prop_str(vm, desc, sk) : js_undefined();
     bool has_get = (getter.type == JS_OBJECT && getter.u.obj &&
                     (getter.u.obj->obj_type == OBJ_FUNC || getter.u.obj->obj_type == OBJ_NATIVE_FN));
     bool has_set = (setter.type == JS_OBJECT && setter.u.obj &&
                     (setter.u.obj->obj_type == OBJ_FUNC || setter.u.obj->obj_type == OBJ_NATIVE_FN));
-    if (has_get || has_set) {
-        js_define_accessor(vm, tobj, k, has_get ? getter.u.obj : NULL, has_set ? setter.u.obj : NULL);
-    } else if (desc.u.obj->obj_type == OBJ_OBJECT) {
-        JsStr *vk = js_str_cstr(vm, "value");
-        if (vk && map_has_own_prop((JsMapObj *)desc.u.obj, vk)) {
-            js_set_prop_str(vm, target, k, js_get_prop_str(vm, desc, vk));
+    if (desc_has_get || desc_has_set) {
+        if (desc_has_get && !has_get) js_remove_accessor(vm, tobj, k, true, false);
+        if (desc_has_set && !has_set) js_remove_accessor(vm, tobj, k, false, true);
+        if (has_get || has_set) {
+            js_define_accessor(vm, tobj, k, has_get ? getter.u.obj : NULL, has_set ? setter.u.obj : NULL);
         }
+    } else if (desc_has_val) {
+        js_define_data_prop(vm, target.u.obj, k, js_get_prop_str(vm, desc, vk));
     }
 }
 
@@ -671,7 +733,19 @@ static JsVal fn_object(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, in
     }
     if (magic == OBJ_CREATE) {
         JsObj *proto = (a0.type == JS_OBJECT) ? a0.u.obj : NULL;
-        return js_obj_val(js_map_new(vm, proto));
+        JsObj *obj = js_map_new(vm, proto);
+        if (obj && argc > 1 && argv[1].type == JS_OBJECT && argv[1].u.obj &&
+            argv[1].u.obj->obj_type == OBJ_OBJECT) {
+            int saved_sp = vm->temp_sp;
+            js_temp_push(vm, js_obj_val(obj));
+            JsMapObj *pm = (JsMapObj *)argv[1].u.obj;
+            for (uint32_t i = 0; i < pm->count; i++) {
+                if (pm->props[i].key->len > 0 && pm->props[i].key->data[0] == '\x01') continue;
+                apply_prop_descriptor(vm, js_obj_val(obj), pm->props[i].key, pm->props[i].val);
+            }
+            vm->temp_sp = saved_sp;
+        }
+        return js_obj_val(obj);
     }
     return js_undefined();
 }
@@ -2208,7 +2282,8 @@ static void run_promise_reaction_job(JsVm *vm, JsVal react, int state, JsVal val
 }
 
 void js_drain_microtasks(JsVm *vm) {
-    if (!vm || vm->draining_microtasks) return;
+    if (!vm || vm->call_depth >= JS_MAX_CALL_DEPTH) return;
+    bool prev_draining = vm->draining_microtasks;
     vm->draining_microtasks = true;
     while (vm->microtask_count > 0 && !vm->has_thrown && vm->steps <= vm->step_limit) {
         JsMicrotask mt = vm->microtasks[vm->microtask_head];
@@ -2229,7 +2304,7 @@ void js_drain_microtasks(JsVm *vm) {
         }
         vm->temp_sp = saved_sp;
     }
-    vm->draining_microtasks = false;
+    vm->draining_microtasks = prev_draining;
 }
 
 JsObj *js_promise_new(JsVm *vm, int state, JsVal val) {
@@ -2305,6 +2380,8 @@ void js_promise_settle(JsVm *vm, JsObj *p, bool fulfilled, JsVal val) {
                 JsObj *res_fn = js_native_fn_new(vm, "resolve", fn_promise, PROM_RESOLVE_CB);
                 JsObj *rej_fn = js_native_fn_new(vm, "reject", fn_promise, PROM_REJECT_CB);
                 if (res_fn && rej_fn) {
+                    res_fn->pad |= OBJ_FLAG_BIND_CALLEE;
+                    rej_fn->pad |= OBJ_FLAG_BIND_CALLEE;
                     js_temp_push(vm, js_obj_val(res_fn));
                     js_temp_push(vm, js_obj_val(rej_fn));
                     js_set_prop(vm, js_obj_val(res_fn), "_promise", js_obj_val(p));
@@ -2381,6 +2458,8 @@ static JsVal fn_promise(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, i
             JsObj *res_fn = js_native_fn_new(vm, "resolve", fn_promise, PROM_RESOLVE_CB);
             JsObj *rej_fn = js_native_fn_new(vm, "reject", fn_promise, PROM_REJECT_CB);
             if (res_fn && rej_fn) {
+                res_fn->pad |= OBJ_FLAG_BIND_CALLEE;
+                rej_fn->pad |= OBJ_FLAG_BIND_CALLEE;
                 js_temp_push(vm, js_obj_val(res_fn));
                 js_temp_push(vm, js_obj_val(rej_fn));
                 js_set_prop(vm, js_obj_val(res_fn), "_promise", js_obj_val(p));
@@ -2450,15 +2529,18 @@ static JsVal fn_promise(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, i
         js_set_prop(vm, js_obj_val(ctx), "_promise", js_obj_val(p));
         JsObj *rej_fn = js_native_fn_new(vm, "reject", fn_promise, PROM_REJECT_CB);
         if (rej_fn) {
+            rej_fn->pad |= OBJ_FLAG_BIND_CALLEE;
             js_temp_push(vm, js_obj_val(rej_fn));
             js_set_prop(vm, js_obj_val(rej_fn), "_promise", js_obj_val(p));
         }
         for (uint32_t i = 0; i < ia->len; i++) {
+            int iter_sp = vm->temp_sp;
             JsVal item_p = fn_promise(vm, js_undefined(), 1, &ia->items[i], PROM_RESOLVE);
             if (item_p.type == JS_OBJECT && item_p.u.obj) {
                 js_temp_push(vm, item_p);
                 JsObj *step_fn = js_native_fn_new(vm, "step", fn_promise, PROM_ALL_STEP_CB);
                 if (step_fn) {
+                    step_fn->pad |= OBJ_FLAG_BIND_CALLEE;
                     js_temp_push(vm, js_obj_val(step_fn));
                     js_set_prop(vm, js_obj_val(step_fn), "_ctx", js_obj_val(ctx));
                     js_set_prop(vm, js_obj_val(step_fn), "_idx", js_num((double)i));
@@ -2467,6 +2549,7 @@ static JsVal fn_promise(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, i
                                             js_undefined(), NULL);
                 }
             }
+            vm->temp_sp = iter_sp;
         }
         vm->temp_sp = saved_sp;
         return js_obj_val(p);
@@ -2570,8 +2653,27 @@ typedef enum {
     URL_PARAMS_HAS,
     URL_PARAMS_DELETE,
     URL_PARAMS_TO_STRING,
-    URL_PARAMS_FOR_EACH
+    URL_PARAMS_FOR_EACH,
+    URL_PARAMS_KEYS,
+    URL_PARAMS_VALUES,
+    URL_PARAMS_ENTRIES
 } JsUrlParamsMagic;
+
+static void url_decode_form_component(const char *src, size_t len, char *out, size_t cap) {
+    size_t w = 0;
+    for (size_t i = 0; i < len && w + 1 < cap; i++) {
+        if (src[i] == '+') {
+            out[w++] = ' ';
+        } else if (src[i] == '%' && i + 2 < len &&
+                   tb_isxdigit(src[i + 1]) && tb_isxdigit(src[i + 2])) {
+            out[w++] = (char)((tb_hex_val(src[i + 1]) << 4) | tb_hex_val(src[i + 2]));
+            i += 2;
+        } else {
+            out[w++] = src[i];
+        }
+    }
+    out[w] = '\0';
+}
 
 static void url_params_parse_query(JsVm *vm, JsObj *params_obj, const char *qs) {
     if (!qs) return;
@@ -2587,13 +2689,8 @@ static void url_params_parse_query(JsVm *vm, JsObj *params_obj, const char *qs) 
             const char *vstart = eq ? eq + 1 : "";
 
             char kbuf[512], vbuf[1024];
-            size_t kc = klen < sizeof(kbuf) - 1 ? klen : sizeof(kbuf) - 1;
-            memcpy(kbuf, p, kc); kbuf[kc] = '\0';
-            size_t vc = vlen < sizeof(vbuf) - 1 ? vlen : sizeof(vbuf) - 1;
-            memcpy(vbuf, vstart, vc); vbuf[vc] = '\0';
-
-            for (size_t i = 0; i < kc; i++) if (kbuf[i] == '+') kbuf[i] = ' ';
-            for (size_t i = 0; i < vc; i++) if (vbuf[i] == '+') vbuf[i] = ' ';
+            url_decode_form_component(p, klen, kbuf, sizeof(kbuf));
+            url_decode_form_component(vstart, vlen, vbuf, sizeof(vbuf));
 
             JsVal kv = make_cstr_val(vm, kbuf);
             JsVal vv = make_cstr_val(vm, vbuf);
@@ -2771,9 +2868,22 @@ static JsVal fn_url_params(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
                 if (i > 0) tb_buf_append_char(&b, '&');
                 JsStr *ki = js_to_str(vm, ka->items[i]);
                 JsStr *vi = js_to_str(vm, va->items[i]);
-                if (ki) tb_buf_append_cstr(&b, ki->data);
-                tb_buf_append_char(&b, '=');
-                if (vi) tb_buf_append_cstr(&b, vi->data);
+                const char * strs[2] = { ki ? ki->data : "", vi ? vi->data : "" };
+                for (int s = 0; s < 2; s++) {
+                    if (s == 1) tb_buf_append_char(&b, '=');
+                    for (const unsigned char *p = (const unsigned char *)strs[s]; *p; p++) {
+                        unsigned char c = *p;
+                        if (c == ' ') {
+                            tb_buf_append_char(&b, '+');
+                        } else if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                   (c >= '0' && c <= '9') || c == '*' || c == '-' ||
+                                   c == '.' || c == '_') {
+                            tb_buf_append_char(&b, (char)c);
+                        } else {
+                            tb_buf_printf(&b, "%%%02X", (unsigned int)c);
+                        }
+                    }
+                }
             }
             JsVal res = make_str_val(vm, b.data ? b.data : "", b.len);
             tb_buf_free(&b);
@@ -2790,6 +2900,29 @@ static JsVal fn_url_params(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
                 if (vm->has_thrown) break;
             }
             return js_undefined();
+        }
+        case URL_PARAMS_KEYS:
+        case URL_PARAMS_VALUES:
+        case URL_PARAMS_ENTRIES: {
+            uint32_t n = ka->len < va->len ? ka->len : va->len;
+            JsObj *res = js_arr_new(vm, n);
+            if (!res) return js_undefined();
+            int saved_sp = vm->temp_sp;
+            js_temp_push(vm, js_obj_val(res));
+            for (uint32_t i = 0; i < n; i++) {
+                if (magic == URL_PARAMS_KEYS) js_arr_push(vm, res, ka->items[i]);
+                else if (magic == URL_PARAMS_VALUES) js_arr_push(vm, res, va->items[i]);
+                else {
+                    JsObj *pair = js_arr_new(vm, 2);
+                    if (pair) {
+                        js_arr_push(vm, pair, ka->items[i]);
+                        js_arr_push(vm, pair, va->items[i]);
+                        js_arr_push(vm, res, js_obj_val(pair));
+                    }
+                }
+            }
+            vm->temp_sp = saved_sp;
+            return js_obj_val(res);
         }
         default:
             return js_undefined();
@@ -2880,7 +3013,7 @@ static JsVal fn_url(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int m
         /* Search */
         char search_buf[1024] = "";
         char query_only[1024] = "";
-        if (qpos) {
+        if (qpos && qpos[1]) {
             snprintf(search_buf, sizeof(search_buf), "%s", qpos);
             snprintf(query_only, sizeof(query_only), "%s", qpos + 1);
         }
@@ -3096,6 +3229,7 @@ void js_stdlib_init(JsVm *vm) {
     js_define_native(vm, g, "atob", fn_global_misc, GM_ATOB);
     js_define_native(vm, g, "btoa", fn_global_misc, GM_BTOA);
     js_define_native(vm, g, "queueMicrotask", fn_global_misc, GM_QUEUE_MICROTASK);
+    js_dom_init_timers(vm);
 
     /* Object */
     js_define_native(vm, vm->object_proto, "hasOwnProperty", fn_object, OBJ_HAS_OWN_PROP);
@@ -3330,6 +3464,9 @@ void js_stdlib_init(JsVm *vm) {
     js_define_native(vm, vm->url_params_proto, "delete", fn_url_params, URL_PARAMS_DELETE);
     js_define_native(vm, vm->url_params_proto, "toString", fn_url_params, URL_PARAMS_TO_STRING);
     js_define_native(vm, vm->url_params_proto, "forEach", fn_url_params, URL_PARAMS_FOR_EACH);
+    js_define_native(vm, vm->url_params_proto, "keys", fn_url_params, URL_PARAMS_KEYS);
+    js_define_native(vm, vm->url_params_proto, "values", fn_url_params, URL_PARAMS_VALUES);
+    js_define_native(vm, vm->url_params_proto, "entries", fn_url_params, URL_PARAMS_ENTRIES);
 
     /* Headers */
     JsObj *hdrs_ctor = js_native_fn_new(vm, "Headers", fn_headers, HEADERS_CTOR);

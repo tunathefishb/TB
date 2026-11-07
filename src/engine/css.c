@@ -276,6 +276,7 @@ void css_apply_decl_ex(CssStyle *st, const char *prop, const char *val, bool imp
     }
     size_t vlen = strlen(vclean);
     while (vlen > 0 && tb_isspace(vclean[vlen - 1])) vclean[--vlen] = '\0';
+    if (vlen == 0) return;
 
     if (tb_strcasecmp(prop, "display") == 0) {
         if (!check_and_mark_important(st, 1u << CSS_BIT_DISPLAY, important)) return;
@@ -297,7 +298,7 @@ void css_apply_decl_ex(CssStyle *st, const char *prop, const char *val, bool imp
     } else if (tb_strcasecmp(prop, "background") == 0 ||
                tb_strcasecmp(prop, "background-color") == 0) {
         if (!check_and_mark_important(st, 1u << CSS_BIT_BG, important)) return;
-        char tmp[128];
+        char tmp[256];
         snprintf(tmp, sizeof(tmp), "%s", vclean);
         CssColor c;
         if (css_parse_color(tmp, &c)) {
@@ -350,7 +351,7 @@ void css_apply_decl_ex(CssStyle *st, const char *prop, const char *val, bool imp
             st->border = 0;
         } else {
             st->border = 1;
-            char tmp[128];
+            char tmp[256];
             snprintf(tmp, sizeof(tmp), "%s", vclean);
             char *save = NULL;
             for (char *t = strtok_r(tmp, " \t", &save); t; t = strtok_r(NULL, " \t", &save)) {
@@ -499,7 +500,7 @@ static void resolve_css_vars(const DomNode *node, const char *in, char *out, siz
     out[w] = '\0';
 }
 
-static void parse_inline_for_node(DomNode *node, CssStyle *st, const char *inline_css) {
+static void parse_inline_for_node(DomNode *node, CssStyle *st, const char *inline_css, int pass) {
     if (!st || !inline_css) return;
     const char *p = inline_css;
     while (*p) {
@@ -521,18 +522,31 @@ static void parse_inline_for_node(DomNode *node, CssStyle *st, const char *inlin
             prop[plen] = '\0';
             memcpy(val, vstart, vlen);
             val[vlen] = '\0';
-            if (node && prop[0] == '-' && prop[1] == '-') {
+            bool is_var = (prop[0] == '-' && prop[1] == '-');
+            if (is_var) {
+                if (node && (pass == 0 || pass == 1)) {
+                    char *bang = strchr(val, '!');
+                    if (bang) {
+                        *bang = '\0';
+                        size_t l = strlen(val);
+                        while (l > 0 && tb_isspace(val[l - 1])) val[--l] = '\0';
+                    }
+                    dom_set_css_var(node, prop, val);
+                }
+            } else if (pass == 0 || pass == 2) {
+                bool imp = false;
                 char *bang = strchr(val, '!');
                 if (bang) {
+                    const char *ip = bang + 1;
+                    while (*ip && tb_isspace(*ip)) ip++;
+                    if (tb_strncasecmp(ip, "important", 9) == 0) imp = true;
                     *bang = '\0';
                     size_t l = strlen(val);
                     while (l > 0 && tb_isspace(val[l - 1])) val[--l] = '\0';
                 }
-                dom_set_css_var(node, prop, val);
-            } else {
                 char resolved[256];
                 resolve_css_vars(node, val, resolved, sizeof(resolved), 0);
-                css_apply_decl(st, prop, resolved);
+                css_apply_decl_ex(st, prop, resolved, imp);
             }
         }
         p = semi ? semi + 1 : vstart + strlen(vstart);
@@ -540,7 +554,7 @@ static void parse_inline_for_node(DomNode *node, CssStyle *st, const char *inlin
 }
 
 void css_parse_inline(CssStyle *st, const char *inline_css) {
-    parse_inline_for_node(NULL, st, inline_css);
+    parse_inline_for_node(NULL, st, inline_css, 0);
 }
 
 static uint32_t compute_specificity(const char *sel, size_t len) {
@@ -997,7 +1011,10 @@ static void compute_node_rec(DomNode *node, const CssStyle *parent_st,
         return;
     }
 
+    dom_clear_css_vars(node);
     init_ua_defaults(node, parent_st);
+
+    const char *inl = dom_get_attr(node, "style");
 
     if (ss && ss->rules_head && node->style.display != CSS_DISP_NONE) {
         MatchedRule matches[128];
@@ -1019,6 +1036,9 @@ static void compute_node_rec(DomNode *node, const CssStyle *parent_st,
                 }
             }
         }
+        if (inl && *inl) {
+            parse_inline_for_node(node, &node->style, inl, 1);
+        }
         /* Pass 2: apply regular properties with var() resolution and !important */
         for (size_t i = 0; i < mcount; i++) {
             for (const CssDecl *d = matches[i].rule->decls; d; d = d->next) {
@@ -1028,12 +1048,13 @@ static void compute_node_rec(DomNode *node, const CssStyle *parent_st,
                 css_apply_decl_ex(&node->style, d->prop, resolved, d->important);
             }
         }
+    } else if (inl && *inl) {
+        parse_inline_for_node(node, &node->style, inl, 1);
     }
 
     /* Inline style="..." overrides non-important stylesheet rules */
-    const char *inl = dom_get_attr(node, "style");
     if (inl && *inl) {
-        parse_inline_for_node(node, &node->style, inl);
+        parse_inline_for_node(node, &node->style, inl, 2);
     }
 
     if (node->style.display == CSS_DISP_NONE) return;

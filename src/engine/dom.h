@@ -117,6 +117,7 @@ DomNode *dom_create_element(DomDocument *doc, const char *tag_name);
 DomNode *dom_create_text(DomDocument *doc, const char *text);
 DomNode *dom_create_fragment(DomDocument *doc);
 void     dom_node_free(DomNode *node);
+bool     dom_subtree_has_wrapper(const DomNode *node);
 
 bool     dom_append_child(DomNode *parent, DomNode *child);
 bool     dom_insert_before(DomNode *parent, DomNode *new_node, DomNode *ref_node);

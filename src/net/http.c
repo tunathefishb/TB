@@ -211,7 +211,7 @@ void tb_cookie_set_from_header(const TbUrl *req_url, const char *set_cookie_val,
     c.name[nlen] = '\0';
     memcpy(c.value, vstart, vlen);
     c.value[vlen] = '\0';
-    snprintf(c.domain, sizeof(c.domain), "%s", host);
+    snprintf(c.domain, sizeof(c.domain), "%.*s", (int)(sizeof(c.domain) - 1), host);
     strcpy(c.path, "/");
     c.host_only = true;
     bool delete_cookie = false;

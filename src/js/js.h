@@ -71,6 +71,7 @@ typedef enum {
 } JsNativeTag;
 
 #define OBJ_FLAG_HAS_ACCESSORS 0x01
+#define OBJ_FLAG_BIND_CALLEE   0x02
 
 struct JsObj {
     JsObj    *gc_next;
@@ -305,6 +306,8 @@ typedef void (*JsAlertCb)(void *userdata, const char *msg);
 typedef bool (*JsFetchCb)(void *userdata, const char *url, const char *method,
                           const char *body, int *out_status, char **out_text);
 
+#define JS_MAX_TIMER_ARGS 4
+
 typedef struct {
     int      id;
     bool     active;
@@ -313,6 +316,8 @@ typedef struct {
     int64_t  interval_ms;
     int64_t  due_ms;
     JsObj   *fn_obj;
+    int      argc;
+    JsVal    args[JS_MAX_TIMER_ARGS];
 } JsTimer;
 
 #define JS_MAX_TIMERS     64
@@ -454,6 +459,8 @@ bool   js_set_index(JsVm *vm, JsVal target, uint32_t idx, JsVal val);
 bool   js_del_prop_str(JsVm *vm, JsVal target, JsStr *key);
 bool   js_has_prop_str(JsVm *vm, JsVal target, JsStr *key);
 bool   js_define_accessor(JsVm *vm, JsObj *target, JsStr *key, JsObj *getter, JsObj *setter);
+bool   js_remove_accessor(JsVm *vm, JsObj *target, JsStr *key, bool rem_get, bool rem_set);
+bool   js_define_data_prop(JsVm *vm, JsObj *target, JsStr *key, JsVal val);
 void   js_arr_push(JsVm *vm, JsObj *arr_obj, JsVal val);
 void   js_define_native(JsVm *vm, JsObj *target, const char *name, JsNativeFn fn, int magic);
 
@@ -491,6 +498,8 @@ static inline bool js_temp_push(JsVm *vm, JsVal v) {
 }
 
 /* DOM Bindings & Events (js_dom.c) */
+void  js_dom_init_timers(JsVm *vm);
+bool  js_step_next_timer(JsVm *vm);
 void  js_bind_document(JsVm *vm, DomDocument *doc, const char *url);
 JsVal js_wrap_dom_node(JsVm *vm, DomNode *node);
 bool  js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out);

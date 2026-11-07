@@ -341,6 +341,15 @@ bool dom_replace_child(DomNode *parent, DomNode *new_node, DomNode *old_node) {
     return true;
 }
 
+bool dom_subtree_has_wrapper(const DomNode *node) {
+    if (!node) return false;
+    if (node->js_wrapper != NULL) return true;
+    for (const DomNode *ch = node->first_child; ch; ch = ch->next_sibling) {
+        if (dom_subtree_has_wrapper(ch)) return true;
+    }
+    return false;
+}
+
 void dom_clear_children(DomNode *parent) {
     if (!parent) return;
     DomNode *ch = parent->first_child;
@@ -351,7 +360,9 @@ void dom_clear_children(DomNode *parent) {
         ch->parent       = NULL;
         ch->prev_sibling = NULL;
         ch->next_sibling = NULL;
-        dom_node_free(ch);
+        if (!dom_subtree_has_wrapper(ch)) {
+            dom_node_free(ch);
+        }
         ch = next;
     }
     mark_doc_dirty(parent, true);
@@ -939,7 +950,9 @@ void dom_set_outer_html(DomNode *node, const char *html) {
         dom_insert_adjacent_html(node, "beforebegin", html);
     }
     dom_remove_child(parent, node);
-    dom_node_free(node);
+    if (!dom_subtree_has_wrapper(node)) {
+        dom_node_free(node);
+    }
 }
 
 /* ClassList helpers */
@@ -1306,6 +1319,39 @@ typedef struct {
     char        comb_to_next; /* ' ' descendant, '>' child, '+' adjacent sibling, '~' general sibling, 0 rightmost */
 } SelPart;
 
+static bool match_chain_rec(const DomNode *cur, const SelPart *parts, int p) {
+    if (p < 0) return true;
+    if (!cur) return false;
+    char comb = parts[p].comb_to_next;
+    if (comb == '>') {
+        const DomNode *par = cur->parent;
+        if (!par || par->type != DOM_NODE_ELEMENT) return false;
+        return match_compound(par, parts[p].ptr, parts[p].len) && match_chain_rec(par, parts, p - 1);
+    } else if (comb == '+') {
+        const DomNode *prev = cur->prev_sibling;
+        while (prev && prev->type != DOM_NODE_ELEMENT) prev = prev->prev_sibling;
+        if (!prev) return false;
+        return match_compound(prev, parts[p].ptr, parts[p].len) && match_chain_rec(prev, parts, p - 1);
+    } else if (comb == '~') {
+        for (const DomNode *prev = cur->prev_sibling; prev; prev = prev->prev_sibling) {
+            if (prev->type == DOM_NODE_ELEMENT &&
+                match_compound(prev, parts[p].ptr, parts[p].len) &&
+                match_chain_rec(prev, parts, p - 1)) {
+                return true;
+            }
+        }
+        return false;
+    } else {
+        for (const DomNode *anc = cur->parent; anc && anc->type == DOM_NODE_ELEMENT; anc = anc->parent) {
+            if (match_compound(anc, parts[p].ptr, parts[p].len) &&
+                match_chain_rec(anc, parts, p - 1)) {
+                return true;
+            }
+        }
+        return false;
+    }
+}
+
 static bool match_single_chain(const DomNode *node, const char *sel, size_t len) {
     SelPart parts[32];
     int nparts = 0;
@@ -1351,44 +1397,7 @@ static bool match_single_chain(const DomNode *node, const char *sel, size_t len)
     if (nparts == 0) return false;
 
     if (!match_compound(node, parts[nparts - 1].ptr, parts[nparts - 1].len)) return false;
-    const DomNode *cur = node;
-    for (int p = nparts - 2; p >= 0; p--) {
-        char comb = parts[p].comb_to_next;
-        if (comb == '>') {
-            cur = cur->parent;
-            if (!cur || cur->type != DOM_NODE_ELEMENT) return false;
-            if (!match_compound(cur, parts[p].ptr, parts[p].len)) return false;
-        } else if (comb == '+') {
-            const DomNode *prev = cur->prev_sibling;
-            while (prev && prev->type != DOM_NODE_ELEMENT) prev = prev->prev_sibling;
-            if (!prev || !match_compound(prev, parts[p].ptr, parts[p].len)) return false;
-            cur = prev;
-        } else if (comb == '~') {
-            const DomNode *prev = cur->prev_sibling;
-            bool found = false;
-            while (prev) {
-                if (prev->type == DOM_NODE_ELEMENT && match_compound(prev, parts[p].ptr, parts[p].len)) {
-                    found = true;
-                    cur = prev;
-                    break;
-                }
-                prev = prev->prev_sibling;
-            }
-            if (!found) return false;
-        } else {
-            cur = cur->parent;
-            bool found = false;
-            while (cur && cur->type == DOM_NODE_ELEMENT) {
-                if (match_compound(cur, parts[p].ptr, parts[p].len)) {
-                    found = true;
-                    break;
-                }
-                cur = cur->parent;
-            }
-            if (!found) return false;
-        }
-    }
-    return true;
+    return match_chain_rec(node, parts, nparts - 2);
 }
 
 bool dom_matches_selector(const DomNode *node, const char *selector) {

@@ -222,6 +222,21 @@ static bool map_find_accessor(const JsMapObj *m, const char *prefix, const JsStr
     return false;
 }
 
+static void map_remove_accessor_entries(JsMapObj *m, const JsStr *key, bool rem_get, bool rem_set) {
+    if (!m || !(m->hdr.pad & OBJ_FLAG_HAS_ACCESSORS) || !key) return;
+    uint32_t target_len = key->len + 3;
+    for (uint32_t i = 0; i < m->count; i++) {
+        const JsStr *k = m->props[i].key;
+        if (k && k->len == target_len && k->data[0] == '\x01' && k->data[2] == ':' &&
+            ((rem_get && k->data[1] == 'g') || (rem_set && k->data[1] == 's')) &&
+            memcmp(k->data + 3, key->data, key->len) == 0) {
+            for (uint32_t j = i; j + 1 < m->count; j++) m->props[j] = m->props[j + 1];
+            m->count--;
+            i--;
+        }
+    }
+}
+
 bool js_define_accessor(JsVm *vm, JsObj *target, JsStr *key, JsObj *getter, JsObj *setter) {
     if (!vm || !target || !key) return false;
     vm->gc_pause++;
@@ -239,6 +254,11 @@ bool js_define_accessor(JsVm *vm, JsObj *target, JsStr *key, JsObj *getter, JsOb
         return false;
     }
     JsMapObj *m = (JsMapObj *)target;
+    uint32_t dpos = 0;
+    if (map_find_own(m, key, &dpos)) {
+        for (uint32_t i = dpos; i + 1 < m->count; i++) m->props[i] = m->props[i + 1];
+        m->count--;
+    }
     m->hdr.pad |= OBJ_FLAG_HAS_ACCESSORS;
     char kbuf[256];
     if (getter) {
@@ -253,6 +273,39 @@ bool js_define_accessor(JsVm *vm, JsObj *target, JsStr *key, JsObj *getter, JsOb
     }
     vm->gc_pause--;
     return true;
+}
+
+bool js_remove_accessor(JsVm *vm, JsObj *target, JsStr *key, bool rem_get, bool rem_set) {
+    (void)vm;
+    if (!target || !key) return false;
+    if (target->obj_type == OBJ_FUNC) target = ((JsFuncObj *)target)->props_obj;
+    else if (target->obj_type == OBJ_NATIVE_FN) target = ((JsNativeFnObj *)target)->props_obj;
+    if (!target || target->obj_type != OBJ_OBJECT) return false;
+    map_remove_accessor_entries((JsMapObj *)target, key, rem_get, rem_set);
+    return true;
+}
+
+bool js_define_data_prop(JsVm *vm, JsObj *target, JsStr *key, JsVal val) {
+    if (!vm || !target || !key) return false;
+    vm->gc_pause++;
+    if (target->obj_type == OBJ_FUNC) {
+        JsFuncObj *f = (JsFuncObj *)target;
+        if (!f->props_obj) f->props_obj = js_map_new(vm, NULL);
+        target = f->props_obj;
+    } else if (target->obj_type == OBJ_NATIVE_FN) {
+        JsNativeFnObj *nf = (JsNativeFnObj *)target;
+        if (!nf->props_obj) nf->props_obj = js_map_new(vm, NULL);
+        target = nf->props_obj;
+    }
+    if (!target || target->obj_type != OBJ_OBJECT) {
+        vm->gc_pause--;
+        return false;
+    }
+    JsMapObj *m = (JsMapObj *)target;
+    map_remove_accessor_entries(m, key, true, true);
+    bool ok = map_set_own(vm, m, key, val);
+    vm->gc_pause--;
+    return ok;
 }
 
 void js_define_native(JsVm *vm, JsObj *target, const char *name, JsNativeFn fn, int magic) {
@@ -340,15 +393,43 @@ bool js_set_index(JsVm *vm, JsVal target, uint32_t idx, JsVal val) {
 
 JsVal js_get_prop_proto(JsVm *vm, JsVal receiver, JsObj *proto_walk, JsStr *key) {
     int guard = 0;
-    while (proto_walk && proto_walk->obj_type == OBJ_OBJECT && guard++ < 16) {
-        JsMapObj *pm = (JsMapObj *)proto_walk;
-        JsVal gfn = js_undefined();
-        if (map_find_accessor(pm, "\x01g:", key, &gfn)) {
-            return js_call(vm, gfn, receiver, 0, NULL);
+    while (proto_walk && guard++ < 16) {
+        if (proto_walk->obj_type == OBJ_OBJECT) {
+            JsMapObj *pm = (JsMapObj *)proto_walk;
+            JsVal gfn = js_undefined();
+            if (map_find_accessor(pm, "\x01g:", key, &gfn)) {
+                return js_call(vm, gfn, receiver, 0, NULL);
+            }
+            uint32_t pos = 0;
+            if (map_find_own(pm, key, &pos)) return pm->props[pos].val;
+            proto_walk = pm->proto;
+        } else if (proto_walk->obj_type == OBJ_FUNC) {
+            JsFuncObj *cf = (JsFuncObj *)proto_walk;
+            if (cf->props_obj && cf->props_obj->obj_type == OBJ_OBJECT) {
+                JsMapObj *pm = (JsMapObj *)cf->props_obj;
+                JsVal gfn = js_undefined();
+                if (map_find_accessor(pm, "\x01g:", key, &gfn)) {
+                    return js_call(vm, gfn, receiver, 0, NULL);
+                }
+                uint32_t pos = 0;
+                if (map_find_own(pm, key, &pos)) return pm->props[pos].val;
+            }
+            proto_walk = cf->super_ctor ? cf->super_ctor : cf->proto;
+        } else if (proto_walk->obj_type == OBJ_NATIVE_FN) {
+            JsNativeFnObj *nf = (JsNativeFnObj *)proto_walk;
+            if (nf->props_obj && nf->props_obj->obj_type == OBJ_OBJECT) {
+                JsMapObj *pm = (JsMapObj *)nf->props_obj;
+                JsVal gfn = js_undefined();
+                if (map_find_accessor(pm, "\x01g:", key, &gfn)) {
+                    return js_call(vm, gfn, receiver, 0, NULL);
+                }
+                uint32_t pos = 0;
+                if (map_find_own(pm, key, &pos)) return pm->props[pos].val;
+            }
+            proto_walk = nf->proto;
+        } else {
+            break;
         }
-        uint32_t pos = 0;
-        if (map_find_own(pm, key, &pos)) return pm->props[pos].val;
-        proto_walk = pm->proto;
     }
     return js_undefined();
 }
@@ -593,16 +674,19 @@ bool js_set_prop(JsVm *vm, JsVal target, const char *key, JsVal val) {
 bool js_del_prop_str(JsVm *vm, JsVal target, JsStr *key) {
     (void)vm;
     if (!key || target.type != JS_OBJECT || !target.u.obj) return true;
-    if (target.u.obj->obj_type == OBJ_ARRAY) {
+    JsObj *tobj = target.u.obj;
+    if (tobj->obj_type == OBJ_ARRAY) {
         uint32_t idx = 0;
-        JsArrObj *a = (JsArrObj *)target.u.obj;
+        JsArrObj *a = (JsArrObj *)tobj;
         if (parse_array_index(key->data, key->len, &idx) && idx < a->len) {
             a->items[idx] = js_undefined();
         }
         return true;
     }
-    if (target.u.obj->obj_type != OBJ_OBJECT) return true;
-    JsMapObj *m = (JsMapObj *)target.u.obj;
+    if (tobj->obj_type == OBJ_FUNC) tobj = ((JsFuncObj *)tobj)->props_obj;
+    else if (tobj->obj_type == OBJ_NATIVE_FN) tobj = ((JsNativeFnObj *)tobj)->props_obj;
+    if (!tobj || tobj->obj_type != OBJ_OBJECT) return true;
+    JsMapObj *m = (JsMapObj *)tobj;
     if (m->hdr.native_tag == NATIVE_TAG_STORAGE) {
         JsVal store = js_get_prop(vm, target, "_store");
         if (store.type == JS_OBJECT && store.u.obj && store.u.obj->obj_type == OBJ_OBJECT) {
@@ -614,6 +698,7 @@ bool js_del_prop_str(JsVm *vm, JsVal target, JsStr *key) {
         for (uint32_t i = pos; i + 1 < m->count; i++) m->props[i] = m->props[i + 1];
         m->count--;
     }
+    map_remove_accessor_entries(m, key, true, true);
     return true;
 }
 
@@ -1026,11 +1111,12 @@ static void gc_mark_obj(JsVm *vm, JsObj *o) {
 }
 
 static void gc_free_obj(JsVm *vm, JsObj *o, bool vm_teardown) {
+    (void)vm_teardown;
     size_t extra = 0;
     switch (o->obj_type) {
         case OBJ_OBJECT: {
             JsMapObj *m = (JsMapObj *)o;
-            if (!vm_teardown && m->hdr.native_tag == NATIVE_TAG_DOM_NODE) {
+            if (m->hdr.native_tag == NATIVE_TAG_DOM_NODE) {
                 js_dom_on_wrapper_swept(m);
             }
             extra += m->cap * sizeof(JsProp);
@@ -1116,6 +1202,9 @@ size_t js_gc_collect(JsVm *vm) {
     for (int i = 0; i < JS_MAX_TIMERS; i++) {
         if (vm->timers[i].active && vm->timers[i].fn_obj) {
             gc_mark_obj(vm, vm->timers[i].fn_obj);
+            for (int a = 0; a < vm->timers[i].argc; a++) {
+                gc_mark_val(vm, vm->timers[i].args[a]);
+            }
         }
     }
     js_gc_mark_dom(vm, gc_mark_obj);

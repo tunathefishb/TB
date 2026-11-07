@@ -13,15 +13,6 @@ static void on_dom_node_destroy(void *userdata, DomNode *node) {
     }
 }
 
-static bool subtree_has_any_wrapper(const DomNode *n) {
-    if (!n) return false;
-    if (n->js_wrapper != NULL) return true;
-    for (const DomNode *ch = n->first_child; ch; ch = ch->next_sibling) {
-        if (subtree_has_any_wrapper(ch)) return true;
-    }
-    return false;
-}
-
 void js_dom_on_wrapper_swept(JsMapObj *m) {
     if (!m || !m->native_ptr) return;
     DomNode *n = (DomNode *)m->native_ptr;
@@ -31,11 +22,11 @@ void js_dom_on_wrapper_swept(JsMapObj *m) {
     }
     DomNode *top = n;
     while (top->parent) top = top->parent;
-    if (n->owner_doc && top == n->owner_doc->root) {
+    if (top->type == DOM_NODE_DOCUMENT) {
         return; /* Attached to live document: keep DomNode alive */
     }
     /* Orphan detached subtree: free once its last JS wrapper is swept */
-    if (!subtree_has_any_wrapper(top)) {
+    if (!dom_subtree_has_wrapper(top)) {
         dom_node_free(top);
     }
 }
@@ -328,6 +319,15 @@ static JsVal fn_style_method(JsVm *vm, JsVal this_val, int argc, const JsVal *ar
     if (magic == STYLE_SET_PROP) {
         if (m->hdr.native_tag == NATIVE_TAG_COMPUTED_STYLE) return js_undefined();
         JsVal v = argc > 1 ? argv[1] : js_obj_val((JsObj *)js_str_cstr(vm, ""));
+        if (argc > 2 && argv[2].type != JS_UNDEFINED && argv[2].type != JS_NULL) {
+            JsStr *prio = js_to_str(vm, argv[2]);
+            JsStr *vs   = js_to_str(vm, v);
+            if (prio && vs && vs->len > 0 && tb_strcasecmp(prio->data, "important") == 0) {
+                char buf[256];
+                snprintf(buf, sizeof(buf), "%s !important", vs->data);
+                v = js_obj_val((JsObj *)js_str_cstr(vm, buf));
+            }
+        }
         js_dom_set_virtual(vm, m, prop->data, v);
         return js_undefined();
     }
@@ -895,27 +895,55 @@ bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
     if (tag == NATIVE_TAG_STYLE) {
         DomNode *n = (DomNode *)m->native_ptr;
         if (!n) return true;
-        JsStr *vs = js_to_str(vm, val);
+        JsStr *vs = (val.type == JS_NULL || val.type == JS_UNDEFINED) ? NULL : js_to_str(vm, val);
         const char *vstr = vs ? vs->data : "";
         if (strcmp(key, "cssText") == 0) {
             dom_set_attr(n, "style", vstr);
+            if (vm->doc) {
+                css_compute_document_ex(vm->doc, NULL, vm->viewport_w > 0 ? vm->viewport_w : 80);
+            }
             return true;
         }
         char kebab[64];
         if (key[0] == '-' && key[1] == '-') snprintf(kebab, sizeof(kebab), "%s", key);
         else camel_to_kebab(key, kebab, sizeof(kebab));
+        size_t klen = strlen(kebab);
         const char *old_s = dom_get_attr(n, "style");
         TbBuf b;
         tb_buf_init(&b);
         if (old_s && *old_s) {
-            tb_buf_append_cstr(&b, old_s);
-            if (b.len > 0 && b.data[b.len - 1] != ';') tb_buf_append_char(&b, ';');
+            const char *p = old_s;
+            while (*p) {
+                while (*p && (tb_isspace(*p) || *p == ';')) p++;
+                if (!*p) break;
+                const char *semi = strchr(p, ';');
+                size_t dlen = semi ? (size_t)(semi - p) : strlen(p);
+                bool match = false;
+                if (kebab[0] == '-' && kebab[1] == '-') {
+                    match = (dlen > klen && strncmp(p, kebab, klen) == 0 &&
+                             (p[klen] == ':' || tb_isspace(p[klen])));
+                } else {
+                    match = (dlen > klen && tb_strncasecmp(p, kebab, klen) == 0 &&
+                             (p[klen] == ':' || tb_isspace(p[klen])));
+                }
+                if (!match) {
+                    tb_buf_append(&b, p, dlen);
+                    tb_buf_append_char(&b, ';');
+                }
+                if (!semi) break;
+                p = semi + 1;
+            }
         }
-        tb_buf_printf(&b, "%s:%s;", kebab, vstr);
+        if (vstr[0] != '\0') {
+            tb_buf_printf(&b, "%s:%s;", kebab, vstr);
+        }
         dom_set_attr(n, "style", b.data ? b.data : "");
         tb_buf_free(&b);
-        if (!(kebab[0] == '-' && kebab[1] == '-')) {
+        if (vstr[0] != '\0' && !(kebab[0] == '-' && kebab[1] == '-')) {
             css_apply_decl(&n->style, kebab, vstr);
+        }
+        if (vm->doc) {
+            css_compute_document_ex(vm->doc, NULL, vm->viewport_w > 0 ? vm->viewport_w : 80);
         }
         return true;
     }
@@ -1224,7 +1252,7 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             while (n->first_child) {
                 DomNode *ch = n->first_child;
                 dom_remove_child(n, ch);
-                if (!ch->js_wrapper) dom_node_free(ch);
+                if (!dom_subtree_has_wrapper(ch)) dom_node_free(ch);
             }
             for (int i = 0; i < argc; i++) {
                 DomNode *ch = arg_to_dom_node(vm, argv[i]);
@@ -1619,6 +1647,12 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
                     vm->timers[i].interval_ms = (magic == WIN_SET_INTERVAL && delay < 10) ? 10 : delay;
                     vm->timers[i].due_ms      = js_now_ms() + delay;
                     vm->timers[i].fn_obj      = argv[0].u.obj;
+                    int extra = (magic != WIN_RAF && argc > 2) ? (argc - 2) : 0;
+                    if (extra > JS_MAX_TIMER_ARGS) extra = JS_MAX_TIMER_ARGS;
+                    vm->timers[i].argc = extra;
+                    for (int a = 0; a < extra; a++) {
+                        vm->timers[i].args[a] = argv[2 + a];
+                    }
                     return js_num((double)id);
                 }
             }
@@ -1631,6 +1665,7 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
                 if (vm->timers[i].active && vm->timers[i].id == id) {
                     vm->timers[i].active = false;
                     vm->timers[i].fn_obj = NULL;
+                    vm->timers[i].argc   = 0;
                 }
             }
             return js_undefined();
@@ -1839,28 +1874,83 @@ static JsVal fn_fetch(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int
     return js_obj_val(js_promise_new(vm, 1, js_obj_val(ro)));
 }
 
+bool js_step_next_timer(JsVm *vm) {
+    if (!vm) return false;
+    int best = -1;
+    for (int i = 0; i < JS_MAX_TIMERS; i++) {
+        if (vm->timers[i].active && !vm->timers[i].repeat) {
+            if (best < 0 || vm->timers[i].due_ms < vm->timers[best].due_ms) {
+                best = i;
+            }
+        }
+    }
+    if (best < 0) return false;
+    JsObj *fn   = vm->timers[best].fn_obj;
+    bool is_raf = vm->timers[best].is_raf;
+    int targc   = vm->timers[best].argc;
+    JsVal targs[JS_MAX_TIMER_ARGS];
+    for (int a = 0; a < targc; a++) targs[a] = vm->timers[best].args[a];
+    vm->timers[best].active = false;
+    vm->timers[best].fn_obj = NULL;
+    vm->timers[best].argc   = 0;
+
+    if (fn) {
+        int saved_sp = vm->temp_sp;
+        js_temp_push(vm, js_obj_val(fn));
+        for (int a = 0; a < targc; a++) js_temp_push(vm, targs[a]);
+        if (is_raf) {
+            JsVal ts = js_num((double)(js_now_ms() - vm->boot_ms));
+            (void)js_call(vm, js_obj_val(fn), js_obj_val(vm->global_obj), 1, &ts);
+        } else {
+            (void)js_call(vm, js_obj_val(fn), js_obj_val(vm->global_obj), targc, targs);
+        }
+        vm->temp_sp = saved_sp;
+        js_drain_microtasks(vm);
+    }
+    return true;
+}
+
+void js_dom_init_timers(JsVm *vm) {
+    if (!vm || !vm->global_obj) return;
+    JsObj *g = vm->global_obj;
+    js_define_native(vm, g, "setTimeout", fn_window_api, WIN_SET_TIMEOUT);
+    js_define_native(vm, g, "setInterval", fn_window_api, WIN_SET_INTERVAL);
+    js_define_native(vm, g, "clearTimeout", fn_window_api, WIN_CLEAR_TIMER);
+    js_define_native(vm, g, "clearInterval", fn_window_api, WIN_CLEAR_TIMER);
+    js_define_native(vm, g, "requestAnimationFrame", fn_window_api, WIN_RAF);
+    js_define_native(vm, g, "cancelAnimationFrame", fn_window_api, WIN_CANCEL_RAF);
+}
+
 int js_run_timers(JsVm *vm) {
     if (!vm) return -1;
     js_drain_microtasks(vm);
     int64_t now = js_now_ms();
     for (int i = 0; i < JS_MAX_TIMERS; i++) {
         if (vm->timers[i].active && vm->timers[i].due_ms <= now) {
-            JsObj *fn = vm->timers[i].fn_obj;
+            JsObj *fn   = vm->timers[i].fn_obj;
             bool is_raf = vm->timers[i].is_raf;
+            int targc   = vm->timers[i].argc;
+            JsVal targs[JS_MAX_TIMER_ARGS];
+            for (int a = 0; a < targc; a++) targs[a] = vm->timers[i].args[a];
             if (vm->timers[i].repeat) {
                 vm->timers[i].due_ms = now + vm->timers[i].interval_ms;
             } else {
                 vm->timers[i].active = false;
                 vm->timers[i].fn_obj = NULL;
+                vm->timers[i].argc   = 0;
             }
             if (fn) {
                 vm->steps = 0;
+                int saved_sp = vm->temp_sp;
+                js_temp_push(vm, js_obj_val(fn));
+                for (int a = 0; a < targc; a++) js_temp_push(vm, targs[a]);
                 if (is_raf) {
                     JsVal ts = js_num((double)(now - vm->boot_ms));
                     js_call(vm, js_obj_val(fn), js_obj_val(vm->global_obj), 1, &ts);
                 } else {
-                    js_call(vm, js_obj_val(fn), js_obj_val(vm->global_obj), 0, NULL);
+                    js_call(vm, js_obj_val(fn), js_obj_val(vm->global_obj), targc, targs);
                 }
+                vm->temp_sp = saved_sp;
                 js_drain_microtasks(vm);
                 if (vm->has_thrown) {
                     TbBuf eb;

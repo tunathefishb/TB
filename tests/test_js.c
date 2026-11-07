@@ -160,6 +160,97 @@ void test_js_engine(void) {
         ASSERT_STR_EQ(got, exp, "Exact modern ES6+ & Web APIs output verification");
     }
 
+    const char *edge_js =
+        "let timerPromVal = 0;\n"
+        "new Promise(resolve => setTimeout(resolve, 0, 99)).then(v => { timerPromVal = v; });\n"
+        "let timerAwaitVal = 0;\n"
+        "(async () => {\n"
+        "  const a = await new Promise(r => setTimeout(() => r(40), 5));\n"
+        "  const b = await Promise.resolve(1).then(async x => {\n"
+        "    const y = await Promise.resolve(x).then(v => v + 1);\n"
+        "    return y;\n"
+        "  });\n"
+        "  timerAwaitVal = a + b;\n"
+        "})();\n"
+        "class BaseA {\n"
+        "  static base = 10;\n"
+        "  static calc() { return this.base; }\n"
+        "  chain() { return 'A'; }\n"
+        "}\n"
+        "class MidB extends BaseA {\n"
+        "  static extra = this.base + 5;\n"
+        "  constructor() { super(); this.b = 2; }\n"
+        "}\n"
+        "class LeafC extends MidB {\n"
+        "  static calc() { return super.calc() + this.extra; }\n"
+        "  chain() { return super.chain() + '->C:' + this.b; }\n"
+        "}\n"
+        "const leafInst = new LeafC();\n"
+        "const inhCheck = `${leafInst instanceof LeafC}:${leafInst instanceof BaseA}:${leafInst.chain()}:${LeafC.calc()}`;\n"
+        "const redefObj = {};\n"
+        "let setLog = 0;\n"
+        "Object.defineProperty(redefObj, 'prop', { get: () => 10, set: v => { setLog = v; } });\n"
+        "Object.defineProperty(redefObj, 'prop', { get: () => 20 });\n"
+        "redefObj.prop = 77;\n"
+        "const beforeValRedef = `${redefObj.prop}:${setLog}`;\n"
+        "Object.defineProperty(redefObj, 'prop', { value: 55 });\n"
+        "const afterValRedef = `${redefObj.prop}:${setLog}`;\n"
+        "Object.defineProperty(redefObj, 'delMe', { get: () => 88 });\n"
+        "delete redefObj.delMe;\n"
+        "const createdObj = Object.create({ p: 1 }, { own: { value: 2 }, acc: { get: () => 3 } });\n"
+        "const redefCheck = `${beforeValRedef}|${afterValRedef}|${redefObj.delMe === undefined}|${createdObj.p + createdObj.own + createdObj.acc}`;\n"
+        "async function addAsync(a, b) { return this.base + a + b; }\n"
+        "const boundAsync = addAsync.bind({ base: 100 }, 20);\n"
+        "let boundAsyncVal = 0;\n"
+        "boundAsync(3).then(v => { boundAsyncVal = v; });\n"
+        "function mulAdd(a, b, c) { return this.k * (a * b + c); }\n"
+        "const b1 = mulAdd.bind({ k: 2 }, 6);\n"
+        "const b2 = b1.bind({ k: 999 }, 7);\n"
+        "function hoistCheck(p) {\n"
+        "  const pre = typeof h1 + ':' + typeof h2;\n"
+        "  var [[h1], { k: h2 }] = [[11], { k: 22 }];\n"
+        "  var [p] = [p + 5];\n"
+        "  return `${pre}|${h1}:${h2}:${p}`;\n"
+        "}\n"
+        "const usp = new URLSearchParams('msg=hello%20world%21&plus=a+b');\n"
+        "const uspObj = Object.fromEntries(usp);\n"
+        "const uspKeys = [...usp.keys()].join(',');\n"
+        "const emptySearch = new URL('https://example.com/?').search;\n";
+    JsVal ejres = js_undefined();
+    ASSERT_TRUE(js_eval(vm, edge_js, strlen(edge_js), &ejres),
+                "Edge-case ES6+ regression setup evaluates cleanly");
+    js_run_timers(vm);
+    const char *edge_verify_js =
+        "JSON.stringify({\n"
+        "  timerPromVal,\n"
+        "  timerAwaitVal,\n"
+        "  inhCheck,\n"
+        "  redefCheck,\n"
+        "  boundAsyncVal,\n"
+        "  b2Val: b2(8),\n"
+        "  hoist: hoistCheck(10),\n"
+        "  uspMsg: uspObj.msg,\n"
+        "  uspPlus: uspObj.plus,\n"
+        "  uspStr: usp.toString(),\n"
+        "  uspKeys,\n"
+        "  emptySearch\n"
+        "});";
+    ASSERT_TRUE(js_eval(vm, edge_verify_js, strlen(edge_verify_js), &ejres) &&
+                ejres.type == JS_OBJECT && ejres.u.obj->obj_type == OBJ_STRING,
+                "Edge-case ES6+ regression verification evaluates cleanly");
+    if (ejres.type == JS_OBJECT && ejres.u.obj->obj_type == OBJ_STRING) {
+        const char *got = ((JsStr *)ejres.u.obj)->data;
+        const char *exp =
+            "{\"timerPromVal\":99,\"timerAwaitVal\":42,"
+            "\"inhCheck\":\"true:true:A->C:2:25\","
+            "\"redefCheck\":\"20:77|55:77|true|6\","
+            "\"boundAsyncVal\":123,\"b2Val\":100,"
+            "\"hoist\":\"undefined:undefined|11:22:15\","
+            "\"uspMsg\":\"hello world!\",\"uspPlus\":\"a b\","
+            "\"uspStr\":\"msg=hello+world%21&plus=a+b\",\"uspKeys\":\"msg,plus\",\"emptySearch\":\"\"}";
+        ASSERT_STR_EQ(got, exp, "setTimeout(resolve), timer-backed await, 3-level class/static super, Object.defineProperty redefinition, bound async, and URLSearchParams");
+    }
+
     js_vm_free(vm);
 }
 
