@@ -1189,6 +1189,9 @@ static EvalRes eval_stmt_list(JsVm *vm, JsChunk *ch, JsEnv *env, uint32_t first_
         EvalRes r = eval_stmt(vm, ch, env, cur);
         if (r.flow != FLOW_NONE) return r;
         last = r.val;
+        if (vm->call_depth == 0 && vm->microtask_count > 0 && !vm->draining_microtasks) {
+            js_drain_microtasks(vm);
+        }
     }
     return res_ok(last);
 }

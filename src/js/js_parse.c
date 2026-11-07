@@ -547,6 +547,7 @@ static void consume_asi(Parser *p) {
 /* Forward declarations */
 static uint32_t parse_expr(Parser *p, bool allow_in);
 static uint32_t parse_assign(Parser *p, bool allow_in);
+static uint32_t parse_lhs_expr(Parser *p, bool allow_calls);
 static uint32_t parse_stmt(Parser *p);
 static uint32_t parse_block(Parser *p);
 static uint32_t parse_binding_target(Parser *p);

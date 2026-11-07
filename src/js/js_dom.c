@@ -411,6 +411,32 @@ static void remove_node_listener(DomNode *n, const char *type, JsObj *fn_obj) {
 bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
     JsNativeTag tag = (JsNativeTag)m->hdr.native_tag;
 
+    if (tag == NATIVE_TAG_SET) {
+        if (strcmp(key, "size") == 0) {
+            JsVal vv = js_get_prop(vm, js_obj_val((JsObj *)m), "_vals");
+            if (vv.type == JS_OBJECT && vv.u.obj && vv.u.obj->obj_type == OBJ_ARRAY) {
+                *out = js_num((double)((JsArrObj *)vv.u.obj)->len);
+                return true;
+            }
+            *out = js_num(0);
+            return true;
+        }
+        return false;
+    }
+
+    if (tag == NATIVE_TAG_MAP || tag == NATIVE_TAG_URL_PARAMS) {
+        if (strcmp(key, "size") == 0) {
+            JsVal kv = js_get_prop(vm, js_obj_val((JsObj *)m), "_keys");
+            if (kv.type == JS_OBJECT && kv.u.obj && kv.u.obj->obj_type == OBJ_ARRAY) {
+                *out = js_num((double)((JsArrObj *)kv.u.obj)->len);
+                return true;
+            }
+            *out = js_num(0);
+            return true;
+        }
+        return false;
+    }
+
     if (tag == NATIVE_TAG_WINDOW) {
         if (strcmp(key, "innerWidth") == 0)  { *out = js_num(vm->viewport_w > 0 ? vm->viewport_w : 80); return true; }
         if (strcmp(key, "innerHeight") == 0) { *out = js_num(vm->viewport_h > 0 ? vm->viewport_h : 24); return true; }

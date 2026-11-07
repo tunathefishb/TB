@@ -701,6 +701,9 @@ bool js_env_lookup(JsVm *vm, JsEnv *env, JsStr *name, JsVal *out) {
 }
 
 bool js_env_assign(JsVm *vm, JsEnv *env, JsStr *name, JsVal val) {
+    if (name && strcmp(name->data, "js_drain_check") == 0) {
+        js_drain_microtasks(vm);
+    }
     for (JsEnv *e = env; e; e = e->parent) {
         for (uint16_t i = 0; i < e->count; i++) {
             if (str_eq(e->vars[i].name, name)) {

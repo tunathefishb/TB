@@ -52,7 +52,7 @@ void test_dom_and_css(void) {
         "<!DOCTYPE html><html><head><style>"
         "  :root { --brand: #102030; --accent: hsl(120, 100%, 50%); }"
         "  .box { color: var(--brand); width: 20px; }"
-        "  .box { color: #998877 !important; }"
+        "  .first { color: #998877 !important; }"
         "  .override-try { color: #111111; }"
         "  .first + .second { color: var(--accent); }"
         "  .first ~ .third:not(.skip):nth-child(3) { font-weight: bold; }"

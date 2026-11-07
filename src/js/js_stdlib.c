@@ -1,6 +1,7 @@
 #include "js.h"
 #include "math_tb.h"
 #include "regex_tb.h"
+#include "net.h"
 
 static JsVal make_str_val(JsVm *vm, const char *s, size_t len) {
     JsStr *st = js_str_new(vm, s, len);
@@ -2491,6 +2492,591 @@ static JsVal fn_promise(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, i
     return js_obj_val(child);
 }
 
+/* Storage (localStorage & sessionStorage) */
+typedef enum {
+    STORAGE_SET_ITEM,
+    STORAGE_GET_ITEM,
+    STORAGE_REMOVE_ITEM,
+    STORAGE_CLEAR,
+    STORAGE_KEY
+} JsStorageMagic;
+
+static JsVal fn_storage(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
+    if (this_val.type != JS_OBJECT || !this_val.u.obj) return js_undefined();
+    JsVal sv = js_get_prop(vm, this_val, "_store");
+    if (sv.type != JS_OBJECT || !sv.u.obj || sv.u.obj->obj_type != OBJ_OBJECT)
+        return js_undefined();
+    JsMapObj *sm = (JsMapObj *)sv.u.obj;
+
+    switch (magic) {
+        case STORAGE_SET_ITEM: {
+            if (argc < 2) return js_undefined();
+            JsStr *k = js_to_str(vm, argv[0]);
+            JsStr *v = js_to_str(vm, argv[1]);
+            if (!k || !v) return js_undefined();
+            js_set_prop(vm, sv, k->data, js_obj_val((JsObj *)v));
+            return js_undefined();
+        }
+        case STORAGE_GET_ITEM: {
+            if (argc < 1) return js_null();
+            JsStr *k = js_to_str(vm, argv[0]);
+            if (!k) return js_null();
+            for (uint32_t i = 0; i < sm->count; i++) {
+                if (strcmp(sm->props[i].key->data, k->data) == 0) {
+                    return sm->props[i].val;
+                }
+            }
+            return js_null();
+        }
+        case STORAGE_REMOVE_ITEM: {
+            if (argc < 1) return js_undefined();
+            JsStr *k = js_to_str(vm, argv[0]);
+            if (!k) return js_undefined();
+            for (uint32_t i = 0; i < sm->count; i++) {
+                if (strcmp(sm->props[i].key->data, k->data) == 0) {
+                    for (uint32_t j = i; j + 1 < sm->count; j++) {
+                        sm->props[j] = sm->props[j + 1];
+                    }
+                    sm->count--;
+                    break;
+                }
+            }
+            return js_undefined();
+        }
+        case STORAGE_CLEAR: {
+            sm->count = 0;
+            return js_undefined();
+        }
+        case STORAGE_KEY: {
+            if (argc < 1) return js_null();
+            int idx = (int)js_to_num(vm, argv[0]);
+            if (idx >= 0 && (uint32_t)idx < sm->count) {
+                return js_obj_val((JsObj *)sm->props[idx].key);
+            }
+            return js_null();
+        }
+        default:
+            return js_undefined();
+    }
+}
+
+/* URLSearchParams */
+typedef enum {
+    URL_PARAMS_CTOR,
+    URL_PARAMS_APPEND,
+    URL_PARAMS_GET,
+    URL_PARAMS_GET_ALL,
+    URL_PARAMS_SET,
+    URL_PARAMS_HAS,
+    URL_PARAMS_DELETE,
+    URL_PARAMS_TO_STRING,
+    URL_PARAMS_FOR_EACH
+} JsUrlParamsMagic;
+
+static void url_params_parse_query(JsVm *vm, JsObj *params_obj, const char *qs) {
+    if (!qs) return;
+    if (*qs == '?') qs++;
+    const char *p = qs;
+    while (*p) {
+        const char *amp = strchr(p, '&');
+        size_t len = amp ? (size_t)(amp - p) : strlen(p);
+        if (len > 0) {
+            const char *eq = memchr(p, '=', len);
+            size_t klen = eq ? (size_t)(eq - p) : len;
+            size_t vlen = eq ? len - klen - 1 : 0;
+            const char *vstart = eq ? eq + 1 : "";
+
+            char kbuf[512], vbuf[1024];
+            size_t kc = klen < sizeof(kbuf) - 1 ? klen : sizeof(kbuf) - 1;
+            memcpy(kbuf, p, kc); kbuf[kc] = '\0';
+            size_t vc = vlen < sizeof(vbuf) - 1 ? vlen : sizeof(vbuf) - 1;
+            memcpy(vbuf, vstart, vc); vbuf[vc] = '\0';
+
+            for (size_t i = 0; i < kc; i++) if (kbuf[i] == '+') kbuf[i] = ' ';
+            for (size_t i = 0; i < vc; i++) if (vbuf[i] == '+') vbuf[i] = ' ';
+
+            JsVal kv = make_cstr_val(vm, kbuf);
+            JsVal vv = make_cstr_val(vm, vbuf);
+            JsVal k_arr = js_get_prop(vm, js_obj_val(params_obj), "_keys");
+            JsVal v_arr = js_get_prop(vm, js_obj_val(params_obj), "_vals");
+            if (k_arr.type == JS_OBJECT && k_arr.u.obj && v_arr.type == JS_OBJECT && v_arr.u.obj) {
+                js_arr_push(vm, k_arr.u.obj, kv);
+                js_arr_push(vm, v_arr.u.obj, vv);
+            }
+        }
+        if (!amp) break;
+        p = amp + 1;
+    }
+}
+
+static JsVal fn_url_params(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
+    if (magic == URL_PARAMS_CTOR) {
+        JsObj *usp = js_map_new(vm, vm->url_params_proto);
+        if (!usp) return js_undefined();
+        usp->native_tag = NATIVE_TAG_URL_PARAMS;
+        int saved_sp = vm->temp_sp;
+        js_temp_push(vm, js_obj_val(usp));
+        JsObj *keys = js_arr_new(vm, 8);
+        JsObj *vals = js_arr_new(vm, 8);
+        js_set_prop(vm, js_obj_val(usp), "_keys", js_obj_val(keys));
+        js_set_prop(vm, js_obj_val(usp), "_vals", js_obj_val(vals));
+
+        if (argc > 0) {
+            if (argv[0].type == JS_OBJECT && argv[0].u.obj) {
+                JsObj *o = argv[0].u.obj;
+                if (o->obj_type == OBJ_STRING) {
+                    url_params_parse_query(vm, usp, ((JsStr *)o)->data);
+                } else if (o->native_tag == NATIVE_TAG_URL_PARAMS) {
+                    JsVal ok = js_get_prop(vm, argv[0], "_keys");
+                    JsVal ov = js_get_prop(vm, argv[0], "_vals");
+                    if (ok.type == JS_OBJECT && ok.u.obj && ok.u.obj->obj_type == OBJ_ARRAY &&
+                        ov.type == JS_OBJECT && ov.u.obj && ov.u.obj->obj_type == OBJ_ARRAY) {
+                        JsArrObj *oka = (JsArrObj *)ok.u.obj;
+                        JsArrObj *ova = (JsArrObj *)ov.u.obj;
+                        uint32_t n = oka->len < ova->len ? oka->len : ova->len;
+                        for (uint32_t i = 0; i < n; i++) {
+                            js_arr_push(vm, keys, oka->items[i]);
+                            js_arr_push(vm, vals, ova->items[i]);
+                        }
+                    }
+                } else if (o->obj_type == OBJ_OBJECT) {
+                    JsMapObj *mo = (JsMapObj *)o;
+                    for (uint32_t i = 0; i < mo->count; i++) {
+                        if (mo->props[i].key->data[0] == '\x01' || mo->props[i].key->data[0] == '_') continue;
+                        JsStr *vs = js_to_str(vm, mo->props[i].val);
+                        js_arr_push(vm, keys, js_obj_val((JsObj *)mo->props[i].key));
+                        js_arr_push(vm, vals, vs ? js_obj_val((JsObj *)vs) : make_cstr_val(vm, ""));
+                    }
+                }
+            } else if (argv[0].type != JS_UNDEFINED && argv[0].type != JS_NULL) {
+                JsStr *qs = js_to_str(vm, argv[0]);
+                if (qs) url_params_parse_query(vm, usp, qs->data);
+            }
+        }
+        vm->temp_sp = saved_sp;
+        return js_obj_val(usp);
+    }
+
+    if (this_val.type != JS_OBJECT || !this_val.u.obj) return js_undefined();
+    JsVal kv = js_get_prop(vm, this_val, "_keys");
+    JsVal vv = js_get_prop(vm, this_val, "_vals");
+    if (kv.type != JS_OBJECT || !kv.u.obj || kv.u.obj->obj_type != OBJ_ARRAY ||
+        vv.type != JS_OBJECT || !vv.u.obj || vv.u.obj->obj_type != OBJ_ARRAY) {
+        return js_undefined();
+    }
+    JsArrObj *ka = (JsArrObj *)kv.u.obj;
+    JsArrObj *va = (JsArrObj *)vv.u.obj;
+
+    switch (magic) {
+        case URL_PARAMS_APPEND: {
+            if (argc < 2) return js_undefined();
+            JsStr *k = js_to_str(vm, argv[0]);
+            JsStr *v = js_to_str(vm, argv[1]);
+            js_arr_push(vm, (JsObj *)ka, k ? js_obj_val((JsObj *)k) : make_cstr_val(vm, ""));
+            js_arr_push(vm, (JsObj *)va, v ? js_obj_val((JsObj *)v) : make_cstr_val(vm, ""));
+            return js_undefined();
+        }
+        case URL_PARAMS_GET: {
+            if (argc < 1) return js_null();
+            JsStr *k = js_to_str(vm, argv[0]);
+            if (!k) return js_null();
+            for (uint32_t i = 0; i < ka->len; i++) {
+                JsStr *ki = js_to_str(vm, ka->items[i]);
+                if (ki && strcmp(ki->data, k->data) == 0) {
+                    return va->items[i];
+                }
+            }
+            return js_null();
+        }
+        case URL_PARAMS_GET_ALL: {
+            JsObj *res = js_arr_new(vm, 4);
+            if (!res) return js_undefined();
+            if (argc > 0) {
+                JsStr *k = js_to_str(vm, argv[0]);
+                if (k) {
+                    for (uint32_t i = 0; i < ka->len; i++) {
+                        JsStr *ki = js_to_str(vm, ka->items[i]);
+                        if (ki && strcmp(ki->data, k->data) == 0) {
+                            js_arr_push(vm, res, va->items[i]);
+                        }
+                    }
+                }
+            }
+            return js_obj_val(res);
+        }
+        case URL_PARAMS_SET: {
+            if (argc < 2) return js_undefined();
+            JsStr *k = js_to_str(vm, argv[0]);
+            JsStr *v = js_to_str(vm, argv[1]);
+            if (!k) return js_undefined();
+            JsVal k_val = js_obj_val((JsObj *)k);
+            JsVal v_val = v ? js_obj_val((JsObj *)v) : make_cstr_val(vm, "");
+            bool replaced = false;
+            for (uint32_t i = 0; i < ka->len; i++) {
+                JsStr *ki = js_to_str(vm, ka->items[i]);
+                if (ki && strcmp(ki->data, k->data) == 0) {
+                    if (!replaced) {
+                        va->items[i] = v_val;
+                        replaced = true;
+                    } else {
+                        for (uint32_t j = i; j + 1 < ka->len; j++) {
+                            ka->items[j] = ka->items[j + 1];
+                            va->items[j] = va->items[j + 1];
+                        }
+                        ka->len--;
+                        va->len--;
+                        i--;
+                    }
+                }
+            }
+            if (!replaced) {
+                js_arr_push(vm, (JsObj *)ka, k_val);
+                js_arr_push(vm, (JsObj *)va, v_val);
+            }
+            return js_undefined();
+        }
+        case URL_PARAMS_HAS: {
+            if (argc < 1) return js_bool(false);
+            JsStr *k = js_to_str(vm, argv[0]);
+            if (!k) return js_bool(false);
+            for (uint32_t i = 0; i < ka->len; i++) {
+                JsStr *ki = js_to_str(vm, ka->items[i]);
+                if (ki && strcmp(ki->data, k->data) == 0) return js_bool(true);
+            }
+            return js_bool(false);
+        }
+        case URL_PARAMS_DELETE: {
+            if (argc < 1) return js_undefined();
+            JsStr *k = js_to_str(vm, argv[0]);
+            if (!k) return js_undefined();
+            for (uint32_t i = 0; i < ka->len; i++) {
+                JsStr *ki = js_to_str(vm, ka->items[i]);
+                if (ki && strcmp(ki->data, k->data) == 0) {
+                    for (uint32_t j = i; j + 1 < ka->len; j++) {
+                        ka->items[j] = ka->items[j + 1];
+                        va->items[j] = va->items[j + 1];
+                    }
+                    ka->len--;
+                    va->len--;
+                    i--;
+                }
+            }
+            return js_undefined();
+        }
+        case URL_PARAMS_TO_STRING: {
+            TbBuf b;
+            tb_buf_init(&b);
+            uint32_t n = ka->len < va->len ? ka->len : va->len;
+            for (uint32_t i = 0; i < n; i++) {
+                if (i > 0) tb_buf_append_char(&b, '&');
+                JsStr *ki = js_to_str(vm, ka->items[i]);
+                JsStr *vi = js_to_str(vm, va->items[i]);
+                if (ki) tb_buf_append_cstr(&b, ki->data);
+                tb_buf_append_char(&b, '=');
+                if (vi) tb_buf_append_cstr(&b, vi->data);
+            }
+            JsVal res = make_str_val(vm, b.data ? b.data : "", b.len);
+            tb_buf_free(&b);
+            return res;
+        }
+        case URL_PARAMS_FOR_EACH: {
+            if (argc < 1) return js_undefined();
+            JsVal cb = argv[0];
+            JsVal this_arg = argc > 1 ? argv[1] : js_undefined();
+            uint32_t snap = ka->len < va->len ? ka->len : va->len;
+            for (uint32_t i = 0; i < snap && i < ka->len && i < va->len; i++) {
+                JsVal cargs[3] = { va->items[i], ka->items[i], this_val };
+                (void)js_call(vm, cb, this_arg, 3, cargs);
+                if (vm->has_thrown) break;
+            }
+            return js_undefined();
+        }
+        default:
+            return js_undefined();
+    }
+}
+
+/* URL */
+typedef enum {
+    URL_CTOR,
+    URL_TO_STRING
+} JsUrlMagic;
+
+static JsVal fn_url(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
+    if (magic == URL_TO_STRING) {
+        if (this_val.type != JS_OBJECT || !this_val.u.obj) return js_undefined();
+        return js_get_prop(vm, this_val, "href");
+    }
+
+    if (magic == URL_CTOR) {
+        if (argc < 1) {
+            js_throw_str(vm, "TypeError: Failed to construct 'URL': 1 argument required");
+            return js_undefined();
+        }
+        JsStr *u_s = js_to_str(vm, argv[0]);
+        if (!u_s) {
+            js_throw_str(vm, "TypeError: Invalid URL string");
+            return js_undefined();
+        }
+
+        char resolved[1536];
+        TbUrl parsed;
+        if (argc > 1 && argv[1].type != JS_UNDEFINED && argv[1].type != JS_NULL) {
+            JsStr *base_s = js_to_str(vm, argv[1]);
+            if (!base_s) {
+                js_throw_str(vm, "TypeError: Invalid base URL");
+                return js_undefined();
+            }
+            TbUrl base_u;
+            if (!tb_url_parse(base_s->data, &base_u)) {
+                js_throw_str(vm, "TypeError: Invalid base URL");
+                return js_undefined();
+            }
+            tb_url_resolve(&base_u, u_s->data, resolved, sizeof(resolved));
+            if (!tb_url_parse(resolved, &parsed)) {
+                js_throw_str(vm, "TypeError: Invalid URL");
+                return js_undefined();
+            }
+        } else {
+            if (!tb_url_parse(u_s->data, &parsed)) {
+                js_throw_str(vm, "TypeError: Invalid URL");
+                return js_undefined();
+            }
+            tb_url_format(&parsed, resolved, sizeof(resolved), true);
+        }
+
+        JsObj *uo = js_map_new(vm, vm->url_proto);
+        if (!uo) return js_undefined();
+        uo->native_tag = NATIVE_TAG_URL;
+        int saved_sp = vm->temp_sp;
+        js_temp_push(vm, js_obj_val(uo));
+
+        /* Origin */
+        char origin_buf[512] = "";
+        bool is_std_port = (strcmp(parsed.scheme, "http") == 0 && (parsed.port == 80 || parsed.port == 0)) ||
+                           (strcmp(parsed.scheme, "https") == 0 && (parsed.port == 443 || parsed.port == 0));
+        if (strcmp(parsed.scheme, "http") == 0 || strcmp(parsed.scheme, "https") == 0) {
+            if (parsed.port > 0 && !is_std_port) {
+                snprintf(origin_buf, sizeof(origin_buf), "%s://%s:%d", parsed.scheme, parsed.host, parsed.port);
+            } else {
+                snprintf(origin_buf, sizeof(origin_buf), "%s://%s", parsed.scheme, parsed.host);
+            }
+        } else {
+            snprintf(origin_buf, sizeof(origin_buf), "%s://%s", parsed.scheme, parsed.host);
+        }
+
+        /* Pathname */
+        char pathname_buf[1024];
+        const char *qpos = strchr(parsed.path, '?');
+        if (qpos) {
+            size_t plen = (size_t)(qpos - parsed.path);
+            if (plen >= sizeof(pathname_buf)) plen = sizeof(pathname_buf) - 1;
+            memcpy(pathname_buf, parsed.path, plen);
+            pathname_buf[plen] = '\0';
+        } else {
+            snprintf(pathname_buf, sizeof(pathname_buf), "%s", parsed.path[0] ? parsed.path : "/");
+        }
+
+        /* Search */
+        char search_buf[1024] = "";
+        char query_only[1024] = "";
+        if (qpos) {
+            snprintf(search_buf, sizeof(search_buf), "%s", qpos);
+            snprintf(query_only, sizeof(query_only), "%s", qpos + 1);
+        }
+
+        /* Hash */
+        char hash_buf[256] = "";
+        if (parsed.fragment[0]) {
+            snprintf(hash_buf, sizeof(hash_buf), "#%s", parsed.fragment);
+        }
+
+        /* Host & Hostname & Port */
+        char host_buf[512];
+        char port_buf[16] = "";
+        if (parsed.port > 0 && !is_std_port) {
+            snprintf(host_buf, sizeof(host_buf), "%s:%d", parsed.host, parsed.port);
+            snprintf(port_buf, sizeof(port_buf), "%d", parsed.port);
+        } else {
+            snprintf(host_buf, sizeof(host_buf), "%s", parsed.host);
+        }
+
+        /* Protocol */
+        char proto_buf[32];
+        snprintf(proto_buf, sizeof(proto_buf), "%s:", parsed.scheme);
+
+        /* searchParams */
+        JsVal q_val = make_cstr_val(vm, query_only);
+        JsVal sp_val = fn_url_params(vm, js_undefined(), 1, &q_val, URL_PARAMS_CTOR);
+
+        js_set_prop(vm, js_obj_val(uo), "href", make_cstr_val(vm, resolved));
+        js_set_prop(vm, js_obj_val(uo), "origin", make_cstr_val(vm, origin_buf));
+        js_set_prop(vm, js_obj_val(uo), "protocol", make_cstr_val(vm, proto_buf));
+        js_set_prop(vm, js_obj_val(uo), "host", make_cstr_val(vm, host_buf));
+        js_set_prop(vm, js_obj_val(uo), "hostname", make_cstr_val(vm, parsed.host));
+        js_set_prop(vm, js_obj_val(uo), "port", make_cstr_val(vm, port_buf));
+        js_set_prop(vm, js_obj_val(uo), "pathname", make_cstr_val(vm, pathname_buf));
+        js_set_prop(vm, js_obj_val(uo), "search", make_cstr_val(vm, search_buf));
+        js_set_prop(vm, js_obj_val(uo), "hash", make_cstr_val(vm, hash_buf));
+        js_set_prop(vm, js_obj_val(uo), "searchParams", sp_val);
+
+        vm->temp_sp = saved_sp;
+        return js_obj_val(uo);
+    }
+
+    return js_undefined();
+}
+
+/* Headers */
+typedef enum {
+    HEADERS_CTOR,
+    HEADERS_APPEND,
+    HEADERS_GET,
+    HEADERS_SET,
+    HEADERS_HAS,
+    HEADERS_DELETE,
+    HEADERS_FOR_EACH
+} JsHeadersMagic;
+
+static JsVal fn_headers(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
+    if (magic == HEADERS_CTOR) {
+        JsObj *ho = js_map_new(vm, vm->headers_proto);
+        if (!ho) return js_undefined();
+        ho->native_tag = NATIVE_TAG_HEADERS;
+        int saved_sp = vm->temp_sp;
+        js_temp_push(vm, js_obj_val(ho));
+        JsObj *map = js_map_new(vm, NULL);
+        js_set_prop(vm, js_obj_val(ho), "_map", js_obj_val(map));
+
+        if (argc > 0 && argv[0].type == JS_OBJECT && argv[0].u.obj) {
+            JsObj *init = argv[0].u.obj;
+            if (init->native_tag == NATIVE_TAG_HEADERS) {
+                JsVal src_map = js_get_prop(vm, argv[0], "_map");
+                if (src_map.type == JS_OBJECT && src_map.u.obj && src_map.u.obj->obj_type == OBJ_OBJECT) {
+                    JsMapObj *sm = (JsMapObj *)src_map.u.obj;
+                    for (uint32_t i = 0; i < sm->count; i++) {
+                        JsVal cargs[2] = { js_obj_val((JsObj *)sm->props[i].key), sm->props[i].val };
+                        (void)fn_headers(vm, js_obj_val(ho), 2, cargs, HEADERS_APPEND);
+                    }
+                }
+            } else if (init->obj_type == OBJ_OBJECT) {
+                JsMapObj *mo = (JsMapObj *)init;
+                for (uint32_t i = 0; i < mo->count; i++) {
+                    if (mo->props[i].key->data[0] == '\x01' || mo->props[i].key->data[0] == '_') continue;
+                    JsStr *vs = js_to_str(vm, mo->props[i].val);
+                    JsVal cargs[2] = { js_obj_val((JsObj *)mo->props[i].key),
+                                       vs ? js_obj_val((JsObj *)vs) : make_cstr_val(vm, "") };
+                    (void)fn_headers(vm, js_obj_val(ho), 2, cargs, HEADERS_APPEND);
+                }
+            } else if (init->obj_type == OBJ_ARRAY) {
+                JsArrObj *ao = (JsArrObj *)init;
+                for (uint32_t i = 0; i < ao->len; i++) {
+                    JsVal item = ao->items[i];
+                    if (item.type == JS_OBJECT && item.u.obj) {
+                        JsVal cargs[2] = { js_get_index(vm, item, 0), js_get_index(vm, item, 1) };
+                        (void)fn_headers(vm, js_obj_val(ho), 2, cargs, HEADERS_APPEND);
+                    }
+                }
+            }
+        }
+        vm->temp_sp = saved_sp;
+        return js_obj_val(ho);
+    }
+
+    if (this_val.type != JS_OBJECT || !this_val.u.obj) return js_undefined();
+    JsVal mv = js_get_prop(vm, this_val, "_map");
+    if (mv.type != JS_OBJECT || !mv.u.obj || mv.u.obj->obj_type != OBJ_OBJECT) return js_undefined();
+    JsMapObj *m = (JsMapObj *)mv.u.obj;
+
+    switch (magic) {
+        case HEADERS_APPEND: {
+            if (argc < 2) return js_undefined();
+            JsStr *k = js_to_str(vm, argv[0]);
+            JsStr *v = js_to_str(vm, argv[1]);
+            if (!k || !v) return js_undefined();
+            for (uint32_t i = 0; i < m->count; i++) {
+                if (tb_strcasecmp(m->props[i].key->data, k->data) == 0) {
+                    JsStr *old_s = js_to_str(vm, m->props[i].val);
+                    const char *old_c = old_s ? old_s->data : "";
+                    size_t nlen = strlen(old_c) + 2 + v->len + 1;
+                    char *combined = (char *)tb_malloc(nlen);
+                    if (combined) {
+                        snprintf(combined, nlen, "%s, %s", old_c, v->data);
+                        m->props[i].val = make_cstr_val(vm, combined);
+                        tb_free(combined);
+                    }
+                    return js_undefined();
+                }
+            }
+            js_set_prop(vm, mv, k->data, js_obj_val((JsObj *)v));
+            return js_undefined();
+        }
+        case HEADERS_GET: {
+            if (argc < 1) return js_null();
+            JsStr *k = js_to_str(vm, argv[0]);
+            if (!k) return js_null();
+            for (uint32_t i = 0; i < m->count; i++) {
+                if (tb_strcasecmp(m->props[i].key->data, k->data) == 0) {
+                    return m->props[i].val;
+                }
+            }
+            return js_null();
+        }
+        case HEADERS_SET: {
+            if (argc < 2) return js_undefined();
+            JsStr *k = js_to_str(vm, argv[0]);
+            JsStr *v = js_to_str(vm, argv[1]);
+            if (!k) return js_undefined();
+            for (uint32_t i = 0; i < m->count; i++) {
+                if (tb_strcasecmp(m->props[i].key->data, k->data) == 0) {
+                    m->props[i].val = v ? js_obj_val((JsObj *)v) : make_cstr_val(vm, "");
+                    return js_undefined();
+                }
+            }
+            js_set_prop(vm, mv, k->data, v ? js_obj_val((JsObj *)v) : make_cstr_val(vm, ""));
+            return js_undefined();
+        }
+        case HEADERS_HAS: {
+            if (argc < 1) return js_bool(false);
+            JsStr *k = js_to_str(vm, argv[0]);
+            if (!k) return js_bool(false);
+            for (uint32_t i = 0; i < m->count; i++) {
+                if (tb_strcasecmp(m->props[i].key->data, k->data) == 0) return js_bool(true);
+            }
+            return js_bool(false);
+        }
+        case HEADERS_DELETE: {
+            if (argc < 1) return js_undefined();
+            JsStr *k = js_to_str(vm, argv[0]);
+            if (!k) return js_undefined();
+            for (uint32_t i = 0; i < m->count; i++) {
+                if (tb_strcasecmp(m->props[i].key->data, k->data) == 0) {
+                    for (uint32_t j = i; j + 1 < m->count; j++) {
+                        m->props[j] = m->props[j + 1];
+                    }
+                    m->count--;
+                    break;
+                }
+            }
+            return js_undefined();
+        }
+        case HEADERS_FOR_EACH: {
+            if (argc < 1) return js_undefined();
+            JsVal cb = argv[0];
+            JsVal this_arg = argc > 1 ? argv[1] : js_undefined();
+            uint32_t snap = m->count;
+            for (uint32_t i = 0; i < snap && i < m->count; i++) {
+                JsVal cargs[3] = { m->props[i].val, js_obj_val((JsObj *)m->props[i].key), this_val };
+                (void)js_call(vm, cb, this_arg, 3, cargs);
+                if (vm->has_thrown) break;
+            }
+            return js_undefined();
+        }
+        default:
+            return js_undefined();
+    }
+}
+
 void js_stdlib_init(JsVm *vm) {
     JsObj *g = vm->global_obj;
     js_set_prop(vm, js_obj_val(g), "globalThis", js_obj_val(g));
@@ -2725,4 +3311,59 @@ void js_stdlib_init(JsVm *vm) {
     JsObj *tb_obj = js_map_new(vm, vm->object_proto);
     js_define_native(vm, tb_obj, "gc", fn_global_misc, GM_TB_GC);
     js_set_prop(vm, js_obj_val(g), "tb", js_obj_val(tb_obj));
+
+    /* URL & URLSearchParams */
+    JsObj *url_ctor = js_native_fn_new(vm, "URL", fn_url, URL_CTOR);
+    js_set_prop(vm, js_obj_val(url_ctor), "prototype", js_obj_val(vm->url_proto));
+    js_set_prop(vm, js_obj_val(g), "URL", js_obj_val(url_ctor));
+    js_define_native(vm, vm->url_proto, "toString", fn_url, URL_TO_STRING);
+    js_define_native(vm, vm->url_proto, "toJSON", fn_url, URL_TO_STRING);
+
+    JsObj *usp_ctor = js_native_fn_new(vm, "URLSearchParams", fn_url_params, URL_PARAMS_CTOR);
+    js_set_prop(vm, js_obj_val(usp_ctor), "prototype", js_obj_val(vm->url_params_proto));
+    js_set_prop(vm, js_obj_val(g), "URLSearchParams", js_obj_val(usp_ctor));
+    js_define_native(vm, vm->url_params_proto, "append", fn_url_params, URL_PARAMS_APPEND);
+    js_define_native(vm, vm->url_params_proto, "get", fn_url_params, URL_PARAMS_GET);
+    js_define_native(vm, vm->url_params_proto, "getAll", fn_url_params, URL_PARAMS_GET_ALL);
+    js_define_native(vm, vm->url_params_proto, "set", fn_url_params, URL_PARAMS_SET);
+    js_define_native(vm, vm->url_params_proto, "has", fn_url_params, URL_PARAMS_HAS);
+    js_define_native(vm, vm->url_params_proto, "delete", fn_url_params, URL_PARAMS_DELETE);
+    js_define_native(vm, vm->url_params_proto, "toString", fn_url_params, URL_PARAMS_TO_STRING);
+    js_define_native(vm, vm->url_params_proto, "forEach", fn_url_params, URL_PARAMS_FOR_EACH);
+
+    /* Headers */
+    JsObj *hdrs_ctor = js_native_fn_new(vm, "Headers", fn_headers, HEADERS_CTOR);
+    js_set_prop(vm, js_obj_val(hdrs_ctor), "prototype", js_obj_val(vm->headers_proto));
+    js_set_prop(vm, js_obj_val(g), "Headers", js_obj_val(hdrs_ctor));
+    js_define_native(vm, vm->headers_proto, "append", fn_headers, HEADERS_APPEND);
+    js_define_native(vm, vm->headers_proto, "get", fn_headers, HEADERS_GET);
+    js_define_native(vm, vm->headers_proto, "set", fn_headers, HEADERS_SET);
+    js_define_native(vm, vm->headers_proto, "has", fn_headers, HEADERS_HAS);
+    js_define_native(vm, vm->headers_proto, "delete", fn_headers, HEADERS_DELETE);
+    js_define_native(vm, vm->headers_proto, "forEach", fn_headers, HEADERS_FOR_EACH);
+
+    /* localStorage & sessionStorage */
+    JsObj *ls = js_map_new(vm, vm->object_proto);
+    ls->native_tag = NATIVE_TAG_STORAGE;
+    JsObj *ls_store = js_map_new(vm, NULL);
+    js_set_prop(vm, js_obj_val(ls), "_store", js_obj_val(ls_store));
+    js_define_native(vm, ls, "setItem", fn_storage, STORAGE_SET_ITEM);
+    js_define_native(vm, ls, "getItem", fn_storage, STORAGE_GET_ITEM);
+    js_define_native(vm, ls, "removeItem", fn_storage, STORAGE_REMOVE_ITEM);
+    js_define_native(vm, ls, "clear", fn_storage, STORAGE_CLEAR);
+    js_define_native(vm, ls, "key", fn_storage, STORAGE_KEY);
+    vm->local_storage_obj = ls;
+    js_set_prop(vm, js_obj_val(g), "localStorage", js_obj_val(ls));
+
+    JsObj *ss = js_map_new(vm, vm->object_proto);
+    ss->native_tag = NATIVE_TAG_STORAGE;
+    JsObj *ss_store = js_map_new(vm, NULL);
+    js_set_prop(vm, js_obj_val(ss), "_store", js_obj_val(ss_store));
+    js_define_native(vm, ss, "setItem", fn_storage, STORAGE_SET_ITEM);
+    js_define_native(vm, ss, "getItem", fn_storage, STORAGE_GET_ITEM);
+    js_define_native(vm, ss, "removeItem", fn_storage, STORAGE_REMOVE_ITEM);
+    js_define_native(vm, ss, "clear", fn_storage, STORAGE_CLEAR);
+    js_define_native(vm, ss, "key", fn_storage, STORAGE_KEY);
+    vm->session_storage_obj = ss;
+    js_set_prop(vm, js_obj_val(g), "sessionStorage", js_obj_val(ss));
 }
