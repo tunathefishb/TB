@@ -209,6 +209,119 @@ void test_dom_and_css(void) {
     js_vm_free(vm);
     layout_free(&ldoc);
     dom_doc_free(mdoc);
+
+    /* Part A Regression: innerText vs textContent, <center>, align="right",
+     * recursive <table> cell layout with interactive form controls & inline <script>,
+     * adjacent link spacing, .lsbb span button wrappers, and legacy Google homepage JS DOM bindings */
+    const char *google_html =
+        "<!DOCTYPE html><html><head><style>"
+        "body { background: #fff; color: #1f1f1f; }"
+        ".hidden-note { display: none; }"
+        ".ds { display: inline-block; }"
+        ".lsbb { background: #f8f9fa; border: 1px solid #dadce0; display: block; }"
+        "</style></head>"
+        "<body bgcolor='#fff' onload='document.f.q.focus()'>"
+        "<div id='gbar'><a href='/imghp'>Images</a><a href='/maps'>Maps</a></div>"
+        "<div id='guser' align='right'><a href='/login'>Sign in</a></div>"
+        "<center>"
+        "  <img id='hplogo' name='logo' src='/logo.png' alt='Google'>"
+        "  <form action='index.html' name='f'>"
+        "    <table><tr>"
+        "      <td>&nbsp;</td>"
+        "      <td align='center'>"
+        "        <input name='ie' value='ISO-8859-1' type='hidden'>"
+        "        <input id='q-in' name='q' size='25' value=''>"
+        "        <br>"
+        "        <span class='ds'><span class='lsbb'><input name='btnG' type='submit' value='Google Search'></span></span>"
+        "        <span class='ds'><span class='lsbb'><input name='btnI' type='submit' value=\"I'm Feeling Lucky\" "
+        "               onclick=\"if(this.form.q.value)this.form.iflsig.disabled=false;else{top.location='about:blank';return false;}\"></span></span>"
+        "        <input name='iflsig' value='AL9hbdg' disabled type='hidden'>"
+        "      </td>"
+        "      <td>"
+        "        <a href='/advanced_search'>Advanced search</a>"
+        "        <script>(function(){ window._tdScriptRan = true; })();</script>"
+        "        <style>.unused { color: red; }</style>"
+        "        <span class='hidden-note'>SecretHidden</span>"
+        "      </td>"
+        "    </tr></table>"
+        "  </form>"
+        "</center></body></html>";
+
+    DomDocument *gdoc = dom_parse_html(google_html, strlen(google_html));
+    ASSERT_TRUE(gdoc != NULL, "Parse Google-style <center><form><table> HTML");
+    LayoutDoc gldoc;
+    layout_init(&gldoc);
+    layout_build(&gldoc, gdoc, 140, NULL, 0);
+
+    char *body_tc = dom_get_text_content(gdoc->body);
+    char *body_it = dom_get_inner_text(gdoc->body);
+    ASSERT_TRUE(body_tc && strstr(body_tc, "_tdScriptRan") != NULL && strstr(body_tc, "SecretHidden") != NULL,
+                "dom_get_text_content includes raw <script>, <style>, and display:none text");
+    ASSERT_TRUE(body_it && strstr(body_it, "_tdScriptRan") == NULL &&
+                strstr(body_it, ".unused") == NULL && strstr(body_it, "SecretHidden") == NULL &&
+                strstr(body_it, "Advanced search") != NULL,
+                "dom_get_inner_text excludes <script>, <style>, and display:none nodes");
+    tb_free(body_tc);
+    tb_free(body_it);
+
+    TbBuf gdump;
+    tb_buf_init(&gdump);
+    layout_render_document(&gldoc, false, &gdump);
+    ASSERT_TRUE(gdump.data && strstr(gdump.data, "_tdScriptRan") == NULL,
+                "Table cell layout does not leak inline <script> source into rendered TUI output");
+    ASSERT_TRUE(gdump.data && strstr(gdump.data, "[ Google Search ] [ I'm Feeling Lucky ]") != NULL,
+                "Interactive submit buttons inside .lsbb spans render side-by-side on the same row");
+    ASSERT_TRUE(gdump.data && strstr(gdump.data, "Images Maps") != NULL,
+                "Adjacent <a> links without whitespace are separated by a visual column gap");
+    tb_buf_free(&gdump);
+
+    DomNode *q_node   = dom_get_element_by_id(gdoc->root, "q-in");
+    DomNode *sign_in  = dom_query_selector(gdoc->root, "#guser a");
+    int q_hit         = layout_find_node_hit(&gldoc, q_node);
+    int sign_hit      = layout_find_node_hit(&gldoc, sign_in);
+    ASSERT_TRUE(q_hit >= 0 && gldoc.hits[q_hit].col_start > 35,
+                "<input name='q'> inside <center><table> has a HitBox centered horizontally");
+    ASSERT_TRUE(sign_hit >= 0 && gldoc.hits[sign_hit].col_start > 100,
+                "<div align='right'> right-aligns child link and its HitBox");
+
+    JsVm *gvm = js_vm_new();
+    gvm->viewport_w = 100;
+    gvm->viewport_h = 28;
+    js_bind_document(gvm, gdoc, "https://www.google.com/");
+    const char *legacy_js =
+        "document.f.q.focus();\n"
+        "const img = new Image(1, 1);\n"
+        "img.src = '/gen_204?atyp=i';\n"
+        "JSON.stringify({\n"
+        "  hasTop: window.top === window && window.parent === window,\n"
+        "  formsLen: document.forms.length,\n"
+        "  imagesLen: document.images.length,\n"
+        "  namedForm: document.f.tagName,\n"
+        "  namedInput: document.f.q.id,\n"
+        "  ctrlFormMatch: document.f.q.form === document.f,\n"
+        "  elementsLen: document.f.elements.length,\n"
+        "  activeId: document.activeElement ? document.activeElement.id : null,\n"
+        "  imgTag: img.tagName,\n"
+        "  imgSrc: img.src,\n"
+        "  innerClean: document.body.innerText.indexOf('_tdScriptRan') === -1\n"
+        "});";
+    JsVal gres = js_undefined();
+    bool gok = js_eval(gvm, legacy_js, strlen(legacy_js), &gres);
+    ASSERT_TRUE(gok && gres.type == JS_OBJECT && gres.u.obj->obj_type == OBJ_STRING,
+                "Legacy Google JS DOM bindings script succeeds");
+    if (gok && gres.type == JS_OBJECT && gres.u.obj->obj_type == OBJ_STRING) {
+        const char *got = ((JsStr *)gres.u.obj)->data;
+        const char *exp =
+            "{\"hasTop\":true,\"formsLen\":1,\"imagesLen\":1,\"namedForm\":\"FORM\","
+            "\"namedInput\":\"q-in\",\"ctrlFormMatch\":true,\"elementsLen\":5,"
+            "\"activeId\":\"q-in\",\"imgTag\":\"IMG\",\"imgSrc\":\"/gen_204?atyp=i\",\"innerClean\":true}";
+        ASSERT_STR_EQ(got, exp, "Legacy DOM Level 0 bindings (document.f.q, form.elements, activeElement, new Image)");
+    }
+
+    js_vm_free(gvm);
+    layout_free(&gldoc);
+    dom_doc_free(gdoc);
+
     TbMemStats mst;
     tb_mem_stats(&mst);
     ASSERT_TRUE(mst.heap_live == 0,
@@ -309,6 +422,67 @@ void test_browser_lifecycle(void) {
                 "History Back restored about:memory");
     ASSERT_TRUE(tb_browser_forward(&b) && strstr(b.current_url, "demos/index.html") != NULL,
                 "History Forward restored demos/index.html");
+
+    /* 4. Part A: Table-nested form submission with named submit buttons (btnG vs btnI) & top.location */
+    ASSERT_TRUE(tb_browser_eval_repl(&b,
+        "document.body.innerHTML = `"
+        "<center><form action='index.html' name='f'><table><tr><td>"
+        "<input id='q' name='q' value=''>"
+        "<input id='btnG' name='btnG' type='submit' value='Google Search'>"
+        "<input id='btnI' name='btnI' type='submit' value=\"I'm Feeling Lucky\" "
+        " onclick=\"if(this.form.q.value)this.form.iflsig.disabled=false;else{top.location='about:help';return false;}\">"
+        "<input name='iflsig' value='AL9hbdg' disabled type='hidden'>"
+        "</td></tr></table></form></center>`;"
+        "document.f.q.focus();"),
+        "Inject Google-style table form and focus document.f.q");
+    DomNode *q_el = dom_get_element_by_id(b.doc->root, "q");
+    ASSERT_TRUE(b.focused_hit >= 0 && b.layout.hits[b.focused_hit].node == q_el,
+                "document.f.q.focus() synced browser focused_hit to <input name='q'>");
+
+    /* Click btnI with empty query -> should navigate to about:help via top.location and return false */
+    DomNode *btnI_el = dom_get_element_by_id(b.doc->root, "btnI");
+    int btnI_hit = layout_find_node_hit(&b.layout, btnI_el);
+    ASSERT_TRUE(btnI_hit >= 0, "Locate #btnI inside table cell");
+    tb_browser_activate_hit(&b, btnI_hit);
+    ASSERT_STR_EQ(b.current_url, "about:help",
+                  "Empty-query Lucky button navigated via top.location='about:help' without submitting form");
+
+    /* Go back to demos/index.html, re-inject form, set query='linux', click btnG */
+    ASSERT_TRUE(tb_browser_back(&b), "Back to demos/index.html");
+    ASSERT_TRUE(tb_browser_eval_repl(&b,
+        "document.body.innerHTML = `"
+        "<center><form action='index.html' name='f'><table><tr><td>"
+        "<input id='q' name='q' value='linux'>"
+        "<input id='btnG' name='btnG' type='submit' value='Google Search'>"
+        "<input id='btnI' name='btnI' type='submit' value=\"I'm Feeling Lucky\" "
+        " onclick=\"if(this.form.q.value)this.form.iflsig.disabled=false;else{top.location='about:help';return false;}\">"
+        "<input name='iflsig' value='AL9hbdg' disabled type='hidden'>"
+        "</td></tr></table></form></center>`;"),
+        "Re-inject form with q='linux'");
+    DomNode *btnG_el = dom_get_element_by_id(b.doc->root, "btnG");
+    int btnG_hit = layout_find_node_hit(&b.layout, btnG_el);
+    ASSERT_TRUE(btnG_hit >= 0, "Locate #btnG inside table cell");
+    tb_browser_activate_hit(&b, btnG_hit);
+    ASSERT_TRUE(strstr(b.current_url, "index.html?q=linux&btnG=Google+Search") != NULL,
+                "Clicking btnG serialized q=linux&btnG=Google+Search and omitted btnI and disabled iflsig");
+
+    /* Now test clicking btnI with non-empty query -> onclick enables iflsig and submits btnI */
+    ASSERT_TRUE(tb_browser_eval_repl(&b,
+        "document.body.innerHTML = `"
+        "<center><form action='index.html' name='f'><table><tr><td>"
+        "<input id='q' name='q' value='c11'>"
+        "<input id='btnG' name='btnG' type='submit' value='Google Search'>"
+        "<input id='btnI' name='btnI' type='submit' value=\"I'm Feeling Lucky\" "
+        " onclick=\"if(this.form.q.value)this.form.iflsig.disabled=false;else{top.location='about:help';return false;}\">"
+        "<input name='iflsig' value='AL9hbdg' disabled type='hidden'>"
+        "</td></tr></table></form></center>`;"),
+        "Re-inject form with q='c11'");
+    btnI_el = dom_get_element_by_id(b.doc->root, "btnI");
+    btnI_hit = layout_find_node_hit(&b.layout, btnI_el);
+    ASSERT_TRUE(btnI_hit >= 0, "Locate #btnI for non-empty query");
+    tb_browser_activate_hit(&b, btnI_hit);
+    ASSERT_TRUE(strstr(b.current_url, "index.html?q=c11&btnI=I%27m+Feeling+Lucky&iflsig=AL9hbdg") != NULL,
+                "Clicking btnI with q='c11' enabled hidden iflsig in onclick and serialized btnI + iflsig");
 
     tb_browser_free(&b);
 }

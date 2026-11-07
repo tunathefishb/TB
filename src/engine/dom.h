@@ -28,7 +28,7 @@ typedef enum {
     TAG_TABLE, TAG_THEAD, TAG_TBODY, TAG_TFOOT, TAG_TR, TAG_TH, TAG_TD,
     TAG_FORM, TAG_INPUT, TAG_BUTTON, TAG_TEXTAREA, TAG_SELECT, TAG_OPTION, TAG_LABEL,
     TAG_HEADER, TAG_NAV, TAG_MAIN, TAG_SECTION, TAG_ARTICLE, TAG_ASIDE, TAG_FOOTER,
-    TAG_DETAILS, TAG_SUMMARY, TAG_FIGURE, TAG_FIGCAPTION,
+    TAG_DETAILS, TAG_SUMMARY, TAG_FIGURE, TAG_FIGCAPTION, TAG_CENTER,
     TAG_COUNT
 } DomTag;
 
@@ -137,6 +137,7 @@ void        dom_set_css_var(DomNode *node, const char *name, const char *value);
 void        dom_clear_css_vars(DomNode *node);
 
 char *dom_get_text_content(const DomNode *node);
+char *dom_get_inner_text(const DomNode *node);
 void  dom_set_text_content(DomNode *node, const char *text);
 char *dom_get_inner_html(const DomNode *node);
 void  dom_set_inner_html(DomNode *node, const char *html);

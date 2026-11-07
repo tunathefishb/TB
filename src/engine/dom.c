@@ -25,7 +25,7 @@ static const char *TAG_NAMES[TAG_COUNT] = {
     [TAG_HEADER] = "header", [TAG_NAV] = "nav", [TAG_MAIN] = "main",
     [TAG_SECTION] = "section", [TAG_ARTICLE] = "article", [TAG_ASIDE] = "aside",
     [TAG_FOOTER] = "footer", [TAG_DETAILS] = "details", [TAG_SUMMARY] = "summary",
-    [TAG_FIGURE] = "figure", [TAG_FIGCAPTION] = "figcaption"
+    [TAG_FIGURE] = "figure", [TAG_FIGCAPTION] = "figcaption", [TAG_CENTER] = "center"
 };
 
 DomTag dom_tag_from_name(const char *name, size_t len) {
@@ -547,6 +547,32 @@ char *dom_get_text_content(const DomNode *node) {
     TbBuf b;
     tb_buf_init(&b);
     collect_text_rec(node, &b);
+    return tb_buf_detach(&b, NULL);
+}
+
+static void collect_inner_text_rec(const DomNode *n, TbBuf *b) {
+    if (!n) return;
+    if (n->type == DOM_NODE_TEXT) {
+        if (n->text) tb_buf_append_cstr(b, n->text);
+        return;
+    }
+    if (n->type == DOM_NODE_COMMENT) return;
+    if (n->type == DOM_NODE_ELEMENT) {
+        if (n->tag == TAG_SCRIPT || n->tag == TAG_STYLE ||
+            n->tag == TAG_NOSCRIPT || n->tag == TAG_HEAD ||
+            n->style.display == CSS_DISP_NONE || dom_has_attr(n, "hidden")) {
+            return;
+        }
+    }
+    for (const DomNode *ch = n->first_child; ch; ch = ch->next_sibling) {
+        collect_inner_text_rec(ch, b);
+    }
+}
+
+char *dom_get_inner_text(const DomNode *node) {
+    TbBuf b;
+    tb_buf_init(&b);
+    collect_inner_text_rec(node, &b);
     return tb_buf_detach(&b, NULL);
 }
 

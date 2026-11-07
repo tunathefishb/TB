@@ -861,6 +861,10 @@ static void init_ua_defaults(DomNode *node, const CssStyle *parent_st) {
         case TAG_DL: case TAG_DT: case TAG_HR:
             st->display = CSS_DISP_BLOCK;
             break;
+        case TAG_CENTER:
+            st->display    = CSS_DISP_BLOCK;
+            st->text_align = CSS_ALIGN_CENTER;
+            break;
         case TAG_DD:
             st->display     = CSS_DISP_BLOCK;
             st->margin_left = 4;
@@ -975,6 +979,13 @@ static void init_ua_defaults(DomNode *node, const CssStyle *parent_st) {
         }
         default:
             break;
+    }
+
+    const char *align_attr = dom_get_attr(node, "align");
+    if (align_attr && *align_attr) {
+        if (tb_strcasecmp(align_attr, "center") == 0) st->text_align = CSS_ALIGN_CENTER;
+        else if (tb_strcasecmp(align_attr, "right") == 0) st->text_align = CSS_ALIGN_RIGHT;
+        else if (tb_strcasecmp(align_attr, "left") == 0) st->text_align = CSS_ALIGN_LEFT;
     }
 
     if (dom_has_attr(node, "hidden")) {

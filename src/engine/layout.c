@@ -43,6 +43,8 @@ typedef struct {
     int        cur_line;
     int        cur_col;
     bool       at_line_start;
+    bool       in_table_cell;
+    bool       in_inline;
     uint8_t    text_align;
     int        pending_blank_lines;
 
@@ -189,14 +191,17 @@ static void align_finished_line(LayoutCtx *ctx, int line_idx) {
     if (shift <= 0) return;
 
     LayoutLine *ln = &ctx->ld->lines[line_idx];
+    int last_hit = -1;
     for (LayoutSpan *sp = ln->first_span; sp; sp = sp->next) {
         if (sp->col >= ctx->left_margin && sp->col < ctx->right_limit) {
             sp->col += shift;
-            if (sp->hit_index >= 0 && sp->hit_index < ctx->ld->hit_count) {
+            if (sp->hit_index >= 0 && sp->hit_index < ctx->ld->hit_count &&
+                sp->hit_index != last_hit) {
                 HitBox *hb = &ctx->ld->hits[sp->hit_index];
                 if (hb->line_y == line_idx) {
                     hb->col_start += shift;
                     hb->col_end   += shift;
+                    last_hit = sp->hit_index;
                 }
             }
         }
@@ -213,6 +218,10 @@ static void newline(LayoutCtx *ctx) {
 }
 
 static void flush_pending_blanks(LayoutCtx *ctx) {
+    if (ctx->in_table_cell) {
+        ctx->pending_blank_lines = 0;
+        return;
+    }
     while (ctx->pending_blank_lines > 0) {
         if (ctx->cur_line > 0 || !ctx->at_line_start) {
             newline(ctx);
@@ -351,8 +360,19 @@ static bool node_has_click_handler(const DomNode *n) {
 static PenStyle pen_from_node(const DomNode *n, PenStyle parent_pen, int hit_idx) {
     PenStyle p = parent_pen;
     const CssStyle *st = &n->style;
-    if (st->fg_set && st->fg.mode == CSS_COLOR_RGB) p.fg = st->fg;
-    if (st->bg_set && st->bg.mode == CSS_COLOR_RGB && st->display == CSS_DISP_INLINE) p.bg = st->bg;
+    if (st->bg_set && st->bg.mode == CSS_COLOR_RGB && st->display == CSS_DISP_INLINE) {
+        if ((int)st->bg.r + (int)st->bg.g + (int)st->bg.b <= 600) {
+            p.bg = st->bg;
+        }
+    }
+    if (st->fg_set && st->fg.mode == CSS_COLOR_RGB) {
+        int luma = ((int)st->fg.r * 30 + (int)st->fg.g * 59 + (int)st->fg.b * 11) / 100;
+        if (luma < 85 && p.bg.mode != CSS_COLOR_RGB) {
+            p.fg = (n->tag == TAG_A) ? css_rgb(56, 189, 248) : css_rgb(226, 232, 240);
+        } else {
+            p.fg = st->fg;
+        }
+    }
     if (st->bold) p.bold = 1;
     if (st->italic) p.italic = 1;
     if (st->underline) p.underline = 1;
@@ -405,6 +425,136 @@ static void collect_table_rows(DomNode *n, DomNode **rows, int *nrow, int max_ro
     }
 }
 
+static void measure_cell_rec(const DomNode *n, bool is_root, int *cur_w, int *max_w,
+                             bool *prev_space, bool *prev_hit) {
+    if (!n || n->type == DOM_NODE_COMMENT) return;
+    if (n->type == DOM_NODE_TEXT) {
+        const char *t = n->text ? n->text : "";
+        size_t i = 0, len = strlen(t);
+        while (i < len) {
+            if (tb_isspace(t[i])) {
+                while (i < len && tb_isspace(t[i])) i++;
+                if (*cur_w > 0 && !*prev_space) {
+                    *cur_w += 1;
+                    *prev_space = true;
+                }
+                continue;
+            }
+            size_t ws = i;
+            while (i < len && !tb_isspace(t[i])) i++;
+            *cur_w += utf8_display_width(t + ws, i - ws);
+            *prev_space = false;
+            *prev_hit   = false;
+            if (*cur_w > *max_w) *max_w = *cur_w;
+        }
+        return;
+    }
+    if (n->type != DOM_NODE_ELEMENT) return;
+    if (n->style.display == CSS_DISP_NONE || n->tag == TAG_SCRIPT ||
+        n->tag == TAG_STYLE || n->tag == TAG_NOSCRIPT || n->tag == TAG_HEAD ||
+        dom_has_attr(n, "hidden")) {
+        return;
+    }
+    if (n->tag == TAG_BR) {
+        if (*cur_w > *max_w) *max_w = *cur_w;
+        *cur_w = 0;
+        *prev_space = true;
+        *prev_hit   = false;
+        return;
+    }
+    if (n->tag == TAG_IMG) {
+        const char *alt = dom_get_attr(n, "alt");
+        if (alt && *alt) {
+            *cur_w += utf8_display_width(alt, strlen(alt)) + 4;
+            *prev_space = false;
+            *prev_hit   = false;
+            if (*cur_w > *max_w) *max_w = *cur_w;
+        }
+        return;
+    }
+    if (n->tag == TAG_BUTTON || n->tag == TAG_INPUT ||
+        n->tag == TAG_SELECT || n->tag == TAG_TEXTAREA) {
+        int cw = 0;
+        if (n->tag == TAG_BUTTON) {
+            char *lbl = dom_get_inner_text(n);
+            const char *s = (lbl && *lbl) ? lbl : "Button";
+            cw = utf8_display_width(s, strlen(s)) + 4;
+            tb_free(lbl);
+        } else if (n->tag == TAG_SELECT) {
+            const char *val = dom_input_get_value((DomNode *)n);
+            const char *s = (val && *val) ? val : "Select";
+            cw = utf8_display_width(s, strlen(s)) + 6;
+        } else {
+            const char *type = (n->tag == TAG_TEXTAREA) ? "textarea" : dom_get_attr(n, "type");
+            if (!type || !*type) type = "text";
+            if (tb_strcasecmp(type, "button") == 0 ||
+                tb_strcasecmp(type, "submit") == 0 ||
+                tb_strcasecmp(type, "reset") == 0) {
+                const char *v = dom_get_attr(n, "value");
+                if (!v || !*v) v = (tb_strcasecmp(type, "submit") == 0) ? "Submit" : "Button";
+                cw = utf8_display_width(v, strlen(v)) + 4;
+            } else if (tb_strcasecmp(type, "checkbox") == 0 ||
+                       tb_strcasecmp(type, "radio") == 0) {
+                cw = 3;
+            } else {
+                cw = 26;
+                const char *sz_attr = dom_get_attr(n, "size");
+                if (sz_attr && atoi(sz_attr) > 4 && atoi(sz_attr) < 60) cw = atoi(sz_attr) + 2;
+            }
+        }
+        if (*prev_hit && !*prev_space) *cur_w += 1;
+        *cur_w += cw;
+        *prev_space = false;
+        *prev_hit   = true;
+        if (*cur_w > *max_w) *max_w = *cur_w;
+        return;
+    }
+
+    bool is_block = !is_root && n->tag != TAG_SPAN &&
+                    (n->style.display == CSS_DISP_BLOCK ||
+                     n->style.display == CSS_DISP_LIST_ITEM ||
+                     n->style.display == CSS_DISP_FLEX ||
+                     n->style.display == CSS_DISP_TABLE);
+    if (is_block && *cur_w > 0) {
+        if (*cur_w > *max_w) *max_w = *cur_w;
+        *cur_w = 0;
+        *prev_space = true;
+        *prev_hit   = false;
+    }
+
+    bool is_link = (n->tag == TAG_A && dom_has_attr(n, "href")) || node_has_click_handler(n);
+    if (is_link && *prev_hit && !*prev_space) {
+        *cur_w += 1;
+    }
+    int pad_l = n->style.margin_left + n->style.padding_left;
+    int pad_r = n->style.margin_right + n->style.padding_right;
+    if (pad_l > 0) {
+        *cur_w += pad_l;
+        *prev_space = true;
+    }
+    for (const DomNode *ch = n->first_child; ch; ch = ch->next_sibling) {
+        measure_cell_rec(ch, false, cur_w, max_w, prev_space, prev_hit);
+    }
+    if (pad_r > 0 && *cur_w > 0) {
+        *cur_w += pad_r;
+        *prev_space = true;
+    }
+    if (is_link) *prev_hit = true;
+    if (*cur_w > *max_w) *max_w = *cur_w;
+    if (is_block) {
+        *cur_w = 0;
+        *prev_space = true;
+        *prev_hit   = false;
+    }
+}
+
+static int measure_cell_width(const DomNode *cell) {
+    int cur_w = 0, max_w = 0;
+    bool prev_space = true, prev_hit = false;
+    measure_cell_rec(cell, true, &cur_w, &max_w, &prev_space, &prev_hit);
+    return max_w;
+}
+
 static void layout_table(LayoutCtx *ctx, DomNode *table_node, PenStyle parent_pen) {
     DomNode *rows[256];
     int nrow = 0;
@@ -418,9 +568,7 @@ static void layout_table(LayoutCtx *ctx, DomNode *table_node, PenStyle parent_pe
         for (DomNode *cell = rows[r]->first_child; cell && c < 32; cell = cell->next_sibling) {
             if (cell->type != DOM_NODE_ELEMENT ||
                 (cell->tag != TAG_TD && cell->tag != TAG_TH)) continue;
-            char *txt = dom_get_text_content(cell);
-            int w     = txt ? utf8_display_width(txt, strlen(txt)) : 0;
-            tb_free(txt);
+            int w = measure_cell_width(cell);
             if (w > col_w[c]) col_w[c] = w;
             c++;
         }
@@ -454,6 +602,23 @@ static void layout_table(LayoutCtx *ctx, DomNode *table_node, PenStyle parent_pe
     grid_pen.underline = 0;
     grid_pen.hit_index = -1;
 
+    int saved_left      = ctx->left_margin;
+    int saved_right     = ctx->right_limit;
+    uint8_t saved_align = ctx->text_align;
+    bool saved_in_cell  = ctx->in_table_cell;
+    bool saved_in_inl   = ctx->in_inline;
+
+    int grid_w     = total_w + ncols * 3 + 1;
+    int line_avail = saved_right - saved_left;
+    uint8_t tbl_align = (table_node->style.text_align != CSS_ALIGN_LEFT)
+                            ? table_node->style.text_align
+                            : saved_align;
+    int table_left = saved_left;
+    if (grid_w < line_avail) {
+        if (tbl_align == CSS_ALIGN_CENTER) table_left += (line_avail - grid_w) / 2;
+        else if (tbl_align == CSS_ALIGN_RIGHT) table_left += (line_avail - grid_w);
+    }
+
     /* Helper to draw table horizontal divider */
     for (int r = 0; r <= nrow; r++) {
         bool is_top = (r == 0);
@@ -475,84 +640,86 @@ static void layout_table(LayoutCtx *ctx, DomNode *table_node, PenStyle parent_pe
             dw++;
 
             stamp_line_decors(ctx, ctx->cur_line);
-            append_span_raw(ctx->ld, ctx->cur_line, ctx->left_margin, div.data, div.len, dw, grid_pen);
+            append_span_raw(ctx->ld, ctx->cur_line, table_left, div.data, div.len, dw, grid_pen);
             tb_buf_free(&div);
             ctx->cur_line++;
             ctx->at_line_start = true;
         }
         if (is_bot) break;
 
-        /* Render cells on this row */
-        stamp_line_decors(ctx, ctx->cur_line);
-        int x = ctx->left_margin;
-        append_span_raw(ctx->ld, ctx->cur_line, x, "│", 3, 1, grid_pen);
-        x += 1;
+        /* Lay out each cell in this row within its column [cell_left, cell_left + cw) */
+        int row_start_line   = ctx->cur_line;
+        int max_row_end_line = row_start_line + 1;
+        int saved_decors     = ctx->decor_depth;
+        BoxDecor saved_decor_arr[16];
+        memcpy(saved_decor_arr, ctx->decors, sizeof(saved_decor_arr));
+        ctx->decor_depth     = 0;
+        ctx->in_table_cell   = true;
+        ctx->in_inline       = false;
 
+        int cell_x = table_left + 2;
         DomNode *cell = rows[r]->first_child;
         for (int c = 0; c < ncols; c++) {
             while (cell && (cell->type != DOM_NODE_ELEMENT ||
                             (cell->tag != TAG_TD && cell->tag != TAG_TH))) {
                 cell = cell->next_sibling;
             }
-            append_span_raw(ctx->ld, ctx->cur_line, x, " ", 1, 1, grid_pen);
-            x += 1;
-
             int cw = col_w[c];
-            int drawn = 0;
-            if (cell) {
-                int hit = -1;
-                DomNode *link = (cell->first_child && cell->first_child->tag == TAG_A)
-                                    ? cell->first_child : NULL;
-                if (link && dom_has_attr(link, "href")) {
-                    hit = add_hit(ctx->ld, ctx->cur_line, x, x + cw, HIT_LINK, link);
-                } else if (node_has_click_handler(cell)) {
-                    hit = add_hit(ctx->ld, ctx->cur_line, x, x + cw, HIT_CLICKABLE, cell);
+            if (cell && cell->style.display != CSS_DISP_NONE) {
+                ctx->cur_line            = row_start_line;
+                ctx->left_margin         = cell_x;
+                ctx->right_limit         = cell_x + cw;
+                ctx->cur_col             = cell_x;
+                ctx->at_line_start       = true;
+                ctx->text_align          = cell->style.text_align;
+                ctx->pending_blank_lines = 0;
+                ctx->in_inline           = false;
+
+                int cell_hit = -1;
+                if (node_has_click_handler(cell)) {
+                    cell_hit = add_hit(ctx->ld, -1, 0, 0, HIT_CLICKABLE, cell);
                 }
-                PenStyle cp = pen_from_node(link ? link : cell, parent_pen, hit);
-                char *raw = dom_get_text_content(cell);
-                if (raw) {
-                    /* Collapse whitespace & truncate to cw */
-                    TbBuf cb;
-                    tb_buf_init(&cb);
-                    size_t ri = 0;
-                    while (raw[ri] && tb_isspace(raw[ri])) ri++;
-                    while (raw[ri] && drawn < cw) {
-                        if (tb_isspace(raw[ri])) {
-                            while (raw[ri] && tb_isspace(raw[ri])) ri++;
-                            if (raw[ri] && drawn + 1 <= cw) {
-                                tb_buf_append_char(&cb, ' ');
-                                drawn++;
-                            }
-                        } else {
-                            uint32_t ucp = 0;
-                            size_t un = tb_utf8_decode(raw + ri, strlen(raw + ri), &ucp);
-                            int uw = tb_unicode_width(ucp);
-                            if (drawn + uw > cw) break;
-                            tb_buf_append(&cb, raw + ri, un);
-                            drawn += uw;
-                            ri += un;
-                        }
-                    }
-                    if (cb.len > 0) {
-                        append_span_raw(ctx->ld, ctx->cur_line, x, cb.data, cb.len, drawn, cp);
-                    }
-                    tb_buf_free(&cb);
-                    tb_free(raw);
+                PenStyle cell_pen = pen_from_node(cell, parent_pen, cell_hit);
+                for (DomNode *ch = cell->first_child; ch; ch = ch->next_sibling) {
+                    layout_node(ctx, ch, cell_pen, 0);
                 }
-                cell = cell->next_sibling;
+                newline(ctx);
+                ctx->pending_blank_lines = 0;
+
+                int cell_end = (ctx->cur_line > row_start_line) ? ctx->cur_line : (row_start_line + 1);
+                cell->box_x = (int16_t)cell_x;
+                cell->box_y = (int16_t)row_start_line;
+                cell->box_w = (int16_t)cw;
+                cell->box_h = (int16_t)(cell_end - row_start_line);
+                if (cell_end > max_row_end_line) max_row_end_line = cell_end;
             }
-            if (drawn < cw) {
-                char pad[64];
-                int rem = cw - drawn;
-                if (rem > (int)sizeof(pad) - 1) rem = (int)sizeof(pad) - 1;
-                memset(pad, ' ', (size_t)rem);
-                append_span_raw(ctx->ld, ctx->cur_line, x + drawn, pad, (size_t)rem, rem, grid_pen);
-            }
-            x += cw;
-            append_span_raw(ctx->ld, ctx->cur_line, x, " │", 4, 2, grid_pen);
-            x += 2;
+            if (cell) cell = cell->next_sibling;
+            cell_x += cw + 3;
         }
-        ctx->cur_line++;
+
+        memcpy(ctx->decors, saved_decor_arr, sizeof(saved_decor_arr));
+        ctx->decor_depth   = saved_decors;
+        ctx->in_table_cell = saved_in_cell;
+        ctx->in_inline     = saved_in_inl;
+        ctx->left_margin   = saved_left;
+        ctx->right_limit   = saved_right;
+        ctx->text_align    = saved_align;
+
+        /* Stamp outer decors and vertical table borders across all lines of this row */
+        for (int ly = row_start_line; ly < max_row_end_line; ly++) {
+            stamp_line_decors(ctx, ly);
+            int bx = table_left;
+            append_span_raw(ctx->ld, ly, bx, "│", 3, 1, grid_pen);
+            bx += 2;
+            for (int c = 0; c < ncols; c++) {
+                bx += col_w[c] + 1;
+                append_span_raw(ctx->ld, ly, bx, "│", 3, 1, grid_pen);
+                bx += 2;
+            }
+        }
+
+        ctx->cur_line      = max_row_end_line;
+        ctx->cur_col       = saved_left;
         ctx->at_line_start = true;
     }
 
@@ -561,11 +728,25 @@ static void layout_table(LayoutCtx *ctx, DomNode *table_node, PenStyle parent_pe
     }
 }
 
+static void ensure_adjacent_hit_gap(LayoutCtx *ctx, int my_hit_idx, int next_w) {
+    if (ctx->at_line_start || ctx->cur_line < 0 || ctx->cur_line >= ctx->ld->line_count) return;
+    const LayoutLine *ln = &ctx->ld->lines[ctx->cur_line];
+    const LayoutSpan *last = ln->last_span;
+    if (last && last->hit_index >= 0 && last->hit_index != my_hit_idx &&
+        last->col + last->width == ctx->cur_col) {
+        if (next_w > 0 && ctx->cur_col + 1 + next_w > ctx->right_limit) {
+            newline(ctx);
+        } else if (ctx->cur_col + 1 < ctx->right_limit) {
+            ctx->cur_col += 1;
+        }
+    }
+}
+
 static void layout_form_control(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen) {
     PenStyle wp = pen_from_node(node, parent_pen, -1);
 
     if (node->tag == TAG_BUTTON) {
-        char *lbl = dom_get_text_content(node);
+        char *lbl = dom_get_inner_text(node);
         const char *s = (lbl && *lbl) ? lbl : "Button";
         TbBuf b;
         tb_buf_init(&b);
@@ -573,6 +754,7 @@ static void layout_form_control(LayoutCtx *ctx, DomNode *node, PenStyle parent_p
         tb_free(lbl);
 
         int w = utf8_display_width(b.data, b.len);
+        ensure_adjacent_hit_gap(ctx, -2, w);
         if (!ctx->at_line_start && ctx->cur_col + w > ctx->right_limit) newline(ctx);
         start_content_on_line(ctx);
         int hit = add_hit(ctx->ld, ctx->cur_line, ctx->cur_col, ctx->cur_col + w, HIT_BUTTON, node);
@@ -592,6 +774,7 @@ static void layout_form_control(LayoutCtx *ctx, DomNode *node, PenStyle parent_p
         tb_buf_init(&b);
         tb_buf_printf(&b, "‹ %s ▾ ›", (val && *val) ? val : "Select");
         int w = utf8_display_width(b.data, b.len);
+        ensure_adjacent_hit_gap(ctx, -2, w);
         if (!ctx->at_line_start && ctx->cur_col + w > ctx->right_limit) newline(ctx);
         start_content_on_line(ctx);
         wp.hit_index = add_hit(ctx->ld, ctx->cur_line, ctx->cur_col, ctx->cur_col + w, HIT_SELECT, node);
@@ -616,6 +799,7 @@ static void layout_form_control(LayoutCtx *ctx, DomNode *node, PenStyle parent_p
         tb_buf_init(&b);
         tb_buf_printf(&b, "[ %s ]", v);
         int w = utf8_display_width(b.data, b.len);
+        ensure_adjacent_hit_gap(ctx, -2, w);
         if (!ctx->at_line_start && ctx->cur_col + w > ctx->right_limit) newline(ctx);
         start_content_on_line(ctx);
         wp.hit_index = add_hit(ctx->ld, ctx->cur_line, ctx->cur_col, ctx->cur_col + w, HIT_BUTTON, node);
@@ -634,6 +818,7 @@ static void layout_form_control(LayoutCtx *ctx, DomNode *node, PenStyle parent_p
                               ? (chk ? "(•)" : "( )")
                               : (chk ? "[✓]" : "[ ]");
         int w = 3;
+        ensure_adjacent_hit_gap(ctx, -2, w);
         if (!ctx->at_line_start && ctx->cur_col + w > ctx->right_limit) newline(ctx);
         start_content_on_line(ctx);
         wp.hit_index = add_hit(ctx->ld, ctx->cur_line, ctx->cur_col, ctx->cur_col + w, HIT_CHECKBOX, node);
@@ -652,10 +837,10 @@ static void layout_form_control(LayoutCtx *ctx, DomNode *node, PenStyle parent_p
     int box_w       = 26;
     const char *sz_attr = dom_get_attr(node, "size");
     if (sz_attr && atoi(sz_attr) > 4 && atoi(sz_attr) < 60) box_w = atoi(sz_attr) + 2;
-    if (box_w > ctx->right_limit - ctx->left_margin - 2) {
-        box_w = ctx->right_limit - ctx->left_margin - 2;
-    }
-    if (box_w < 8) box_w = 8;
+    int max_avail   = ctx->right_limit - ctx->left_margin;
+    if (!ctx->in_table_cell && max_avail > 10) max_avail -= 2;
+    if (box_w > max_avail) box_w = max_avail;
+    if (box_w < 4) box_w = 4;
 
     TbBuf b;
     tb_buf_init(&b);
@@ -701,6 +886,7 @@ static void layout_form_control(LayoutCtx *ctx, DomNode *node, PenStyle parent_p
     }
     tb_buf_append_char(&b, ']');
 
+    ensure_adjacent_hit_gap(ctx, -2, box_w);
     if (!ctx->at_line_start && ctx->cur_col + box_w > ctx->right_limit) newline(ctx);
     start_content_on_line(ctx);
     wp.hit_index = add_hit(ctx->ld, ctx->cur_line, ctx->cur_col, ctx->cur_col + box_w, HIT_INPUT_TEXT, node);
@@ -765,14 +951,17 @@ static void layout_flex_item_inline(LayoutCtx *ctx, DomNode *node, PenStyle pare
 static void shift_spans_in_range(LayoutDoc *ld, int line_idx, int col_min, int col_max, int shift) {
     if (shift <= 0 || line_idx < 0 || line_idx >= ld->line_count) return;
     LayoutLine *ln = &ld->lines[line_idx];
+    int last_hit = -1;
     for (LayoutSpan *sp = ln->first_span; sp; sp = sp->next) {
         if (sp->col >= col_min && sp->col < col_max) {
             sp->col += shift;
-            if (sp->hit_index >= 0 && sp->hit_index < ld->hit_count) {
+            if (sp->hit_index >= 0 && sp->hit_index < ld->hit_count &&
+                sp->hit_index != last_hit) {
                 HitBox *hb = &ld->hits[sp->hit_index];
                 if (hb->line_y == line_idx) {
                     hb->col_start += shift;
                     hb->col_end   += shift;
+                    last_hit = sp->hit_index;
                 }
             }
         }
@@ -864,18 +1053,32 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
 
     /* Determine interactivity hit box if link or clickable element */
     int hit_idx = parent_pen.hit_index;
+    bool new_hit = false;
     if (node->tag == TAG_A && dom_has_attr(node, "href")) {
         hit_idx = add_hit(ctx->ld, -1, 0, 0, HIT_LINK, node);
+        new_hit = true;
     } else if (node_has_click_handler(node)) {
         hit_idx = add_hit(ctx->ld, -1, 0, 0, HIT_CLICKABLE, node);
+        new_hit = true;
     }
     PenStyle my_pen = pen_from_node(node, parent_pen, hit_idx);
 
-    if (st->display == CSS_DISP_INLINE) {
+    if (st->display == CSS_DISP_INLINE || node->tag == TAG_SPAN) {
+        int pad_l = st->margin_left + st->padding_left;
+        int pad_r = st->margin_right + st->padding_right;
+        if (pad_l > 0) {
+            start_content_on_line(ctx);
+            if (ctx->cur_col + pad_l < ctx->right_limit) ctx->cur_col += pad_l;
+        } else if (new_hit) {
+            ensure_adjacent_hit_gap(ctx, hit_idx, 0);
+        }
         int sx = ctx->at_line_start ? ctx->left_margin : ctx->cur_col;
         int sy = ctx->cur_line;
         for (DomNode *ch = node->first_child; ch; ch = ch->next_sibling) {
             layout_node(ctx, ch, my_pen, 0);
+        }
+        if (pad_r > 0 && !ctx->at_line_start && ctx->cur_col + pad_r < ctx->right_limit) {
+            ctx->cur_col += pad_r;
         }
         node->box_x = (int16_t)sx;
         node->box_y = (int16_t)sy;
@@ -912,17 +1115,21 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
     int box_start_line = ctx->cur_line + ctx->pending_blank_lines;
     bool pushed_decor = false;
 
-    if (st->border || node->tag == TAG_BLOCKQUOTE || (st->bg_set && st->bg.mode == CSS_COLOR_RGB)) {
+    bool use_box_bg = (st->bg_set && st->bg.mode == CSS_COLOR_RGB &&
+                       node->tag != TAG_HTML && node->tag != TAG_BODY &&
+                       ((int)st->bg.r + (int)st->bg.g + (int)st->bg.b <= 600));
+
+    if (st->border || node->tag == TAG_BLOCKQUOTE || use_box_bg) {
         flush_pending_blanks(ctx);
         box_start_line = ctx->cur_line;
         if (st->border) {
             draw_horiz_border(ctx, box_left, box_right, "┌", "┐",
-                              st->border_color, st->bg_set ? st->bg : (CssColor){0});
+                              st->border_color, use_box_bg ? st->bg : (CssColor){0});
         }
         if (ctx->decor_depth < 16) {
             BoxDecor *d   = &ctx->decors[ctx->decor_depth++];
             d->border_fg  = st->border_color.mode == CSS_COLOR_RGB ? st->border_color : css_rgb(71, 85, 105);
-            d->fill_bg    = st->bg_set ? st->bg : (CssColor){0};
+            d->fill_bg    = use_box_bg ? st->bg : (CssColor){0};
             d->left_col   = box_left;
             d->right_col  = box_right;
             d->has_border = (st->border != 0);
@@ -1049,7 +1256,7 @@ static void layout_node(LayoutCtx *ctx, DomNode *node, PenStyle parent_pen, int 
         ctx->decor_depth--;
         if (st->border) {
             draw_horiz_border(ctx, box_left, box_right, "└", "┘",
-                              st->border_color, st->bg_set ? st->bg : (CssColor){0});
+                              st->border_color, use_box_bg ? st->bg : (CssColor){0});
         }
     }
 

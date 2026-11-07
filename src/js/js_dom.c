@@ -8,6 +8,9 @@ static void on_dom_node_destroy(void *userdata, DomNode *node) {
         m->native_ptr = NULL;
         node->js_wrapper = NULL;
     }
+    if (vm && vm->focused_node == node) {
+        vm->focused_node = NULL;
+    }
     if (vm && vm->on_node_destroy) {
         vm->on_node_destroy(vm->host_userdata, node);
     }
@@ -407,6 +410,46 @@ static void remove_node_listener(DomNode *n, const char *type, JsObj *fn_obj) {
     }
 }
 
+static bool map_has_named_prop(const JsMapObj *m, const char *key) {
+    if (!m || !key || m->hdr.obj_type != OBJ_OBJECT) return false;
+    for (uint32_t i = 0; i < m->count; i++) {
+        if (m->props[i].key && strcmp(m->props[i].key->data, key) == 0) return true;
+    }
+    return false;
+}
+
+static DomNode *find_named_descendant(DomNode *root, DomTag tag_filter, const char *name_or_id) {
+    if (!root || !name_or_id || !*name_or_id) return NULL;
+    for (DomNode *ch = root->first_child; ch; ch = ch->next_sibling) {
+        if (ch->type == DOM_NODE_ELEMENT) {
+            if (tag_filter == TAG_UNKNOWN || ch->tag == tag_filter) {
+                const char *nm = dom_get_attr(ch, "name");
+                const char *id = dom_get_attr(ch, "id");
+                if ((nm && strcmp(nm, name_or_id) == 0) ||
+                    (id && strcmp(id, name_or_id) == 0)) {
+                    return ch;
+                }
+            }
+            DomNode *hit = find_named_descendant(ch, tag_filter, name_or_id);
+            if (hit) return hit;
+        }
+    }
+    return NULL;
+}
+
+static void collect_form_controls_rec(DomNode *n, JsVm *vm, JsObj *arr) {
+    if (!n) return;
+    for (DomNode *ch = n->first_child; ch; ch = ch->next_sibling) {
+        if (ch->type == DOM_NODE_ELEMENT) {
+            if (ch->tag == TAG_INPUT || ch->tag == TAG_BUTTON ||
+                ch->tag == TAG_SELECT || ch->tag == TAG_TEXTAREA) {
+                js_arr_push(vm, arr, js_wrap_dom_node(vm, ch));
+            }
+            collect_form_controls_rec(ch, vm, arr);
+        }
+    }
+}
+
 /* Virtual Getters & Setters on DOM / Window / Style / Location / Performance / Storage */
 bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
     JsNativeTag tag = (JsNativeTag)m->hdr.native_tag;
@@ -684,7 +727,33 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
         if (strcmp(key, "body") == 0)            { *out = js_wrap_dom_node(vm, doc->body); return true; }
         if (strcmp(key, "head") == 0)            { *out = js_wrap_dom_node(vm, doc->head); return true; }
         if (strcmp(key, "documentElement") == 0) { *out = js_wrap_dom_node(vm, doc->html); return true; }
+        if (strcmp(key, "activeElement") == 0)   { *out = js_wrap_dom_node(vm, vm->focused_node ? vm->focused_node : doc->body); return true; }
         if (strcmp(key, "nodeType") == 0)        { *out = js_num(9); return true; }
+        if (strcmp(key, "forms") == 0 || strcmp(key, "images") == 0) {
+            const char *sel = (strcmp(key, "forms") == 0) ? "form" : "img";
+            vm->gc_pause++;
+            JsObj *arr = js_arr_new(vm, 4);
+            if (doc->root) {
+                DomNodeList nl;
+                dom_query_selector_all(doc->root, sel, &nl);
+                for (size_t i = 0; i < nl.count; i++) {
+                    js_arr_push(vm, arr, js_wrap_dom_node(vm, nl.items[i]));
+                }
+                dom_nodelist_free(&nl);
+            }
+            vm->gc_pause--;
+            *out = js_obj_val(arr);
+            return true;
+        }
+        if (doc->root && !map_has_named_prop(m, key) &&
+            !map_has_named_prop((const JsMapObj *)vm->elem_proto, key) &&
+            !map_has_named_prop((const JsMapObj *)vm->object_proto, key)) {
+            DomNode *named_form = find_named_descendant(doc->root, TAG_FORM, key);
+            if (named_form) {
+                *out = js_wrap_dom_node(vm, named_form);
+                return true;
+            }
+        }
         return false;
     }
 
@@ -714,18 +783,17 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             *out = js_num((double)nt);
             return true;
         }
-        if (strcmp(key, "id") == 0) {
-            const char *v = dom_get_attr(n, "id");
+        if (strcmp(key, "id") == 0 || strcmp(key, "name") == 0 ||
+            strcmp(key, "href") == 0 || strcmp(key, "src") == 0 ||
+            strcmp(key, "type") == 0 || strcmp(key, "title") == 0 ||
+            strcmp(key, "alt") == 0 || strcmp(key, "action") == 0 ||
+            strcmp(key, "method") == 0) {
+            const char *v = dom_get_attr(n, key);
             *out = js_obj_val((JsObj *)js_str_cstr(vm, v ? v : ""));
             return true;
         }
         if (strcmp(key, "className") == 0) {
             const char *v = dom_get_attr(n, "class");
-            *out = js_obj_val((JsObj *)js_str_cstr(vm, v ? v : ""));
-            return true;
-        }
-        if (strcmp(key, "href") == 0) {
-            const char *v = dom_get_attr(n, "href");
             *out = js_obj_val((JsObj *)js_str_cstr(vm, v ? v : ""));
             return true;
         }
@@ -745,8 +813,26 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             *out = js_bool(dom_has_attr(n, "hidden"));
             return true;
         }
+        if (strcmp(key, "form") == 0) {
+            for (DomNode *p = n->parent; p; p = p->parent) {
+                if (p->type == DOM_NODE_ELEMENT && p->tag == TAG_FORM) {
+                    *out = js_wrap_dom_node(vm, p);
+                    return true;
+                }
+            }
+            *out = js_null();
+            return true;
+        }
+        if (n->tag == TAG_FORM && strcmp(key, "elements") == 0) {
+            vm->gc_pause++;
+            JsObj *arr = js_arr_new(vm, 4);
+            collect_form_controls_rec(n, vm, arr);
+            vm->gc_pause--;
+            *out = js_obj_val(arr);
+            return true;
+        }
         if (strcmp(key, "textContent") == 0 || strcmp(key, "innerText") == 0) {
-            char *txt = dom_get_text_content(n);
+            char *txt = (strcmp(key, "innerText") == 0) ? dom_get_inner_text(n) : dom_get_text_content(n);
             *out = js_obj_val((JsObj *)js_str_cstr(vm, txt ? txt : ""));
             tb_free(txt);
             return true;
@@ -843,12 +929,35 @@ bool js_dom_get_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal *out) {
             *out = js_obj_val(arr);
             return true;
         }
+        /* Legacy HTMLFormElement named control access: form.<controlName> */
+        if (n->tag == TAG_FORM &&
+            !map_has_named_prop(m, key) &&
+            !map_has_named_prop((const JsMapObj *)vm->elem_proto, key) &&
+            !map_has_named_prop((const JsMapObj *)vm->object_proto, key)) {
+            DomNode *ctrl = find_named_descendant(n, TAG_UNKNOWN, key);
+            if (ctrl) {
+                *out = js_wrap_dom_node(vm, ctrl);
+                return true;
+            }
+        }
     }
     return false;
 }
 
 bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
     JsNativeTag tag = (JsNativeTag)m->hdr.native_tag;
+
+    if ((tag == NATIVE_TAG_WINDOW || tag == NATIVE_TAG_DOCUMENT) && strcmp(key, "location") == 0) {
+        if (val.type == JS_OBJECT && val.u.obj && val.u.obj->native_tag == NATIVE_TAG_LOCATION) {
+            return false;
+        }
+        JsStr *s = js_to_str(vm, val);
+        if (s) {
+            snprintf(vm->pushed_url, sizeof(vm->pushed_url), "%s", s->data);
+            if (vm->on_navigate) vm->on_navigate(vm->host_userdata, s->data, false);
+        }
+        return true;
+    }
 
     if (tag == NATIVE_TAG_STORAGE) {
         if (strcmp(key, "getItem") == 0 || strcmp(key, "setItem") == 0 ||
@@ -1006,6 +1115,14 @@ bool js_dom_set_virtual(JsVm *vm, JsMapObj *m, const char *key, JsVal val) {
             dom_set_attr(n, "href", s ? s->data : "");
             return true;
         }
+        if (strcmp(key, "name") == 0 || strcmp(key, "src") == 0 ||
+            strcmp(key, "type") == 0 || strcmp(key, "title") == 0 ||
+            strcmp(key, "alt") == 0 || strcmp(key, "action") == 0 ||
+            strcmp(key, "method") == 0) {
+            JsStr *s = js_to_str(vm, val);
+            dom_set_attr(n, key, s ? s->data : "");
+            return true;
+        }
         if (strcmp(key, "value") == 0) {
             JsStr *s = js_to_str(vm, val);
             dom_input_set_value(n, s ? s->data : "");
@@ -1090,6 +1207,7 @@ typedef enum {
     DOM_DISPATCH_EVENT,
     DOM_CLICK,
     DOM_FOCUS_BLUR,
+    DOM_BLUR,
     DOM_GET_ELEMENT_BY_ID = 40,
     DOM_QUERY_SELECTOR,
     DOM_QUERY_SELECTOR_ALL,
@@ -1409,6 +1527,10 @@ static JsVal fn_dom_method(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
             return js_undefined();
         }
         case DOM_FOCUS_BLUR:
+            if (n && n->type == DOM_NODE_ELEMENT) vm->focused_node = n;
+            return js_undefined();
+        case DOM_BLUR:
+            if (vm->focused_node == n) vm->focused_node = NULL;
             return js_undefined();
         default:
             return js_undefined();
@@ -1542,9 +1664,11 @@ static bool dispatch_event_obj(JsVm *vm, DomNode *target, JsVal ev_val) {
 
             int fn_sp = vm->temp_sp;
             int nfns  = 0;
+            bool is_inl[32];
             for (DomListener *ls = cur->listeners; ls && nfns < 32; ls = ls->next) {
                 if (strcmp(ls->type, type) == 0 && ls->js_fn) {
                     if (js_temp_push(vm, js_obj_val((JsObj *)ls->js_fn))) {
+                        is_inl[nfns] = ls->is_inline;
                         nfns++;
                     }
                 }
@@ -1552,7 +1676,7 @@ static bool dispatch_event_obj(JsVm *vm, DomNode *target, JsVal ev_val) {
             for (int i = 0; i < nfns; i++) {
                 JsVal fn_val = vm->temp_roots[fn_sp + i];
                 vm->steps = 0;
-                js_call(vm, fn_val, cur_wrap, 1, &ev_val);
+                JsVal ret = js_call(vm, fn_val, cur_wrap, 1, &ev_val);
                 if (vm->has_thrown) {
                     TbBuf eb;
                     tb_buf_init(&eb);
@@ -1562,6 +1686,10 @@ static bool dispatch_event_obj(JsVm *vm, DomNode *target, JsVal ev_val) {
                     tb_buf_free(&eb);
                     vm->has_thrown = false;
                     vm->thrown_val = js_undefined();
+                } else if (is_inl[i] && ret.type == JS_BOOL && !ret.u.boolean) {
+                    if (js_to_bool(js_get_prop(vm, ev_val, "cancelable"))) {
+                        js_set_prop(vm, ev_val, "defaultPrevented", js_bool(true));
+                    }
                 }
                 if (js_to_bool(js_get_prop(vm, ev_val, "_stopImmediate"))) break;
             }
@@ -1625,7 +1753,8 @@ typedef enum {
     WIN_HIST_REPLACE_STATE,
     WIN_HIST_BACK,
     WIN_HIST_FORWARD,
-    WIN_HIST_GO
+    WIN_HIST_GO,
+    WIN_IMAGE_CTOR
 } JsWindowApiMagic;
 
 static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv, int magic) {
@@ -1761,6 +1890,19 @@ static JsVal fn_window_api(JsVm *vm, JsVal this_val, int argc, const JsVal *argv
         case WIN_HIST_FORWARD:
         case WIN_HIST_GO:
             return js_undefined();
+        case WIN_IMAGE_CTOR: {
+            if (!vm->doc) return js_obj_val(js_map_new(vm, vm->object_proto));
+            DomNode *img = dom_create_element(vm->doc, "img");
+            if (img && argc > 0 && argv[0].type != JS_UNDEFINED) {
+                JsStr *ws = js_to_str(vm, argv[0]);
+                if (ws) dom_set_attr(img, "width", ws->data);
+            }
+            if (img && argc > 1 && argv[1].type != JS_UNDEFINED) {
+                JsStr *hs = js_to_str(vm, argv[1]);
+                if (hs) dom_set_attr(img, "height", hs->data);
+            }
+            return js_wrap_dom_node(vm, img);
+        }
         default:
             return js_undefined();
     }
@@ -1993,6 +2135,8 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     g->native_tag = NATIVE_TAG_WINDOW;
     js_set_prop(vm, js_obj_val(g), "window", js_obj_val(g));
     js_set_prop(vm, js_obj_val(g), "self", js_obj_val(g));
+    js_set_prop(vm, js_obj_val(g), "top", js_obj_val(g));
+    js_set_prop(vm, js_obj_val(g), "parent", js_obj_val(g));
     js_set_prop(vm, js_obj_val(g), "globalThis", js_obj_val(g));
 
     /* Element.prototype methods */
@@ -2026,7 +2170,7 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     js_define_native(vm, ep, "dispatchEvent", fn_dom_method, DOM_DISPATCH_EVENT);
     js_define_native(vm, ep, "click", fn_dom_method, DOM_CLICK);
     js_define_native(vm, ep, "focus", fn_dom_method, DOM_FOCUS_BLUR);
-    js_define_native(vm, ep, "blur", fn_dom_method, DOM_FOCUS_BLUR);
+    js_define_native(vm, ep, "blur", fn_dom_method, DOM_BLUR);
     js_define_native(vm, ep, "querySelector", fn_dom_method, DOM_QUERY_SELECTOR);
     js_define_native(vm, ep, "querySelectorAll", fn_dom_method, DOM_QUERY_SELECTOR_ALL);
     js_define_native(vm, ep, "getElementsByTagName", fn_dom_method, DOM_GET_ELEMENTS_BY_TAG_NAME);
@@ -2048,7 +2192,7 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     js_define_native(vm, vm->doc_obj, "createComment", fn_dom_method, DOM_CREATE_COMMENT);
     js_set_prop(vm, js_obj_val(g), "document", js_obj_val(vm->doc_obj));
 
-    /* window timers, rAF, getComputedStyle, matchMedia, Event, CustomEvent, alert, scrollTo, fetch */
+    /* window timers, rAF, getComputedStyle, matchMedia, Event, CustomEvent, Image, alert, scrollTo, fetch */
     js_define_native(vm, g, "setTimeout", fn_window_api, WIN_SET_TIMEOUT);
     js_define_native(vm, g, "setInterval", fn_window_api, WIN_SET_INTERVAL);
     js_define_native(vm, g, "clearTimeout", fn_window_api, WIN_CLEAR_TIMER);
@@ -2059,6 +2203,7 @@ void js_bind_document(JsVm *vm, DomDocument *doc, const char *url) {
     js_define_native(vm, g, "matchMedia", fn_window_api, WIN_MATCH_MEDIA);
     js_define_native(vm, g, "Event", fn_event_ctrl, EV_CTOR);
     js_define_native(vm, g, "CustomEvent", fn_event_ctrl, EV_CUSTOM_CTOR);
+    js_define_native(vm, g, "Image", fn_window_api, WIN_IMAGE_CTOR);
     js_define_native(vm, g, "alert", fn_window_api, WIN_ALERT);
     js_define_native(vm, g, "scrollTo", fn_window_api, WIN_SCROLL_TO);
     js_define_native(vm, g, "scrollBy", fn_window_api, WIN_SCROLL_TO);

@@ -256,6 +256,19 @@ static void execute_page_scripts(TbBrowser *b) {
     if (b->doc->body) {
         js_dispatch_dom_event(b->vm, b->doc->body, "load", NULL, false);
     }
+    if (b->doc->root && b->doc->root != b->doc->body) {
+        js_dispatch_dom_event(b->vm, b->doc->root, "load", NULL, false);
+    }
+    if (b->vm->global_obj) {
+        JsVal onload_fn = js_get_prop(b->vm, js_obj_val(b->vm->global_obj), "onload");
+        if (onload_fn.type == JS_OBJECT && onload_fn.u.obj &&
+            (onload_fn.u.obj->obj_type == OBJ_FUNC || onload_fn.u.obj->obj_type == OBJ_NATIVE_FN)) {
+            b->vm->steps = 0;
+            js_call(b->vm, onload_fn, js_obj_val(b->vm->global_obj), 0, NULL);
+            b->vm->has_thrown = false;
+            b->vm->thrown_val = js_undefined();
+        }
+    }
     js_run_timers(b->vm);
 }
 
@@ -284,9 +297,11 @@ static void process_pending_nav(TbBrowser *b) {
 
 void tb_browser_relayout_if_needed(TbBrowser *b, bool force) {
     if (!b || !b->doc) return;
-    DomNode *focused_node = (b->focused_hit >= 0 && b->focused_hit < b->layout.hit_count)
-                                ? b->layout.hits[b->focused_hit].node
-                                : NULL;
+    DomNode *focused_node = (b->vm && b->vm->focused_node)
+                                ? b->vm->focused_node
+                                : ((b->focused_hit >= 0 && b->focused_hit < b->layout.hit_count)
+                                       ? b->layout.hits[b->focused_hit].node
+                                       : NULL);
     if (force || b->doc->dirty_style || b->doc->dirty_layout ||
         b->layout.viewport_w != b->viewport_w) {
         if (b->vm) {
@@ -300,7 +315,11 @@ void tb_browser_relayout_if_needed(TbBrowser *b, bool force) {
         } else if (b->focused_hit >= b->layout.hit_count) {
             b->focused_hit = b->layout.hit_count - 1;
         }
+    } else if (b->vm && b->vm->focused_node) {
+        int hit = layout_find_node_hit(&b->layout, b->vm->focused_node);
+        if (hit >= 0) b->focused_hit = hit;
     }
+    if (b->vm) b->vm->focused_node = NULL;
 }
 
 static bool navigate_with_method(TbBrowser *b, const char *raw_url, const char *method,
@@ -364,6 +383,9 @@ static bool navigate_with_method(TbBrowser *b, const char *raw_url, const char *
     tb_response_free(&resp);
 
     load_external_stylesheets(b);
+    if (b->doc) {
+        css_compute_document_ex(b->doc, NULL, b->viewport_w);
+    }
 
     b->scroll_y = 0;
     b->vm       = js_vm_new();
@@ -474,20 +496,26 @@ static void url_encode_append(TbBuf *out, const char *s) {
     }
 }
 
-static void collect_form_fields(DomNode *n, TbBuf *q) {
+static void collect_form_fields(DomNode *n, DomNode *submitter, TbBuf *q) {
     if (!n) return;
     if (n->type == DOM_NODE_ELEMENT &&
-        (n->tag == TAG_INPUT || n->tag == TAG_TEXTAREA || n->tag == TAG_SELECT)) {
+        (n->tag == TAG_INPUT || n->tag == TAG_TEXTAREA || n->tag == TAG_SELECT || n->tag == TAG_BUTTON)) {
         const char *name = dom_get_attr(n, "name");
         const char *type = dom_get_attr(n, "type");
-        if (!type) type = "text";
+        if (!type) type = (n->tag == TAG_BUTTON) ? "submit" : "text";
         if (name && *name && !dom_has_attr(n, "disabled")) {
             bool include = true;
             const char *val = dom_input_get_value(n);
             if (tb_strcasecmp(type, "checkbox") == 0 || tb_strcasecmp(type, "radio") == 0) {
                 include = dom_input_get_checked(n);
                 if (!val || !*val) val = "on";
-            } else if (tb_strcasecmp(type, "submit") == 0 || tb_strcasecmp(type, "button") == 0) {
+            } else if (tb_strcasecmp(type, "submit") == 0 || n->tag == TAG_BUTTON) {
+                include = (n == submitter && tb_strcasecmp(type, "submit") == 0);
+                if (include) {
+                    val = dom_get_attr(n, "value");
+                    if (!val) val = "";
+                }
+            } else if (tb_strcasecmp(type, "button") == 0 || tb_strcasecmp(type, "reset") == 0) {
                 include = false;
             }
             if (include) {
@@ -499,7 +527,7 @@ static void collect_form_fields(DomNode *n, TbBuf *q) {
         }
     }
     for (DomNode *ch = n->first_child; ch; ch = ch->next_sibling) {
-        collect_form_fields(ch, q);
+        collect_form_fields(ch, submitter, q);
     }
 }
 
@@ -536,7 +564,7 @@ static void submit_enclosing_form(TbBrowser *b, DomNode *control) {
 
     TbBuf query;
     tb_buf_init(&query);
-    collect_form_fields(form, &query);
+    collect_form_fields(form, control, &query);
 
     if (is_post) {
         navigate_with_method(b, target_url, "POST", query.data ? query.data : "", true);

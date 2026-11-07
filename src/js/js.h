@@ -389,6 +389,7 @@ struct JsVm {
 
     /* Bound DOM & Browser callbacks */
     DomDocument *doc;
+    DomNode     *focused_node;
     const char  *current_url;
     char         pushed_url[1536];
     const char  *fetch_extra_headers;
