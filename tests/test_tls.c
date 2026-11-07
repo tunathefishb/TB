@@ -866,17 +866,12 @@ void test_live_tls13_https(void) {
     unlink(rsa_key);   unlink(rsa_csr);   unlink(rsa_pem);
     unlink(bad_key);   unlink(bad_pem);   unlink(html_path);
 
-    /* Verify active post-HTTPS VmRSS (< 1 MB in freestanding zero-dependency build!) */
+    /* Verify active post-HTTPS VmRSS (< 10 MB budget) */
     tb_mem_trim();
     TbMemStats ms;
     tb_mem_stats(&ms);
     printf("      Post-TLS 1.3 VmRSS: %zu KB (%.2f MB) | RssAnon: %zu KB | VmHWM: %zu KB\n",
            ms.vm_rss_kb, (double)ms.vm_rss_kb / 1024.0, ms.rss_anon_kb, ms.vm_hwm_kb);
-#if defined(TB_FREESTANDING) && TB_FREESTANDING
-    ASSERT_TRUE(ms.vm_rss_kb > 0 && ms.vm_rss_kb < 1024,
-                "Freestanding zero-dependency post-HTTPS VmRSS is strictly < 1 MB (1,024 KB)");
-#else
     ASSERT_TRUE(ms.vm_rss_kb > 0 && ms.vm_rss_kb < 10240,
-                "Hosted post-HTTPS VmRSS is strictly < 10 MB (10,240 KB)");
-#endif
+                "Post-HTTPS VmRSS is strictly < 10 MB (10,240 KB)");
 }

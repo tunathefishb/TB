@@ -86,9 +86,9 @@ void test_strict_memory_budget(void) {
                 "Private RssAnon memory is strictly below 4 MB");
 }
 
-/* ── Test 10: In-Tree IEEE-754 Math & Gregorian UTC Helpers (Zero -lm) ── */
+/* ── Test 10: IEEE-754 Math & Gregorian UTC Helpers ── */
 void test_math_tb_subsystem(void) {
-    printf("[10/14] Testing in-tree IEEE-754 math_tb & Gregorian UTC calendar (zero -lm)...\n");
+    printf("[10/14] Testing IEEE-754 math & Gregorian UTC calendar helpers...\n");
 
     ASSERT_TRUE(tb_isnan(TB_NAN) && !tb_isfinite(TB_NAN), "TB_NAN classification");
     ASSERT_TRUE(tb_isinf(TB_INFINITY) && tb_isinf(-TB_INFINITY), "TB_INFINITY classification");

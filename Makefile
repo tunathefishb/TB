@@ -1,5 +1,4 @@
 CC           ?= gcc
-FREESTANDING ?= 1
 TLS          ?= builtin
 
 CFLAGS       ?= -std=c11 -O2 -Wall -Wextra
@@ -9,18 +8,8 @@ BUILD_DIR    := build
 
 INC_DIRS     := -Isrc/core -Isrc/net -Isrc/tls -Isrc/js -Isrc/engine -Isrc/ui -Itests
 
-MODE_CFLAGS  := $(INC_DIRS)
-MODE_LDFLAGS :=
-
-ifeq ($(FREESTANDING),1)
-ifeq ($(TLS),openssl)
-$(error TLS=openssl requires FREESTANDING=0 (dlopen/libssl needs dynamic libc loader))
-endif
-MODE_CFLAGS  += -DTB_FREESTANDING=1 -ffreestanding -fno-stack-protector -fno-pie
-MODE_LDFLAGS += -nostdlib -static -no-pie
-else
-MODE_CFLAGS  += -DTB_FREESTANDING=0 -D_GNU_SOURCE
-endif
+MODE_CFLAGS  := $(INC_DIRS) -D_GNU_SOURCE
+MODE_LDFLAGS := -lm
 
 ifeq ($(TLS),openssl)
 MODE_CFLAGS  += -DTB_TLS_OPENSSL=1
@@ -41,10 +30,6 @@ ALL_CFLAGS   := $(CFLAGS) $(MODE_CFLAGS)
 ALL_LDFLAGS  := $(LDFLAGS) $(MODE_LDFLAGS)
 
 CORE_SRCS := \
-	src/core/sys_syscall.c \
-	src/core/sys_stdio.c \
-	src/core/sys_stdlib.c \
-	src/core/math_tb.c \
 	src/core/regex_tb.c \
 	src/core/mem.c \
 	src/core/inflate.c \
@@ -80,7 +65,7 @@ MAIN_OBJ     := $(BUILD_DIR)/main.o
 TEST_OBJS    := $(addprefix $(BUILD_DIR)/,$(notdir $(TEST_SRCS:.c=.o)))
 HEADERS      := $(wildcard src/*/*.h tests/*.h)
 
-CONFIG_STR   := FREESTANDING=$(FREESTANDING) TLS=$(TLS)
+CONFIG_STR   := TLS=$(TLS)
 CONFIG_STAMP := $(BUILD_DIR)/.config
 
 .PHONY: all test clean FORCE
